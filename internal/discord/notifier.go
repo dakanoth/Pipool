@@ -220,6 +220,23 @@ func (n *Notifier) HashrateReport(data HashrateReportData) {
 	})
 }
 
+// NodeBackOnline sends an alert when a coin daemon comes back after being unreachable
+func (n *Notifier) NodeBackOnline(coin string) {
+	if !n.cfg.Enabled || !n.cfg.Alerts.NodeUnreachable {
+		return
+	}
+	go n.send(webhookPayload{
+		Username: n.cfg.BotName,
+		Embeds: []embed{{
+			Title:       fmt.Sprintf("✅ Node Back Online — %s", coin),
+			Description: fmt.Sprintf("The **%s** daemon is reachable again. Mining resumed.", coin),
+			Color:       ColorGreen,
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+			Footer:      &embedFooter{Text: "PiPool · Raspberry Pi 5"},
+		}},
+	})
+}
+
 // NodeUnreachable sends an alert when a coin daemon cannot be reached
 func (n *Notifier) NodeUnreachable(coin string, err error) {
 	if !n.cfg.Enabled || !n.cfg.Alerts.NodeUnreachable {

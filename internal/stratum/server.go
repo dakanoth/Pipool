@@ -26,6 +26,7 @@ type Server struct {
 
 	mu         sync.RWMutex
 	workers    map[string]*Worker
+	blockLog   []BlockEntry // last 50 blocks found, shown on dashboard
 	currentJob *Job
 
 	// Stats (updated atomically for lock-free reads)
@@ -37,11 +38,15 @@ type Server struct {
 	// Channel to broadcast new jobs to all workers
 	jobBroadcast chan *Job
 	stopCh       chan struct{}
+	ln           net.Listener   // stored so Stop() can close the TCP port cleanly
+	wg           sync.WaitGroup // tracks active worker goroutines for graceful drain
 
 	// Callbacks for Discord notifications
-	OnBlockFound    func(coin, hash string, reward float64)
-	OnMinerConnect  func(worker string, addr string)
+	OnBlockFound      func(coin, hash string, reward float64)
+	OnMinerConnect    func(worker string, addr string)
 	OnMinerDisconnect func(worker string)
+	OnNodeUnreachable func(err error)
+	OnNodeOnline      func()
 }
 
 // Worker represents a connected miner
@@ -110,10 +115,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("[%s] stratum listen on %s: %w", s.coin.Symbol, addr, err)
 	}
+	s.ln = ln
 
 	log.Printf("[%s] Stratum server listening on %s", s.coin.Symbol, addr)
 
-	// Start block template poller
+	// Start block template poller — recovers from panics internally
 	go s.pollBlockTemplate()
 
 	// Accept miner connections
@@ -123,7 +129,7 @@ func (s *Server) Start() error {
 			if err != nil {
 				select {
 				case <-s.stopCh:
-					return
+					return // clean shutdown
 				default:
 					log.Printf("[%s] accept error: %v", s.coin.Symbol, err)
 					continue
@@ -137,27 +143,63 @@ func (s *Server) Start() error {
 				continue
 			}
 
+			s.wg.Add(1)
 			go s.handleWorker(conn)
 		}
 	}()
 
-	// Broadcast new jobs as they arrive
+	// Broadcast new jobs as they arrive — recovers from panics internally
 	go s.broadcastJobs()
 
 	return nil
 }
 
-// Stop shuts down the server
+// Stop shuts down the server gracefully.
+// Closes the TCP listener (stops new connections), signals all goroutines,
+// then waits up to 10s for in-flight workers to finish their current share.
 func (s *Server) Stop() {
 	close(s.stopCh)
+	if s.ln != nil {
+		s.ln.Close() // unblocks ln.Accept() in the accept goroutine
+	}
+
+	// Drain in-flight worker goroutines with a timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[%s] all workers drained cleanly", s.coin.Symbol)
+	case <-time.After(10 * time.Second):
+		log.Printf("[%s] shutdown timeout — %d workers still active, forcing close", s.coin.Symbol, s.connectedMiners.Load())
+	}
 }
 
 // ─── Block template polling ───────────────────────────────────────────────────
 
 func (s *Server) pollBlockTemplate() {
+	// If this goroutine panics for any reason, restart it after a short delay
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[%s] panic in block template poller (restarting in 5s): %v", s.coin.Symbol, r)
+			time.Sleep(5 * time.Second)
+			select {
+			case <-s.stopCh:
+				return
+			default:
+				go s.pollBlockTemplate() // restart
+			}
+		}
+	}()
 	var lastHash string
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+
+	daemonWasDown := false
+	retryDelay := 5 * time.Second
+	const maxRetryDelay = 60 * time.Second
 
 	for {
 		select {
@@ -166,9 +208,30 @@ func (s *Server) pollBlockTemplate() {
 		case <-ticker.C:
 			hash, err := s.rpcClient.GetBestBlockHash()
 			if err != nil {
-				log.Printf("[%s] getbestblockhash: %v", s.coin.Symbol, err)
-				time.Sleep(5 * time.Second)
+				if !daemonWasDown {
+					// First failure — log and fire Discord alert
+					log.Printf("[%s] daemon unreachable: %v — will retry every %v", s.coin.Symbol, err, retryDelay)
+					if s.OnNodeUnreachable != nil {
+						s.OnNodeUnreachable(err)
+					}
+					daemonWasDown = true
+				}
+				// Exponential backoff up to maxRetryDelay
+				time.Sleep(retryDelay)
+				if retryDelay < maxRetryDelay {
+					retryDelay *= 2
+				}
 				continue
+			}
+
+			// Daemon came back online after being down
+			if daemonWasDown {
+				log.Printf("[%s] daemon back online", s.coin.Symbol)
+				if s.OnNodeOnline != nil {
+					s.OnNodeOnline()
+				}
+				daemonWasDown = false
+				retryDelay = 5 * time.Second
 			}
 
 			if hash == lastHash {
@@ -189,7 +252,7 @@ func (s *Server) pollBlockTemplate() {
 			select {
 			case s.jobBroadcast <- job:
 			default:
-				// channel full, drop old job - miners will get next one
+				// channel full — miners will get next job
 			}
 		}
 	}
@@ -257,6 +320,12 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 // ─── Worker connection handler ────────────────────────────────────────────────
 
 func (s *Server) handleWorker(conn net.Conn) {
+	defer s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[%s] panic in worker handler (recovered): %v", s.coin.Symbol, r)
+		}
+	}()
 	workerID := fmt.Sprintf("%x", rand.Uint32())
 	w := &Worker{
 		id:          workerID,
@@ -451,8 +520,16 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 		s.blocksFound.Add(1)
 		log.Printf("[%s] 🏆 BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
 
-		// Submit to daemon
+		reward := s.coin.BlockReward
 		go s.submitBlock(params, w.workerName)
+
+		// Record in dashboard block log
+		s.recordBlock("(pending)", s.currentJobHeight(), reward, w.workerName)
+
+		// Fire Discord notification
+		if s.OnBlockFound != nil {
+			s.OnBlockFound(s.coin.Symbol, "(pending)", reward)
+		}
 	}
 
 	return s.reply(w, msg.ID, true, nil)
@@ -555,6 +632,18 @@ func (s *Server) writeJSON(w *Worker, v any) error {
 
 // broadcastJobs sends new jobs to all connected authorized workers
 func (s *Server) broadcastJobs() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[%s] panic in job broadcaster (restarting in 2s): %v", s.coin.Symbol, r)
+			time.Sleep(2 * time.Second)
+			select {
+			case <-s.stopCh:
+				return
+			default:
+				go s.broadcastJobs() // restart
+			}
+		}
+	}()
 	for {
 		select {
 		case <-s.stopCh:
@@ -579,6 +668,16 @@ func (s *Server) broadcastJobs() {
 }
 
 // ─── Worker introspection (for pipoolctl) ────────────────────────────────────
+
+// BlockEntry records a found block for the dashboard log
+type BlockEntry struct {
+	Coin    string
+	Height  int64
+	Hash    string
+	Reward  string
+	Worker  string
+	FoundAt time.Time
+}
 
 // WorkerInfo is a public snapshot of a connected worker
 type WorkerInfo struct {
@@ -619,6 +718,43 @@ func (s *Server) KickWorker(name string) bool {
 		}
 	}
 	return false
+}
+
+// BlockLog returns a copy of the found-block log for the dashboard
+func (s *Server) BlockLog() []BlockEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]BlockEntry, len(s.blockLog))
+	copy(out, s.blockLog)
+	return out
+}
+
+// currentJobHeight returns the block height of the current job, or 0 if no job yet
+func (s *Server) currentJobHeight() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.currentJob != nil {
+		return s.currentJob.Height
+	}
+	return 0
+}
+
+// recordBlock appends a found block to the ring buffer (max 50 entries)
+func (s *Server) recordBlock(hash string, height int64, reward float64, worker string) {
+	entry := BlockEntry{
+		Coin:    s.coin.Symbol,
+		Height:  height,
+		Hash:    hash,
+		Reward:  fmt.Sprintf("%.4f %s", reward, s.coin.Symbol),
+		Worker:  worker,
+		FoundAt: time.Now(),
+	}
+	s.mu.Lock()
+	s.blockLog = append(s.blockLog, entry)
+	if len(s.blockLog) > 50 {
+		s.blockLog = s.blockLog[len(s.blockLog)-50:]
+	}
+	s.mu.Unlock()
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────

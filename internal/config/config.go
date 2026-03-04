@@ -89,13 +89,10 @@ type DiscordAlerts struct {
 }
 
 type DashboardConfig struct {
-	Enabled bool   `json:"enabled"`
-	Port    int    `json:"port"`
-	// Auth for the dashboard (basic auth)
-	Username string `json:"username"`
-	Password string `json:"password"`
-	// How frequently (seconds) to refresh stats pushed to clients
-	PushIntervalS int `json:"push_interval_s"`
+	Enabled       bool `json:"enabled"`
+	Port          int  `json:"port"`
+	PushIntervalS int  `json:"push_interval_s"`
+	// No auth — dashboard is LAN-only, open by default
 }
 
 type LoggingConfig struct {
@@ -230,10 +227,8 @@ func DefaultConfig() *PoolConfig {
 			},
 		},
 		Dashboard: DashboardConfig{
-			Enabled:       false, // opt-in, saves RAM
+			Enabled:       true,  // on by default — open HTTP on :8080
 			Port:          8080,
-			Username:      "admin",
-			Password:      "changeme",
 			PushIntervalS: 5,
 		},
 		Logging: LoggingConfig{

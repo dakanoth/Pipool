@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const SocketPath = "/var/run/pipool/pipool.sock"
+// SocketPath is the Unix domain socket for pipoolctl communication.
+// /run/pipool is created by systemd's RuntimeDirectory=pipool directive on every boot,
+// so it survives reboots even though /run is a tmpfs.
+const SocketPath = "/run/pipool/pipool.sock"
 
 // ─── Command definitions ──────────────────────────────────────────────────────
 
@@ -49,11 +52,11 @@ func (s *Server) Register(cmd string, h Handler) {
 
 // Start begins listening on the Unix socket
 func (s *Server) Start() error {
-	// Ensure socket directory exists
-	if err := os.MkdirAll("/var/run/pipool", 0750); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
-	}
-	// Remove stale socket if present
+	// /run/pipool is created by systemd RuntimeDirectory= before this process starts.
+	// When running outside systemd (e.g. dev), create it manually as a fallback.
+	os.MkdirAll("/run/pipool", 0755)
+
+	// Remove stale socket from a previous run
 	os.Remove(SocketPath)
 
 	ln, err := net.Listen("unix", SocketPath)
@@ -230,21 +233,24 @@ func printHelp() {
 Usage: pipoolctl <command> [args]
 
 Commands:
-  status                   Show pool status (uptime, hashrate, temp, RAM)
-  workers                  List all connected workers with device info
-  coins                    Show per-coin stats
-  coin enable  <SYMBOL>    Enable a coin (e.g. pipoolctl coin enable PEP)
-  coin disable <SYMBOL>    Disable a coin without restarting
-  kick <worker>            Disconnect a specific worker by name
+  status                        Show pool status (uptime, hashrate, temp, RAM)
+  workers                       List all connected workers with device info
+  coins                         Show per-coin stats
+  coin enable  <SYMBOL>         Enable a coin  (e.g. pipoolctl coin enable PEP)
+  coin disable <SYMBOL>         Disable a coin without restarting
+  kick <worker>                 Disconnect a specific worker by name
   vardiff <SYMBOL> <min> <max>  Adjust vardiff bounds for a coin live
-  reload                   Hot-reload pipool.json config (wallets, discord, etc.)
-  loglevel <level>         Set log level: debug | info | warn | error
-  discord test             Send a test Discord notification
-  version                  Show PiPool version
+  reload                        Hot-reload pipool.json (discord, logging, limits)
+  restart                       Gracefully restart PiPool (systemd brings it back)
+  stop                          Stop PiPool (systemd will restart it automatically)
+  loglevel <level>              Set log level: debug | info | warn | error
+  discord test                  Send a test Discord notification
+  version                       Show PiPool version
 
 Examples:
   pipoolctl status
   pipoolctl workers
+  pipoolctl restart
   pipoolctl coin enable PEP
   pipoolctl vardiff LTC 0.001 2048
   pipoolctl kick myworker.1

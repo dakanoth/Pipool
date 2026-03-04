@@ -62,8 +62,35 @@ echo ""
 echo -e "  Tag set to: ${YELLOW}${COINBASE_TAG}${NC}"
 echo ""
 
-read -p "$(echo -e "${CYAN}") Enable web dashboard? [y/N]: $(echo -e "${NC}")" ENABLE_DASH
 read -p "$(echo -e "${CYAN}") Enable PEP mining? [y/N]: $(echo -e "${NC}")" ENABLE_PEP
+echo ""
+
+# Blockchain storage
+echo -e "${CYAN}  Blockchain storage — where to store chain data for each coin."
+echo -e "  Default is each daemon's standard location inside /root/."
+echo -e "  If you have a dedicated SSD mounted at e.g. /mnt/ssd, enter that."
+echo -e "  Leave blank to use the default location for each coin.${NC}"
+echo ""
+read -p "$(echo -e "${CYAN}") LTC  datadir [/root/.litecoin]:   $(echo -e "${NC}")" LTC_DATADIR_INPUT
+read -p "$(echo -e "${CYAN}") DOGE datadir [/root/.dogecoin]:   $(echo -e "${NC}")" DOGE_DATADIR_INPUT
+read -p "$(echo -e "${CYAN}") BTC  datadir [/root/.bitcoin]:    $(echo -e "${NC}")" BTC_DATADIR_INPUT
+read -p "$(echo -e "${CYAN}") BCH  datadir [/root/.bch]:        $(echo -e "${NC}")" BCH_DATADIR_INPUT
+read -p "$(echo -e "${CYAN}") PEP  datadir [/root/.pepecoin]:   $(echo -e "${NC}")" PEP_DATADIR_INPUT
+echo ""
+
+# Apply defaults
+LTC_DATADIR="${LTC_DATADIR_INPUT:-/root/.litecoin}"
+DOGE_DATADIR="${DOGE_DATADIR_INPUT:-/root/.dogecoin}"
+BTC_DATADIR="${BTC_DATADIR_INPUT:-/root/.bitcoin}"
+BCH_DATADIR="${BCH_DATADIR_INPUT:-/root/.bch}"
+PEP_DATADIR="${PEP_DATADIR_INPUT:-/root/.pepecoin}"
+
+echo -e "  Storage locations:"
+echo -e "  ${YELLOW}LTC${NC}  → ${LTC_DATADIR}"
+echo -e "  ${YELLOW}DOGE${NC} → ${DOGE_DATADIR}"
+echo -e "  ${YELLOW}BTC${NC}  → ${BTC_DATADIR}"
+echo -e "  ${YELLOW}BCH${NC}  → ${BCH_DATADIR}"
+[[ "$ENABLE_PEP" =~ ^[Yy]$ ]] && echo -e "  ${YELLOW}PEP${NC}  → ${PEP_DATADIR}"
 echo ""
 
 # PEP wallet if enabled
@@ -97,8 +124,7 @@ BTC_RPC_PASS=$(openssl rand -hex 24)
 BCH_RPC_PASS=$(openssl rand -hex 24)
 PEP_RPC_PASS=$(openssl rand -hex 24)
 DASH_PASS=$(openssl rand -hex 12)
-
-DASH_ENABLED="false"; [[ "$ENABLE_DASH" =~ ^[Yy]$ ]] && DASH_ENABLED="true"
+DASH_ENABLED="false"; [[ "${ENABLE_DASH:-n}" =~ ^[Yy]$ ]] && DASH_ENABLED="true"
 PEP_ENABLED="false";  [[ "$ENABLE_PEP"  =~ ^[Yy]$ ]] && PEP_ENABLED="true"
 
 DO_LTC=true;  [[ "${INSTALL_LTC:-y}"   =~ ^[Nn]$ ]] && DO_LTC=false
@@ -170,14 +196,17 @@ install_litecoin() {
     cat > /etc/systemd/system/litecoind.service <<EOF
 [Unit]
 Description=Litecoin daemon
-After=network.target
+After=network-online.target local-fs.target
+Wants=network-online.target
 [Service]
 Type=forking
 User=root
-ExecStart=/usr/local/bin/litecoind -daemon -conf=/root/.litecoin/litecoin.conf
-ExecStop=/usr/local/bin/litecoin-cli stop
+ExecStart=/usr/local/bin/litecoind -daemon -datadir=${LTC_DATADIR} -conf=${LTC_DATADIR}/litecoin.conf
+ExecStop=/usr/local/bin/litecoin-cli -datadir=${LTC_DATADIR} stop
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -205,14 +234,17 @@ install_dogecoin() {
     cat > /etc/systemd/system/dogecoind.service <<EOF
 [Unit]
 Description=Dogecoin daemon
-After=network.target
+After=network-online.target local-fs.target
+Wants=network-online.target
 [Service]
 Type=forking
 User=root
-ExecStart=/usr/local/bin/dogecoind -daemon -conf=/root/.dogecoin/dogecoin.conf
-ExecStop=/usr/local/bin/dogecoin-cli stop
+ExecStart=/usr/local/bin/dogecoind -daemon -datadir=${DOGE_DATADIR} -conf=${DOGE_DATADIR}/dogecoin.conf
+ExecStop=/usr/local/bin/dogecoin-cli -datadir=${DOGE_DATADIR} stop
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -240,14 +272,17 @@ install_bitcoin() {
     cat > /etc/systemd/system/bitcoind.service <<EOF
 [Unit]
 Description=Bitcoin daemon
-After=network.target
+After=network-online.target local-fs.target
+Wants=network-online.target
 [Service]
 Type=forking
 User=root
-ExecStart=/usr/local/bin/bitcoind -daemon -conf=/root/.bitcoin/bitcoin.conf
-ExecStop=/usr/local/bin/bitcoin-cli stop
+ExecStart=/usr/local/bin/bitcoind -daemon -datadir=${BTC_DATADIR} -conf=${BTC_DATADIR}/bitcoin.conf
+ExecStop=/usr/local/bin/bitcoin-cli -datadir=${BTC_DATADIR} stop
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -276,14 +311,17 @@ install_bch() {
     cat > /etc/systemd/system/bchd.service <<EOF
 [Unit]
 Description=Bitcoin Cash Node daemon
-After=network.target
+After=network-online.target local-fs.target
+Wants=network-online.target
 [Service]
 Type=forking
 User=root
-ExecStart=/usr/local/bin/bitcoind-bch -daemon -conf=/root/.bch/bitcoin.conf
-ExecStop=/usr/local/bin/bitcoin-cli-bch -conf=/root/.bch/bitcoin.conf stop
+ExecStart=/usr/local/bin/bitcoind-bch -daemon -datadir=${BCH_DATADIR} -conf=${BCH_DATADIR}/bitcoin.conf
+ExecStop=/usr/local/bin/bitcoin-cli-bch -datadir=${BCH_DATADIR} stop
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -312,14 +350,17 @@ install_pepecoin() {
     cat > /etc/systemd/system/pepecoind.service <<EOF
 [Unit]
 Description=Pepecoin daemon
-After=network.target
+After=network-online.target local-fs.target
+Wants=network-online.target
 [Service]
 Type=forking
 User=root
-ExecStart=/usr/local/bin/pepecoind -daemon -conf=/root/.pepecoin/pepecoin.conf
-ExecStop=/usr/local/bin/pepecoin-cli stop
+ExecStart=/usr/local/bin/pepecoind -daemon -datadir=${PEP_DATADIR} -conf=${PEP_DATADIR}/pepecoin.conf
+ExecStop=/usr/local/bin/pepecoin-cli -datadir=${PEP_DATADIR} stop
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -340,9 +381,24 @@ $DO_PEP  && install_pepecoin
 step "Writing coin daemon configs"
 mkdir -p /root/.litecoin /root/.dogecoin /root/.bitcoin /root/.bch /root/.pepecoin
 
-cat > /root/.litecoin/litecoin.conf <<EOF
+
+# Create all datadirs with correct permissions
+mkdir -p "$LTC_DATADIR" "$DOGE_DATADIR" "$BTC_DATADIR" "$BCH_DATADIR" "$PEP_DATADIR"
+chmod 700 "$LTC_DATADIR" "$DOGE_DATADIR" "$BTC_DATADIR" "$BCH_DATADIR" "$PEP_DATADIR"
+log "Blockchain data directories created"
+
+# Write configs — datadir only added when it differs from the daemon's default
+# (all daemons read their conf from the datadir, so we point -conf at the right place)
+LTC_CONF="${LTC_DATADIR}/litecoin.conf"
+DOGE_CONF="${DOGE_DATADIR}/dogecoin.conf"
+BTC_CONF="${BTC_DATADIR}/bitcoin.conf"
+BCH_CONF="${BCH_DATADIR}/bitcoin.conf"
+PEP_CONF="${PEP_DATADIR}/pepecoin.conf"
+
+cat > "$LTC_CONF" <<EOF
 server=1
 daemon=1
+datadir=${LTC_DATADIR}
 rpcuser=litecoind
 rpcpassword=${LTC_RPC_PASS}
 rpcallowip=127.0.0.1
@@ -353,9 +409,10 @@ maxmempool=100
 listen=1
 EOF
 
-cat > /root/.dogecoin/dogecoin.conf <<EOF
+cat > "$DOGE_CONF" <<EOF
 server=1
 daemon=1
+datadir=${DOGE_DATADIR}
 rpcuser=dogecoind
 rpcpassword=${DOGE_RPC_PASS}
 rpcallowip=127.0.0.1
@@ -366,9 +423,10 @@ maxmempool=50
 listen=1
 EOF
 
-cat > /root/.bitcoin/bitcoin.conf <<EOF
+cat > "$BTC_CONF" <<EOF
 server=1
 daemon=1
+datadir=${BTC_DATADIR}
 rpcuser=bitcoind
 rpcpassword=${BTC_RPC_PASS}
 rpcallowip=127.0.0.1
@@ -379,9 +437,10 @@ maxmempool=100
 listen=1
 EOF
 
-cat > /root/.bch/bitcoin.conf <<EOF
+cat > "$BCH_CONF" <<EOF
 server=1
 daemon=1
+datadir=${BCH_DATADIR}
 rpcuser=bchd
 rpcpassword=${BCH_RPC_PASS}
 rpcallowip=127.0.0.1
@@ -391,9 +450,10 @@ dbcache=256
 maxmempool=50
 EOF
 
-cat > /root/.pepecoin/pepecoin.conf <<EOF
+cat > "$PEP_CONF" <<EOF
 server=1
 daemon=1
+datadir=${PEP_DATADIR}
 rpcuser=pepd
 rpcpassword=${PEP_RPC_PASS}
 rpcallowip=127.0.0.1
@@ -542,10 +602,8 @@ cat > "${PIPOOL_DIR}/configs/pipool.json" <<EOFJSON
     }
   },
   "dashboard": {
-    "enabled": ${DASH_ENABLED},
+    "enabled": true,
     "port": 8080,
-    "username": "admin",
-    "password": "${DASH_PASS}",
     "push_interval_s": 5
   },
   "logging": {
@@ -562,10 +620,23 @@ log "Config written — coinbase tag: ${COINBASE_TAG}"
 # STEP 8 — SYSTEMD SERVICE
 # =============================================================================
 step "Installing PiPool systemd service"
+
+# Build a Wants= line for whichever coin daemons were installed
+DAEMON_WANTS=""
+$DO_LTC  && DAEMON_WANTS="$DAEMON_WANTS litecoind.service"
+$DO_DOGE && DAEMON_WANTS="$DAEMON_WANTS dogecoind.service"
+$DO_BTC  && DAEMON_WANTS="$DAEMON_WANTS bitcoind.service"
+$DO_BCH  && DAEMON_WANTS="$DAEMON_WANTS bchd.service"
+$DO_PEP  && DAEMON_WANTS="$DAEMON_WANTS pepecoind.service"
+DAEMON_WANTS="${DAEMON_WANTS# }" # trim leading space
+
 cat > /etc/systemd/system/pipool.service <<EOF
 [Unit]
 Description=PiPool — Raspberry Pi 5 Solo Mining Pool
-After=network.target
+# Wait for real network (IP assigned) and all filesystems mounted
+After=network-online.target local-fs.target${DAEMON_WANTS:+ $DAEMON_WANTS}
+Wants=network-online.target${DAEMON_WANTS:+
+Wants=$DAEMON_WANTS}
 
 [Service]
 Type=simple
@@ -574,8 +645,15 @@ WorkingDirectory=${PIPOOL_DIR}
 ExecStart=${PIPOOL_DIR}/pipool -config ${PIPOOL_DIR}/configs/pipool.json
 Restart=always
 RestartSec=10
+TimeoutStartSec=60
 StandardOutput=append:/var/log/pipool/pipool.log
 StandardError=append:/var/log/pipool/pipool.log
+
+# Recreates /run/pipool on every boot (it lives on tmpfs — gets wiped on reboot)
+RuntimeDirectory=pipool
+RuntimeDirectoryMode=0755
+
+# RAM guard
 MemoryMax=512M
 MemoryHigh=400M
 
@@ -585,6 +663,22 @@ EOF
 systemctl daemon-reload
 systemctl enable pipool
 log "pipool.service installed and enabled"
+
+# ─── Ensure network-online.target actually waits for network ─────────────────
+# On Ubuntu Server this is sometimes disabled — enable it so our After= works
+step "Ensuring network-online.target is active"
+# Try NetworkManager first (Ubuntu Desktop/Server 20.04+), then systemd-networkd
+if systemctl list-unit-files NetworkManager-wait-online.service &>/dev/null; then
+    systemctl enable NetworkManager-wait-online.service 2>/dev/null && \
+        log "NetworkManager-wait-online.service enabled" || \
+        warn "Could not enable NetworkManager-wait-online (may already be active)"
+elif systemctl list-unit-files systemd-networkd-wait-online.service &>/dev/null; then
+    systemctl enable systemd-networkd-wait-online.service 2>/dev/null && \
+        log "systemd-networkd-wait-online.service enabled" || \
+        warn "Could not enable systemd-networkd-wait-online"
+else
+    warn "Could not find a network-wait service — boot ordering may be approximate"
+fi
 
 # =============================================================================
 # STEP 9 — FIREWALL
@@ -597,8 +691,8 @@ ufw allow 3334/tcp comment "PiPool DOGE Stratum"
 ufw allow 3335/tcp comment "PiPool BTC Stratum"
 ufw allow 3345/tcp comment "PiPool BTC Stratum TLS"
 ufw allow 3336/tcp comment "PiPool BCH Stratum"
+ufw allow 8080/tcp comment "PiPool Dashboard"
 ufw allow 9100/tcp comment "PiPool Prometheus metrics"
-[[ "$DASH_ENABLED" == "true" ]] && ufw allow 8080/tcp comment "PiPool Dashboard"
 ufw --force enable
 log "Firewall configured"
 
@@ -617,11 +711,11 @@ echo -e "  This tag will appear permanently in any block you mine,"
 echo -e "  visible on mempool.space and block explorers forever. 🏆"
 echo ""
 echo -e "${BOLD}Installed daemons:${NC}"
-$DO_LTC  && echo "  ✔ litecoind    — start: sudo systemctl start litecoind"
-$DO_DOGE && echo "  ✔ dogecoind    — start: sudo systemctl start dogecoind"
-$DO_BTC  && echo "  ✔ bitcoind     — start: sudo systemctl start bitcoind"
-$DO_BCH  && echo "  ✔ bitcoind-bch — start: sudo systemctl start bchd"
-$DO_PEP  && echo "  ✔ pepecoind    — start: sudo systemctl start pepecoind"
+$DO_LTC  && echo "  ✔ litecoind    → ${LTC_DATADIR}"
+$DO_DOGE && echo "  ✔ dogecoind    → ${DOGE_DATADIR}"
+$DO_BTC  && echo "  ✔ bitcoind     → ${BTC_DATADIR}"
+$DO_BCH  && echo "  ✔ bitcoind-bch → ${BCH_DATADIR}"
+$DO_PEP  && echo "  ✔ pepecoind    → ${PEP_DATADIR}"
 echo ""
 echo -e "${BOLD}Next steps:${NC}"
 echo ""
@@ -638,8 +732,7 @@ echo -e "     ${CYAN}LTC/DOGE plain:${NC}  stratum+tcp://${PI_IP}:3333"
 echo -e "     ${CYAN}LTC/DOGE TLS:${NC}    stratum+ssl://${PI_IP}:3343"
 echo -e "     ${CYAN}BTC/BCH  plain:${NC}  stratum+tcp://${PI_IP}:3335"
 echo -e "     ${CYAN}BTC/BCH  TLS:${NC}    stratum+ssl://${PI_IP}:3345"
-[[ "$DASH_ENABLED" == "true" ]] && \
-  echo -e "     ${CYAN}Dashboard:${NC}       http://${PI_IP}:8080  (admin / ${DASH_PASS})"
+echo -e "     ${CYAN}Dashboard:${NC}       http://${PI_IP}:8080"
 echo ""
 echo "  4. Control the pool:"
 echo "     pipoolctl status"

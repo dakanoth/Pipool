@@ -17,6 +17,7 @@ import (
 	"github.com/dakota/pipool/internal/merge"
 	"github.com/dakota/pipool/internal/metrics"
 	"github.com/dakota/pipool/internal/mining"
+	"github.com/dakota/pipool/internal/rpc"
 	"github.com/dakota/pipool/internal/stratum"
 )
 
@@ -26,7 +27,6 @@ func main() {
 	// ─── Flags ────────────────────────────────────────────────────────────────
 	cfgPath := flag.String("config", "configs/pipool.json", "Path to pipool.json config file")
 	genConfig := flag.Bool("init", false, "Generate a default config file and exit")
-	dashboard_on := flag.Bool("dashboard", false, "Force-enable the web dashboard (overrides config)")
 	metricsPort := flag.Int("metrics-port", 9100, "Prometheus metrics port (0 to disable)")
 	flag.Parse()
 
@@ -54,10 +54,6 @@ func main() {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Fatalf("Failed to load config from %s: %v\n\n  Run with -init to generate a default config.", *cfgPath, err)
-	}
-
-	if *dashboard_on {
-		cfg.Dashboard.Enabled = true
 	}
 
 	// ─── Logging setup ────────────────────────────────────────────────────────
@@ -97,19 +93,30 @@ func main() {
 
 	enabledCoins := cfg.EnabledCoins()
 	for _, coin := range enabledCoins {
-		// Only start Stratum servers for PRIMARY coins (non-merge-aux)
-		// Aux coins (DOGE, BCH) are merged into their parents via AuxPoW
+		// Aux coins (DOGE, BCH) are merged via AuxPoW — no separate stratum port.
+		// Probe their daemon and warn if unavailable; coordinator retries automatically.
 		if coin.MergeParent != "" {
-			log.Printf("[%s] merge-mined via %s — no separate stratum port needed", coin.Symbol, coin.MergeParent)
+			if err := probeDaemon(coin); err != nil {
+				log.Printf("[%s] daemon offline (%v) — merge mining paused, will retry automatically", coin.Symbol, err)
+				notifier.NodeUnreachable(coin.Symbol, err)
+			} else {
+				log.Printf("[%s] daemon online — merge mining active via %s", coin.Symbol, coin.MergeParent)
+			}
 			continue
+		}
+
+		// Probe primary coin daemon — start stratum regardless so miners can
+		// connect immediately. Jobs are served as soon as the daemon comes online.
+		if err := probeDaemon(coin); err != nil {
+			log.Printf("[%s] daemon offline (%v) — stratum port open, jobs paused until daemon is reachable", coin.Symbol, err)
+			notifier.NodeUnreachable(coin.Symbol, err)
+		} else {
+			log.Printf("[%s] daemon online", coin.Symbol)
 		}
 
 		srv := stratum.NewServer(coin, cfg, coord)
 
-		// Wire up Discord callbacks
-		srv.OnBlockFound = func(sym, hash string, reward float64) {
-			notifier.BlockFound(sym, hash, 0, reward, "unknown")
-		}
+		// Wire up Discord + dashboard callbacks
 		srv.OnMinerConnect = func(worker, addr string) {
 			total := srv.Stats().ConnectedMiners
 			notifier.MinerConnected(coin.Symbol, worker, addr, total)
@@ -118,9 +125,18 @@ func main() {
 			total := srv.Stats().ConnectedMiners
 			notifier.MinerDisconnected(coin.Symbol, worker, total)
 		}
+		srv.OnNodeUnreachable = func(err error) {
+			notifier.NodeUnreachable(coin.Symbol, err)
+		}
+		srv.OnNodeOnline = func() {
+			notifier.NodeBackOnline(coin.Symbol)
+		}
+		srv.OnBlockFound = func(sym, hash string, reward float64) {
+			notifier.BlockFound(sym, hash, 0, reward, "unknown")
+		}
 
 		if err := srv.Start(); err != nil {
-			log.Printf("[%s] FAILED to start stratum: %v", coin.Symbol, err)
+			log.Printf("[%s] FAILED to open stratum port: %v", coin.Symbol, err)
 			continue
 		}
 
@@ -129,7 +145,7 @@ func main() {
 	}
 
 	if len(servers) == 0 {
-		log.Fatal("No stratum servers started — check that at least one primary coin is enabled in config")
+		log.Fatal("No stratum ports could start — check for port conflicts or config errors")
 	}
 
 	// ─── Metrics registry ─────────────────────────────────────────────────────
@@ -137,7 +153,7 @@ func main() {
 
 	// ─── Control server (pipoolctl) ───────────────────────────────────────────
 	ctlServer := ctl.NewServer()
-	registerCtlHandlers(ctlServer, cfg, servers, sysmon, reg, notifier)
+	registerCtlHandlers(ctlServer, cfg, *cfgPath, servers, sysmon, reg, notifier)
 	if err := ctlServer.Start(); err != nil {
 		log.Printf("[ctl] warning: could not start control socket: %v", err)
 	} else {
@@ -203,25 +219,32 @@ func main() {
 		}()
 	}
 
-	// ─── Optional web dashboard ───────────────────────────────────────────────
-	if cfg.Dashboard.Enabled {
-		dash := dashboard.New(
-			cfg.Dashboard.Port,
-			cfg.Dashboard.Username,
-			cfg.Dashboard.Password,
-			time.Duration(cfg.Dashboard.PushIntervalS)*time.Second,
-			func() dashboard.StatsSnapshot {
-				return buildDashboardSnapshot(cfg, servers, sysmon)
-			},
-		)
+	// ─── Web dashboard (always on) ───────────────────────────────────────────
+	{
+		dashPort := cfg.Dashboard.Port
+		if dashPort == 0 {
+			dashPort = 8080
+		}
+		pushInterval := time.Duration(cfg.Dashboard.PushIntervalS) * time.Second
+		if pushInterval == 0 {
+			pushInterval = 5 * time.Second
+		}
+		// Pre-build one RPC client per coin — reused every dashboard snapshot
+		// instead of allocating a new http.Client every 5 seconds
+		dashClients := make(map[string]*rpc.Client, len(cfg.Coins))
+		for sym, coinCfg := range cfg.Coins {
+			dashClients[sym] = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
+				coinCfg.Node.User, coinCfg.Node.Password, sym)
+		}
+		dash := dashboard.New(dashPort, pushInterval, func() dashboard.StatsSnapshot {
+			return buildDashboardSnapshot(cfg, servers, sysmon, dashClients)
+		})
 		go func() {
 			if err := dash.Start(); err != nil {
 				log.Printf("[dashboard] error: %v", err)
 			}
 		}()
-		log.Printf("[dashboard] enabled at http://0.0.0.0:%d", cfg.Dashboard.Port)
-	} else {
-		log.Printf("[dashboard] disabled (run with -dashboard to enable, or set dashboard.enabled=true in config)")
+		log.Printf("[dashboard] http://0.0.0.0:%d — open in any browser on your network", dashPort)
 	}
 
 	// ─── Graceful shutdown ────────────────────────────────────────────────────
@@ -240,14 +263,15 @@ func main() {
 
 // ─── Stats aggregators ────────────────────────────────────────────────────────
 
-func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor) dashboard.StatsSnapshot {
+func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
-		Timestamp: time.Now(),
-		Uptime:     sysmon.Uptime().String(),
-		CPUTemp:    sysmon.CurrentTemp(),
-		CPUUsage:   sysmon.ReadCPUUsage(),
-		RAMUsedGB:  sysmon.ReadRAMUsage(),
-		Throttling: sysmon.IsThrottling(),
+		Timestamp:   time.Now(),
+		Uptime:      sysmon.Uptime().String(),
+		CPUTemp:     sysmon.CurrentTemp(),
+		CPUUsage:    sysmon.ReadCPUUsage(),
+		RAMUsedGB:   sysmon.ReadRAMUsage(),
+		Throttling:  sysmon.IsThrottling(),
+		CoinbaseTag: cfg.Pool.CoinbaseTag,
 	}
 
 	srvMap := make(map[string]*stratum.Server)
@@ -265,11 +289,28 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 			IsMergeAux:  coinCfg.MergeParent != "",
 			MergeParent: coinCfg.MergeParent,
 		}
+
+		// Use cached RPC client — avoids allocating a new http.Client every snapshot
+		cli, ok := dashClients[sym]
+		if !ok {
+			cli = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
+				coinCfg.Node.User, coinCfg.Node.Password, sym)
+		}
+		if err := cli.Ping(); err == nil {
+			cs.DaemonOnline = true
+			if h, err := cli.GetBlockCount(); err == nil {
+				cs.Height = h
+			}
+		}
+
 		if srv, ok := srvMap[sym]; ok {
 			stats := srv.Stats()
 			cs.Miners = stats.ConnectedMiners
 			cs.Blocks = stats.BlocksFound
-			cs.HashrateKHs = float64(stats.ValidShares) * coinCfg.Stratum.Vardiff.MinDiff / sysmon.Uptime().Seconds() * 1000
+			upSecs := sysmon.Uptime().Seconds()
+			if upSecs > 0 {
+				cs.HashrateKHs = float64(stats.ValidShares) * coinCfg.Stratum.Vardiff.MinDiff / upSecs * 1000
+			}
 			totalKHs += cs.HashrateKHs
 			totalBlocks += cs.Blocks
 		}
@@ -278,6 +319,36 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 
 	snap.TotalKHs = totalKHs
 	snap.BlocksFound = totalBlocks
+
+	// Workers across all servers
+	for _, srv := range servers {
+		sym := srv.Stats().Symbol
+		for _, w := range srv.ConnectedWorkers() {
+			snap.Workers = append(snap.Workers, dashboard.WorkerStat{
+				Name:       w.Name,
+				Coin:       sym,
+				Device:     w.DeviceName,
+				Difficulty: w.Difficulty,
+				Shares:     w.ShareCount,
+				RemoteAddr: w.RemoteAddr,
+			})
+		}
+	}
+
+	// Block log across all servers
+	for _, srv := range servers {
+		for _, b := range srv.BlockLog() {
+			snap.BlockLog = append(snap.BlockLog, dashboard.BlockEvent{
+				Coin:    b.Coin,
+				Height:  b.Height,
+				Hash:    b.Hash,
+				Reward:  b.Reward,
+				Worker:  b.Worker,
+				FoundAt: b.FoundAt.Format("Jan 2 15:04:05"),
+			})
+		}
+	}
+
 	return snap
 }
 
@@ -308,6 +379,7 @@ func buildReportData(servers []*stratum.Server, sysmon *mining.SystemMonitor) di
 func registerCtlHandlers(
 	ctlSrv *ctl.Server,
 	cfg *config.PoolConfig,
+	cfgPath string,
 	servers []*stratum.Server,
 	sysmon *mining.SystemMonitor,
 	reg *metrics.Registry,
@@ -409,7 +481,7 @@ func registerCtlHandlers(
 	})
 
 	ctlSrv.Register("reload", func(args []string) ctl.Response {
-		newCfg, err := config.Load("configs/pipool.json")
+		newCfg, err := config.Load(cfgPath)
 		if err != nil {
 			return ctl.Response{OK: false, Message: fmt.Sprintf("reload failed: %v", err)}
 		}
@@ -418,7 +490,26 @@ func registerCtlHandlers(
 		cfg.Logging = newCfg.Logging
 		cfg.Pool.TempLimitC = newCfg.Pool.TempLimitC
 		cfg.Pool.MaxConnections = newCfg.Pool.MaxConnections
-		return ctl.Response{OK: true, Message: "Config reloaded (discord, dashboard, logging, pool limits)"}
+		return ctl.Response{OK: true, Message: fmt.Sprintf("Config reloaded from %s", cfgPath)}
+	})
+
+	ctlSrv.Register("stop", func(args []string) ctl.Response {
+		log.Printf("[ctl] stop requested via pipoolctl")
+		// Send SIGTERM to ourselves — systemd will restart if Restart=always
+		go func() {
+			time.Sleep(100 * time.Millisecond) // let the response reach the client first
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+		return ctl.Response{OK: true, Message: "PiPool stopping... (systemd will restart it automatically)"}
+	})
+
+	ctlSrv.Register("restart", func(args []string) ctl.Response {
+		log.Printf("[ctl] restart requested via pipoolctl")
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+		return ctl.Response{OK: true, Message: "PiPool restarting... (watch: sudo journalctl -u pipool -f)"}
 	})
 
 	ctlSrv.Register("loglevel", func(args []string) ctl.Response {
@@ -440,4 +531,16 @@ func registerCtlHandlers(
 	ctlSrv.Register("version", func(args []string) ctl.Response {
 		return ctl.Response{OK: true, Message: fmt.Sprintf("PiPool v%s", version)}
 	})
+}
+
+// probeDaemon does a lightweight ping to a coin daemon to check availability.
+// Returns nil if reachable, an error describing the failure otherwise.
+// This is non-fatal — callers decide what to do if offline.
+func probeDaemon(coin config.CoinConfig) error {
+	cli := rpc.NewClient(
+		coin.Node.Host, coin.Node.Port,
+		coin.Node.User, coin.Node.Password,
+		coin.Symbol,
+	)
+	return cli.Ping()
 }
