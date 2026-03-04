@@ -20,6 +20,7 @@ import (
 type Server struct {
 	coin        config.CoinConfig
 	poolCfg     *config.PoolConfig
+	coinbaseTag string // e.g. "/PiPool/" — embedded in every block found
 	rpcClient   *rpc.Client
 	coordinator *merge.Coordinator
 
@@ -84,9 +85,16 @@ type Job struct {
 // NewServer creates a Stratum server for the given coin
 func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.Coordinator) *Server {
 	cli := rpc.NewClient(coin.Node.Host, coin.Node.Port, coin.Node.User, coin.Node.Password, coin.Symbol)
+
+	tag := poolCfg.Pool.CoinbaseTag
+	if tag == "" {
+		tag = "/PiPool/"
+	}
+
 	return &Server{
 		coin:         coin,
 		poolCfg:      poolCfg,
+		coinbaseTag:  tag,
 		rpcClient:    cli,
 		coordinator:  coord,
 		workers:      make(map[string]*Worker),
@@ -217,11 +225,22 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 	}
 	merkleBranches := buildMerkleBranch(txHashes)
 
+	// Build coinbase parts with tag embedded
+	// part1 ends just before extranonce, part2 starts after
+	// The tag (e.g. "/PiPool/") sits between the BIP34 height and the extranonce
+	cbPart1, cbPart2 := rpc.CreateCoinbaseTx(
+		s.coin.Wallet,
+		bt.CoinbaseValue,
+		bt.Height,
+		4, // extranonce2 size in bytes
+		s.coinbaseTag,
+	)
+
 	job := &Job{
 		ID:             fmt.Sprintf("%x", rand.Uint32()),
 		PrevHash:       reverseByteOrder(bt.PreviousBlockHash),
-		CoinbasePart1:  "", // built per-worker with extranonce1
-		CoinbasePart2:  "", // built per-worker
+		CoinbasePart1:  fmt.Sprintf("%x", cbPart1),
+		CoinbasePart2:  fmt.Sprintf("%x", cbPart2),
 		MerkleBranches: merkleBranches,
 		Version:        fmt.Sprintf("%08x", bt.Version),
 		NBits:          bt.Bits,

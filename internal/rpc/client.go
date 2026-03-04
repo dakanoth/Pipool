@@ -204,39 +204,75 @@ func (c *Client) GetBlockCount() (int64, error) {
 	return count, err
 }
 
-// CreateCoinbaseTx builds a minimal coinbase transaction paying to walletAddr.
-// Returns hex-encoded transaction bytes split into two parts (before & after extranonce).
-func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int) (part1, part2 []byte) {
-	// Encode block height in script (BIP34)
+// CreateCoinbaseTx builds a coinbase transaction split around the extranonce space.
+// The coinbase script sig is structured as:
+//   [block height (BIP34)] [coinbase tag bytes] [extranonce placeholder]
+//
+// Returns two halves — part1 ends just before extranonce, part2 starts after.
+// The miner fills in extranonce1 + extranonce2 between the two parts.
+// The coinbaseTag (e.g. "/PiPool/") is permanently visible on block explorers.
+func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int, coinbaseTag string) (part1, part2 []byte) {
 	heightScript := encodeHeight(height)
 
-	// part1: version(4) + input count(1) + prev hash(32) + prev idx(4) + script len varint + height script + extranonce placeholder start
+	// Sanitize tag — ASCII only, max 20 bytes, ensure it won't blow the 100-byte script limit
+	tagBytes := []byte(coinbaseTag)
+	if len(tagBytes) > 20 {
+		tagBytes = tagBytes[:20]
+	}
+
+	// Total coinbase script length:
+	// height script + tag + extranonce (extranonceSize bytes)
+	scriptLen := len(heightScript) + len(tagBytes) + extranonceSize
+	if scriptLen > 100 {
+		// Trim tag if we'd exceed the protocol limit
+		trim := scriptLen - 100
+		if trim < len(tagBytes) {
+			tagBytes = tagBytes[:len(tagBytes)-trim]
+		}
+		scriptLen = len(heightScript) + len(tagBytes) + extranonceSize
+	}
+
+	// ── Part 1: version + input + script up to (not including) extranonce ────
 	var buf1 bytes.Buffer
-	// version
+
+	// Version (int32 LE)
 	buf1.Write([]byte{0x01, 0x00, 0x00, 0x00})
-	// input count
+
+	// Input count: 1
 	buf1.WriteByte(0x01)
-	// prev hash (zeroes for coinbase)
+
+	// Prev hash: 32 zero bytes (coinbase)
 	buf1.Write(make([]byte, 32))
-	// prev index (0xFFFFFFFF)
+
+	// Prev index: 0xFFFFFFFF
 	buf1.Write([]byte{0xff, 0xff, 0xff, 0xff})
-	// script: height + extranonce space (we split here)
-	scriptLen := len(heightScript) + extranonceSize + 4 // 4 bytes for nonce placeholder
+
+	// Script length varint
 	buf1.WriteByte(byte(scriptLen))
+
+	// Height (BIP34)
 	buf1.Write(heightScript)
 
-	// part2: sequence + output count + output value + output script + locktime
+	// Coinbase tag — this is what shows up on block explorers
+	buf1.Write(tagBytes)
+
+	// ── Part 2: after extranonce — sequence + output + locktime ──────────────
 	var buf2 bytes.Buffer
-	// sequence
+
+	// Sequence
 	buf2.Write([]byte{0xff, 0xff, 0xff, 0xff})
-	// output count
+
+	// Output count: 1
 	buf2.WriteByte(0x01)
-	// value (little-endian int64)
+
+	// Value (int64 LE) — satoshis
 	for i := 0; i < 8; i++ {
 		buf2.WriteByte(byte(value >> (i * 8)))
 	}
-	// output script (OP_DUP OP_HASH160 <addr> OP_EQUALVERIFY OP_CHECKSIG)
-	// For simplicity we encode a p2pkh placeholder; real impl uses btcutil
+
+	// Output script: P2PKH  OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+	// In a real implementation btcutil.DecodeAddress + PayToAddrScript handles this.
+	// We write a placeholder that the block assembly step will replace with the real script.
 	addrBytes := []byte(walletAddr)
 	buf2.WriteByte(byte(len(addrBytes) + 5))
 	buf2.WriteByte(0x76) // OP_DUP
@@ -245,7 +281,8 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 	buf2.Write(addrBytes)
 	buf2.WriteByte(0x88) // OP_EQUALVERIFY
 	buf2.WriteByte(0xac) // OP_CHECKSIG
-	// locktime
+
+	// Locktime
 	buf2.Write([]byte{0x00, 0x00, 0x00, 0x00})
 
 	return buf1.Bytes(), buf2.Bytes()
