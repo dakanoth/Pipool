@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# Capture where the script lives — used to find the Go source tree regardless
+# of where the user cd'd before running
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"   # project root (contains go.mod)
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 log()  { echo -e "${GREEN}[✔]${NC} $1"; }
@@ -123,8 +128,6 @@ DOGE_RPC_PASS=$(openssl rand -hex 24)
 BTC_RPC_PASS=$(openssl rand -hex 24)
 BCH_RPC_PASS=$(openssl rand -hex 24)
 PEP_RPC_PASS=$(openssl rand -hex 24)
-DASH_PASS=$(openssl rand -hex 12)
-DASH_ENABLED="false"; [[ "${ENABLE_DASH:-n}" =~ ^[Yy]$ ]] && DASH_ENABLED="true"
 PEP_ENABLED="false";  [[ "$ENABLE_PEP"  =~ ^[Yy]$ ]] && PEP_ENABLED="true"
 
 DO_LTC=true;  [[ "${INSTALL_LTC:-y}"   =~ ^[Nn]$ ]] && DO_LTC=false
@@ -369,11 +372,11 @@ EOF
     log "pepecoind.service enabled"
 }
 
-$DO_LTC  && install_litecoin
-$DO_DOGE && install_dogecoin
-$DO_BTC  && install_bitcoin
-$DO_BCH  && install_bch
-$DO_PEP  && install_pepecoin
+if $DO_LTC;  then install_litecoin; fi
+if $DO_DOGE; then install_dogecoin; fi
+if $DO_BTC;  then install_bitcoin;  fi
+if $DO_BCH;  then install_bch;      fi
+if $DO_PEP;  then install_pepecoin; fi
 
 # =============================================================================
 # STEP 5 — COIN DAEMON CONFIGS
@@ -469,16 +472,16 @@ log "Coin daemon configs written"
 # STEP 6 — BUILD PIPOOL
 # =============================================================================
 step "Building PiPool"
-mkdir -p "$PIPOOL_DIR"
-cp -r . "$PIPOOL_DIR/"
-cd "$PIPOOL_DIR"
+mkdir -p "$PIPOOL_DIR/configs" /var/log/pipool /run/pipool
+
+# Build from the source tree — no need to copy the whole repo
+cd "$SOURCE_DIR"
 go mod tidy 2>/dev/null || true
-go build -ldflags="-s -w" -o pipool ./cmd/pipool/
-log "pipool binary built"
-go build -ldflags="-s -w" -o pipoolctl ./cmd/pipoolctl/
-install -m 0755 pipoolctl /usr/local/bin/pipoolctl
-log "pipoolctl installed to /usr/local/bin/pipoolctl"
-mkdir -p "${PIPOOL_DIR}/configs" /var/log/pipool /var/run/pipool
+go build -ldflags="-s -w" -o "${PIPOOL_DIR}/pipool" ./cmd/pipool/
+log "pipool binary built → ${PIPOOL_DIR}/pipool"
+go build -ldflags="-s -w" -o "${PIPOOL_DIR}/pipoolctl" ./cmd/pipoolctl/
+install -m 0755 "${PIPOOL_DIR}/pipoolctl" /usr/local/bin/pipoolctl
+log "pipoolctl installed → /usr/local/bin/pipoolctl"
 
 # =============================================================================
 # STEP 7 — WRITE pipool.json  (coinbase_tag included)
@@ -623,11 +626,11 @@ step "Installing PiPool systemd service"
 
 # Build a Wants= line for whichever coin daemons were installed
 DAEMON_WANTS=""
-$DO_LTC  && DAEMON_WANTS="$DAEMON_WANTS litecoind.service"
-$DO_DOGE && DAEMON_WANTS="$DAEMON_WANTS dogecoind.service"
-$DO_BTC  && DAEMON_WANTS="$DAEMON_WANTS bitcoind.service"
-$DO_BCH  && DAEMON_WANTS="$DAEMON_WANTS bchd.service"
-$DO_PEP  && DAEMON_WANTS="$DAEMON_WANTS pepecoind.service"
+if $DO_LTC;  then DAEMON_WANTS="$DAEMON_WANTS litecoind.service";  fi
+if $DO_DOGE; then DAEMON_WANTS="$DAEMON_WANTS dogecoind.service";  fi
+if $DO_BTC;  then DAEMON_WANTS="$DAEMON_WANTS bitcoind.service";   fi
+if $DO_BCH;  then DAEMON_WANTS="$DAEMON_WANTS bchd.service";       fi
+if $DO_PEP;  then DAEMON_WANTS="$DAEMON_WANTS pepecoind.service";  fi
 DAEMON_WANTS="${DAEMON_WANTS# }" # trim leading space
 
 cat > /etc/systemd/system/pipool.service <<EOF
@@ -711,11 +714,11 @@ echo -e "  This tag will appear permanently in any block you mine,"
 echo -e "  visible on mempool.space and block explorers forever. 🏆"
 echo ""
 echo -e "${BOLD}Installed daemons:${NC}"
-$DO_LTC  && echo "  ✔ litecoind    → ${LTC_DATADIR}"
-$DO_DOGE && echo "  ✔ dogecoind    → ${DOGE_DATADIR}"
-$DO_BTC  && echo "  ✔ bitcoind     → ${BTC_DATADIR}"
-$DO_BCH  && echo "  ✔ bitcoind-bch → ${BCH_DATADIR}"
-$DO_PEP  && echo "  ✔ pepecoind    → ${PEP_DATADIR}"
+if $DO_LTC;  then echo "  ✔ litecoind    → ${LTC_DATADIR}"; fi
+if $DO_DOGE; then echo "  ✔ dogecoind    → ${DOGE_DATADIR}"; fi
+if $DO_BTC;  then echo "  ✔ bitcoind     → ${BTC_DATADIR}"; fi
+if $DO_BCH;  then echo "  ✔ bitcoind-bch → ${BCH_DATADIR}"; fi
+if $DO_PEP;  then echo "  ✔ pepecoind    → ${PEP_DATADIR}"; fi
 echo ""
 echo -e "${BOLD}Next steps:${NC}"
 echo ""
