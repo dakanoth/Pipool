@@ -475,6 +475,19 @@ log "Coin daemon configs written"
 step "Building PiPool"
 mkdir -p "$PIPOOL_DIR/configs" /var/log/pipool /run/pipool
 
+# Remove any stale duplicate .go files that may have been copied in from
+# previous install attempts with mismatched filenames. The canonical filename
+# in every package is server.go — any _server.go variant is a leftover copy.
+for stale in \
+    "${SOURCE_DIR}/internal/dashboard/dashboard_server.go" \
+    "${SOURCE_DIR}/internal/stratum/stratum_server.go" \
+    "${SOURCE_DIR}/internal/ctl/ctl_server.go"; do
+  if [[ -f "$stale" ]]; then
+    warn "Removing stale duplicate: $stale"
+    rm -f "$stale"
+  fi
+done
+
 # Build from the source tree — no need to copy the whole repo
 cd "$SOURCE_DIR"
 go mod tidy 2>/dev/null || true
