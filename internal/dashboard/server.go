@@ -562,24 +562,24 @@ function apply(s) {
     const mergePill = c.is_merge_aux
       ? '<div class="merge-tag">⛓ Merge-mined via '+c.merge_parent+'</div>'
       : '';
-    grid.innerHTML += `
-      <div class="coin-card ${offline} ${mergeClass}">
-        <div class="coin-head">
-          <div class="coin-badge ${cls}">${c.symbol}</div>
-          <div class="coin-name-wrap">
-            <div class="coin-name">${c.symbol}</div>
-            <div class="coin-algo">${ALGO[c.symbol]||c.symbol}</div>
-          </div>
-          ${daemonDot}
-        </div>
-        ${mergePill}
-        <div class="coin-stats-grid">
-          <div class="cs"><div class="cs-l">Hashrate</div><div class="cs-v">${fmtHash(c.hashrate_khs)}</div></div>
-          <div class="cs"><div class="cs-l">Miners</div><div class="cs-v">${c.miners}</div></div>
-          <div class="cs"><div class="cs-l">Blocks Found</div><div class="cs-v">${c.blocks}</div></div>
-          <div class="cs"><div class="cs-l">Height</div><div class="cs-v">${c.height||'--'}</div></div>
-        </div>
-      </div>`;
+    grid.innerHTML +=
+      '<div class="coin-card '+offline+' '+mergeClass+'">' +
+        '<div class="coin-head">' +
+          '<div class="coin-badge '+cls+'">'+c.symbol+'</div>' +
+          '<div class="coin-name-wrap">' +
+            '<div class="coin-name">'+c.symbol+'</div>' +
+            '<div class="coin-algo">'+(ALGO[c.symbol]||c.symbol)+'</div>' +
+          '</div>' +
+          daemonDot +
+        '</div>' +
+        mergePill +
+        '<div class="coin-stats-grid">' +
+          '<div class="cs"><div class="cs-l">Hashrate</div><div class="cs-v">'+fmtHash(c.hashrate_khs)+'</div></div>' +
+          '<div class="cs"><div class="cs-l">Miners</div><div class="cs-v">'+c.miners+'</div></div>' +
+          '<div class="cs"><div class="cs-l">Blocks Found</div><div class="cs-v">'+c.blocks+'</div></div>' +
+          '<div class="cs"><div class="cs-l">Height</div><div class="cs-v">'+(c.height||'--')+'</div></div>' +
+        '</div>' +
+      '</div>';
   });
 
   // workers table
@@ -589,19 +589,19 @@ function apply(s) {
   if (workers.length === 0) {
     tbody.innerHTML = '<tr><td colspan="5" class="no-workers">No miners connected</td></tr>';
   } else {
-    tbody.innerHTML = workers.map(w => {
+    tbody.innerHTML = workers.map(function(w) {
       const coinCls = 'pill-'+(COIN_CLASS[w.coin]||'ltc');
       const addrShort = w.addr ? w.addr.split(':')[0] : '--';
-      return `<tr>
-        <td>
-          <div class="worker-name">${w.name||'anonymous'}</div>
-          <div class="worker-device">${w.device||'Unknown device'}</div>
-        </td>
-        <td><span class="coin-pill ${coinCls}">${w.coin}</span></td>
-        <td><span class="diff-val">${fmtDiff(w.difficulty||0)}</span></td>
-        <td><span class="shares-val">${(w.shares||0).toLocaleString()}</span></td>
-        <td><span class="addr-val">${addrShort}</span></td>
-      </tr>`;
+      return '<tr>' +
+        '<td>' +
+          '<div class="worker-name">'+(w.name||'anonymous')+'</div>' +
+          '<div class="worker-device">'+(w.device||'Unknown device')+'</div>' +
+        '</td>' +
+        '<td><span class="coin-pill '+coinCls+'">'+w.coin+'</span></td>' +
+        '<td><span class="diff-val">'+fmtDiff(w.difficulty||0)+'</span></td>' +
+        '<td><span class="shares-val">'+((w.shares||0).toLocaleString())+'</span></td>' +
+        '<td><span class="addr-val">'+addrShort+'</span></td>' +
+        '</tr>';
     }).join('');
   }
 
@@ -609,30 +609,31 @@ function apply(s) {
   const blocks = s.block_log||[];
   const logEl = document.getElementById('blockLog');
   if (blocks.length === 0) {
-    logEl.innerHTML = '<div class="no-blocks">No blocks found yet this session.<br>Keep hashing — it only takes one. 🎰</div>';
+    logEl.innerHTML = '<div class="no-blocks">No blocks found yet this session.<br>Keep hashing \u2014 it only takes one. \uD83C\uDFB0</div>';
   } else {
-    logEl.innerHTML = '<div class="block-log">' + blocks.map(b => `
-      <div class="block-entry">
-        <div class="block-trophy">🏆</div>
-        <div class="block-info">
-          <div class="block-coin-height">${b.coin} · Block #${b.height}</div>
-          <div class="block-hash">${b.hash}</div>
-          <div style="font-size:.62rem;color:var(--text2);margin-top:3px">by ${b.worker}</div>
-        </div>
-        <div class="block-meta">
-          <div class="block-reward">${b.reward}</div>
-          <div class="block-time">${b.found_at}</div>
-        </div>
-      </div>`).join('') + '</div>';
+    logEl.innerHTML = '<div class="block-log">' + blocks.map(function(b) {
+      return '<div class="block-entry">' +
+        '<div class="block-trophy">\uD83C\uDFC6</div>' +
+        '<div class="block-info">' +
+          '<div class="block-coin-height">'+b.coin+' \u00B7 Block #'+b.height+'</div>' +
+          '<div class="block-hash">'+b.hash+'</div>' +
+          '<div style="font-size:.62rem;color:var(--text2);margin-top:3px">by '+b.worker+'</div>' +
+        '</div>' +
+        '<div class="block-meta">' +
+          '<div class="block-reward">'+b.reward+'</div>' +
+          '<div class="block-time">'+b.found_at+'</div>' +
+        '</div>' +
+        '</div>';
+    }).join('') + '</div>';
   }
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
 }
 
 const evtSrc = new EventSource('/api/events');
-evtSrc.onmessage = e => { try { apply(JSON.parse(e.data)); } catch(err){} };
-evtSrc.onerror = () => { document.getElementById('liveStatus').textContent = 'RECONNECTING...'; };
-fetch('/api/stats').then(r=>r.json()).then(apply).catch(()=>{});
+evtSrc.onmessage = function(e) { try { apply(JSON.parse(e.data)); } catch(err){} };
+evtSrc.onerror = function() { document.getElementById('liveStatus').textContent = 'RECONNECTING...'; };
+fetch('/api/stats').then(function(r){return r.json();}).then(apply).catch(function(){});
 </script>
 </body>
 </html>`
