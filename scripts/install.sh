@@ -347,7 +347,8 @@ install_pepecoin() {
     make -j4
     install -m 0755 src/pepecoind /usr/local/bin/
     install -m 0755 src/pepecoin-cli /usr/local/bin/
-    cd /; rm -rf /tmp/pepecoin-src
+    cd /
+    rm -rf /tmp/pepecoin-src
     log "pepecoind installed"
 
     cat > /etc/systemd/system/pepecoind.service <<EOF
@@ -668,19 +669,17 @@ systemctl enable pipool
 log "pipool.service installed and enabled"
 
 # ─── Ensure network-online.target actually waits for network ─────────────────
-# On Ubuntu Server this is sometimes disabled — enable it so our After= works
 step "Ensuring network-online.target is active"
-# Try NetworkManager first (Ubuntu Desktop/Server 20.04+), then systemd-networkd
-if systemctl list-unit-files NetworkManager-wait-online.service &>/dev/null; then
+if systemctl list-unit-files | grep -q 'NetworkManager-wait-online.service'; then
     systemctl enable NetworkManager-wait-online.service 2>/dev/null && \
         log "NetworkManager-wait-online.service enabled" || \
-        warn "Could not enable NetworkManager-wait-online (may already be active)"
-elif systemctl list-unit-files systemd-networkd-wait-online.service &>/dev/null; then
+        warn "NetworkManager-wait-online already active or could not be enabled"
+elif systemctl list-unit-files | grep -q 'systemd-networkd-wait-online.service'; then
     systemctl enable systemd-networkd-wait-online.service 2>/dev/null && \
         log "systemd-networkd-wait-online.service enabled" || \
-        warn "Could not enable systemd-networkd-wait-online"
+        warn "systemd-networkd-wait-online already active or could not be enabled"
 else
-    warn "Could not find a network-wait service — boot ordering may be approximate"
+    warn "No network-wait service found — boot ordering may be approximate"
 fi
 
 # =============================================================================
