@@ -1,5 +1,12 @@
 # ⛏️ PiPool
 
+So help me god, I am not responsible if you're an idiot. Let me be abundantly clear. Legally or otherwise - you choose to use this for anything that it is intended you are the dumbfuck and I'll sit back and laugh in court.
+
+This is a Pi Flavor - based on Spiral Pool. Runs on 8 GBs, and it is WAY WAY early in build.
+You wanna fuck around and find out - here you go. A solution for the cheap, easy, and get the result fuckers of the world.
+This is for SCRYPT, SHA-256. Merge mined. BCH, BTC, or DOGE + LTC. I added PEP for the giggles.
+You want other coins, go to spiral. fuck off and get big dick hardware.
+
 **A lightweight, original solo mining pool server built in Go for the Raspberry Pi 5.**
 
 Supports merge mining for LTC+DOGE and BTC+BCH, Discord Sentinel notifications,
