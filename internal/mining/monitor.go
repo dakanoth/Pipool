@@ -3,18 +3,24 @@ package mining
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // SystemMonitor reads Pi hardware stats from sysfs/procfs
 type SystemMonitor struct {
-	startTime   time.Time
-	lastTempC   atomic.Value // float64
-	throttling  atomic.Bool
+	startTime  time.Time
+	lastTempC  atomic.Value // float64
+	throttling atomic.Bool
+
+	// CPU delta tracking — need two snapshots to compute real utilisation
+	cpuMu       sync.Mutex
+	lastCPUIdle float64
+	lastCPUTotal float64
+	lastCPUPct  float64
 
 	// Callbacks
 	OnHighTemp func(tempC float64)
@@ -70,51 +76,88 @@ func (m *SystemMonitor) ReadCPUTemp() float64 {
 	return 0
 }
 
-// ReadRAMUsage returns used RAM in GB
+// ReadRAMUsage returns used system RAM in GB by reading /proc/meminfo.
+// This reflects actual OS-wide memory usage, not just the Go runtime heap.
 func (m *SystemMonitor) ReadRAMUsage() float64 {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	return float64(ms.Sys) / (1024 * 1024 * 1024)
-}
-
-// ReadCPUUsage reads /proc/stat to compute CPU utilization %
-func (m *SystemMonitor) ReadCPUUsage() float64 {
-	data, err := os.ReadFile("/proc/stat")
+	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
 	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) == 0 {
-		return 0
+	var memTotal, memAvailable float64
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		val, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			memTotal = val
+		case "MemAvailable:":
+			memAvailable = val
+		}
 	}
-	// Format: cpu  user nice system idle iowait irq softirq steal
-	fields := strings.Fields(lines[0])
-	if len(fields) < 5 || fields[0] != "cpu" {
-		return 0
+	// /proc/meminfo reports in kB
+	used := memTotal - memAvailable
+	if used < 0 {
+		used = 0
 	}
+	return used / (1024 * 1024) // convert kB → GB
+}
 
+// readCPURaw reads the raw cumulative CPU counters from /proc/stat.
+func readCPURaw() (idle, total float64) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	fields := strings.Fields(strings.Split(string(data), "\n")[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0
+	}
 	var vals []float64
 	for _, f := range fields[1:] {
 		v, _ := strconv.ParseFloat(f, 64)
 		vals = append(vals, v)
-	}
-	if len(vals) < 4 {
-		return 0
-	}
-
-	total := 0.0
-	for _, v := range vals {
 		total += v
 	}
-	idle := vals[3]
+	idle = vals[3]
 	if len(vals) > 4 {
-		idle += vals[4] // iowait
+		idle += vals[4] // iowait counts as idle for our purposes
 	}
+	return idle, total
+}
 
+// ReadCPUUsage returns current CPU utilisation % using a delta between
+// the last two calls. First call always returns 0 (no baseline yet).
+func (m *SystemMonitor) ReadCPUUsage() float64 {
+	idle, total := readCPURaw()
 	if total == 0 {
 		return 0
 	}
-	return (1.0 - idle/total) * 100.0
+
+	m.cpuMu.Lock()
+	defer m.cpuMu.Unlock()
+
+	deltaIdle := idle - m.lastCPUIdle
+	deltaTotal := total - m.lastCPUTotal
+
+	m.lastCPUIdle = idle
+	m.lastCPUTotal = total
+
+	if deltaTotal <= 0 {
+		return m.lastCPUPct // return last known value if no time has passed
+	}
+
+	pct := (1.0 - deltaIdle/deltaTotal) * 100.0
+	if pct < 0 {
+		pct = 0
+	}
+	m.lastCPUPct = pct
+	return pct
 }
 
 // Uptime returns how long the pool has been running
