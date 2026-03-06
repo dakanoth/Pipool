@@ -197,6 +197,28 @@ func (c *Client) Ping() error {
 	return c.Call("ping", nil, nil)
 }
 
+
+// BlockchainInfo holds sync state from getblockchaininfo
+type BlockchainInfo struct {
+	Chain                string  `json:"chain"`
+	Blocks               int64   `json:"blocks"`
+	Headers              int64   `json:"headers"`
+	VerificationProgress float64 `json:"verificationprogress"` // 0.0 → 1.0
+	InitialBlockDownload bool    `json:"initialblockdownload"`
+	SizeOnDisk           int64   `json:"size_on_disk"`
+}
+
+// GetBlockchainInfo returns chain sync state including verificationprogress (0.0→1.0).
+// Use this to show sync progress on the dashboard.
+func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
+	var info BlockchainInfo
+	err := c.Call("getblockchaininfo", nil, &info)
+	if err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
 // GetBlockCount returns the current block height
 func (c *Client) GetBlockCount() (int64, error) {
 	var count int64
