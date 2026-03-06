@@ -28,8 +28,9 @@ type PoolSettings struct {
 type CoinConfig struct {
 	Enabled     bool        `json:"enabled"`
 	Symbol      string      `json:"symbol"`
-	Algorithm   string      `json:"algorithm"`   // "scrypt", "sha256d", "scryptn"
+	Algorithm   string      `json:"algorithm"`    // "scrypt", "sha256d", "scryptn"
 	MergeParent string      `json:"merge_parent"` // e.g. "LTC" for DOGE; "" if primary
+	DataDir     string      `json:"datadir"`      // blockchain storage path, e.g. /mnt/external/litecoin
 	Stratum     StratumConf `json:"stratum"`
 	Node        NodeConf    `json:"node"`
 	Wallet      string      `json:"wallet"`

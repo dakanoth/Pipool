@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -236,9 +237,37 @@ func main() {
 			dashClients[sym] = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
 				coinCfg.Node.User, coinCfg.Node.Password, sym)
 		}
-		dash := dashboard.New(dashPort, pushInterval, func() dashboard.StatsSnapshot {
-			return buildDashboardSnapshot(cfg, servers, sysmon, dashClients)
-		})
+		dash := dashboard.New(dashPort, pushInterval,
+			func() dashboard.StatsSnapshot {
+				return buildDashboardSnapshot(cfg, servers, sysmon, dashClients)
+			},
+			func() dashboard.NotifSettings {
+				a := cfg.Discord.Alerts
+				return dashboard.NotifSettings{
+					BlockFound:          a.BlockFound,
+					MinerConnected:      a.MinerConnected,
+					MinerDisconnect:     a.MinerDisconnect,
+					HighTemp:            a.HighTemp,
+					HashrateReport:      a.HashrateReport,
+					HashrateIntervalMin: a.HashrateIntervalMin,
+					HashrateDropPct:     a.HashrateDropPct,
+					NodeUnreachable:     a.NodeUnreachable,
+				}
+			},
+			func(ns dashboard.NotifSettings) {
+				cfg.Discord.Alerts.BlockFound          = ns.BlockFound
+				cfg.Discord.Alerts.MinerConnected      = ns.MinerConnected
+				cfg.Discord.Alerts.MinerDisconnect     = ns.MinerDisconnect
+				cfg.Discord.Alerts.HighTemp            = ns.HighTemp
+				cfg.Discord.Alerts.HashrateReport      = ns.HashrateReport
+				cfg.Discord.Alerts.HashrateIntervalMin = ns.HashrateIntervalMin
+				cfg.Discord.Alerts.HashrateDropPct     = ns.HashrateDropPct
+				cfg.Discord.Alerts.NodeUnreachable     = ns.NodeUnreachable
+				if err := config.Save(cfg, *cfgPath); err != nil {
+					log.Printf("[dashboard] notif save failed: %v", err)
+				}
+			},
+		)
 		go func() {
 			if err := dash.Start(); err != nil {
 				log.Printf("[dashboard] error: %v", err)
@@ -284,10 +313,12 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 
 	for sym, coinCfg := range cfg.Coins {
 		cs := dashboard.CoinStats{
-			Symbol:      sym,
-			Enabled:     coinCfg.Enabled,
-			IsMergeAux:  coinCfg.MergeParent != "",
-			MergeParent: coinCfg.MergeParent,
+			Symbol:        sym,
+			Enabled:       coinCfg.Enabled,
+			IsMergeAux:    coinCfg.MergeParent != "",
+			MergeParent:   coinCfg.MergeParent,
+			NodeHost:      coinCfg.Node.Host,
+			NodeLatencyMs: -1,
 		}
 
 		// Use cached RPC client — avoids allocating a new http.Client every snapshot
@@ -296,8 +327,10 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 			cli = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
 				coinCfg.Node.User, coinCfg.Node.Password, sym)
 		}
+		t0 := time.Now()
 		if err := cli.Ping(); err == nil {
 			cs.DaemonOnline = true
+			cs.NodeLatencyMs = time.Since(t0).Milliseconds()
 			if h, err := cli.GetBlockCount(); err == nil {
 				cs.Height = h
 			}
@@ -319,6 +352,9 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 
 	snap.TotalKHs = totalKHs
 	snap.BlocksFound = totalBlocks
+
+	// Storage stats
+	snap.Disks = collectDiskStats(cfg)
 
 	// Workers across all servers
 	for _, srv := range servers {
@@ -349,6 +385,17 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 		}
 	}
 
+	snap.Notifs = dashboard.NotifSettings{
+		BlockFound:          cfg.Discord.Alerts.BlockFound,
+		MinerConnected:      cfg.Discord.Alerts.MinerConnected,
+		MinerDisconnect:     cfg.Discord.Alerts.MinerDisconnect,
+		HighTemp:            cfg.Discord.Alerts.HighTemp,
+		HashrateReport:      cfg.Discord.Alerts.HashrateReport,
+		HashrateIntervalMin: cfg.Discord.Alerts.HashrateIntervalMin,
+		HashrateDropPct:     cfg.Discord.Alerts.HashrateDropPct,
+		NodeUnreachable:     cfg.Discord.Alerts.NodeUnreachable,
+	}
+
 	return snap
 }
 
@@ -372,6 +419,104 @@ func buildReportData(servers []*stratum.Server, sysmon *mining.SystemMonitor) di
 		data.BlocksFound += stats.BlocksFound
 	}
 	return data
+}
+
+// ─── Storage stats ────────────────────────────────────────────────────────────
+
+func collectDiskStats(cfg *config.PoolConfig) []dashboard.DiskStat {
+	// Build a map of mount point → coins that live there
+	type mountEntry struct {
+		label string
+		dirs  map[string]string // symbol → datadir path
+	}
+	mounts := make(map[string]*mountEntry)
+
+	for sym, coinCfg := range cfg.Coins {
+		if !coinCfg.Enabled || coinCfg.Node.Host == "" {
+			continue
+		}
+		// Use the configured datadir if present, otherwise skip
+		dir := coinCfg.DataDir
+		if dir == "" {
+			continue
+		}
+		// Find the mount point for this dir
+		mount := mountPointOf(dir)
+		if _, ok := mounts[mount]; !ok {
+			label := "SSD"
+			if mount == "/" {
+				label = "SD Card"
+			}
+			mounts[mount] = &mountEntry{label: label, dirs: make(map[string]string)}
+		}
+		mounts[mount].dirs[sym] = dir
+	}
+
+	// Always include the SD card (root) and the SSD if different
+	for _, extra := range []string{"/", "/mnt/external"} {
+		mount := mountPointOf(extra)
+		if _, ok := mounts[mount]; !ok {
+			label := "SD Card"
+			if mount != "/" {
+				label = "SSD"
+			}
+			mounts[mount] = &mountEntry{label: label, dirs: make(map[string]string)}
+		}
+	}
+
+	var stats []dashboard.DiskStat
+	for mount, entry := range mounts {
+		ds := statfsToStat(mount, entry.label)
+		ds.ChainSizes = make(map[string]float64)
+		for sym, dir := range entry.dirs {
+			ds.ChainSizes[sym] = dirSizeGB(dir)
+		}
+		stats = append(stats, ds)
+	}
+	return stats
+}
+
+// statfsToStat reads disk usage for a mount point
+func statfsToStat(mount, label string) dashboard.DiskStat {
+	var st syscall.Statfs_t
+	ds := dashboard.DiskStat{Label: label, Mount: mount}
+	if err := syscall.Statfs(mount, &st); err != nil {
+		return ds
+	}
+	total := float64(st.Blocks) * float64(st.Bsize)
+	free := float64(st.Bavail) * float64(st.Bsize)
+	used := total - free
+	gb := 1024 * 1024 * 1024
+	ds.TotalGB = total / float64(gb)
+	ds.UsedGB = used / float64(gb)
+	ds.FreeGB = free / float64(gb)
+	if total > 0 {
+		ds.UsedPct = (used / total) * 100
+	}
+	return ds
+}
+
+// mountPointOf returns the mount point that contains the given path
+func mountPointOf(path string) string {
+	// Walk up until we find a path where the device changes — simplified version
+	// Just return the path itself if it exists, otherwise "/"
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return "/"
+}
+
+// dirSizeGB returns the total size of a directory tree in GB
+func dirSizeGB(path string) float64 {
+	var total int64
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return float64(total) / (1024 * 1024 * 1024)
 }
 
 // ─── Control server handler registration ─────────────────────────────────────
