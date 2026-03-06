@@ -75,7 +75,7 @@ func main() {
 	sysmon := mining.NewSystemMonitor()
 
 	// ─── Discord Notifier ─────────────────────────────────────────────────────
-	notifier := discord.NewNotifier(cfg.Discord)
+	notifier := discord.NewNotifier(&cfg.Discord)
 
 	// Hook temp alerts into Discord
 	sysmon.OnHighTemp = func(tempC float64) {
@@ -158,7 +158,7 @@ func main() {
 	if err := ctlServer.Start(); err != nil {
 		log.Printf("[ctl] warning: could not start control socket: %v", err)
 	} else {
-		log.Printf("[ctl] Unix socket ready at /var/run/pipool/pipool.sock")
+		log.Printf("[ctl] Unix socket ready at /run/pipool/pipool.sock")
 		log.Printf("[ctl] Use: pipoolctl status | workers | coins | reload | ...")
 		defer ctlServer.Stop()
 	}
@@ -209,16 +209,20 @@ func main() {
 	notifier.PoolStarted(activeSymbols)
 
 	// ─── Periodic hashrate report ─────────────────────────────────────────────
-	if cfg.Discord.Alerts.HashrateIntervalMin > 0 {
-		reportInterval := time.Duration(cfg.Discord.Alerts.HashrateIntervalMin) * time.Minute
-		go func() {
-			ticker := time.NewTicker(reportInterval)
-			defer ticker.Stop()
-			for range ticker.C {
+	// Polls every minute; checks live config so dashboard interval changes take effect without restart.
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		var minutesSinceReport int
+		for range ticker.C {
+			minutesSinceReport++
+			interval := cfg.Discord.Alerts.HashrateIntervalMin
+			if interval > 0 && minutesSinceReport >= interval {
 				notifier.HashrateReport(buildReportData(servers, sysmon))
+				minutesSinceReport = 0
 			}
-		}()
-	}
+		}
+	}()
 
 	// ─── Web dashboard (always on) ───────────────────────────────────────────
 	{
@@ -424,43 +428,47 @@ func buildReportData(servers []*stratum.Server, sysmon *mining.SystemMonitor) di
 // ─── Storage stats ────────────────────────────────────────────────────────────
 
 func collectDiskStats(cfg *config.PoolConfig) []dashboard.DiskStat {
-	// Build a map of mount point → coins that live there
+	// With PC nodes, blockchain data lives on the Windows PC — not locally.
+	// We show the Pi's own storage: root (SD card) always, plus any other
+	// real mounted volumes (skip /mnt/external if it isn't actually mounted).
 	type mountEntry struct {
 		label string
-		dirs  map[string]string // symbol → datadir path
+		dirs  map[string]string // symbol → local datadir (only if DataDir is set)
 	}
 	mounts := make(map[string]*mountEntry)
 
+	// Always include root (SD card)
+	mounts["/"] = &mountEntry{label: "SD Card", dirs: make(map[string]string)}
+
+	// Include any coin datadirs that are explicitly configured AND local
+	// (DataDir == "" means data is on the PC — skip it)
 	for sym, coinCfg := range cfg.Coins {
-		if !coinCfg.Enabled || coinCfg.Node.Host == "" {
+		if !coinCfg.Enabled || coinCfg.DataDir == "" {
 			continue
 		}
-		// Use the configured datadir if present, otherwise skip
-		dir := coinCfg.DataDir
-		if dir == "" {
+		// Only include dirs that actually exist on this machine
+		if _, err := os.Stat(coinCfg.DataDir); err != nil {
 			continue
 		}
-		// Find the mount point for this dir
-		mount := mountPointOf(dir)
+		mount := mountPointOf(coinCfg.DataDir)
 		if _, ok := mounts[mount]; !ok {
-			label := "SSD"
+			label := "Storage"
 			if mount == "/" {
 				label = "SD Card"
 			}
 			mounts[mount] = &mountEntry{label: label, dirs: make(map[string]string)}
 		}
-		mounts[mount].dirs[sym] = dir
+		mounts[mount].dirs[sym] = coinCfg.DataDir
 	}
 
-	// Always include the SD card (root) and the SSD if different
-	for _, extra := range []string{"/", "/mnt/external"} {
+	// Include any real extra mounted volumes (skip if not actually mounted)
+	for _, extra := range []string{"/mnt/ssd", "/mnt/nvme", "/mnt/data"} {
+		if _, err := os.Stat(extra); err != nil {
+			continue // not mounted — skip
+		}
 		mount := mountPointOf(extra)
 		if _, ok := mounts[mount]; !ok {
-			label := "SD Card"
-			if mount != "/" {
-				label = "SSD"
-			}
-			mounts[mount] = &mountEntry{label: label, dirs: make(map[string]string)}
+			mounts[mount] = &mountEntry{label: "SSD", dirs: make(map[string]string)}
 		}
 	}
 
@@ -471,7 +479,9 @@ func collectDiskStats(cfg *config.PoolConfig) []dashboard.DiskStat {
 		for sym, dir := range entry.dirs {
 			ds.ChainSizes[sym] = dirSizeGB(dir)
 		}
-		stats = append(stats, ds)
+		if ds.TotalGB > 0 { // skip mounts that returned no data (permission error etc.)
+			stats = append(stats, ds)
+		}
 	}
 	return stats
 }
@@ -566,13 +576,23 @@ func registerCtlHandlers(
 		var out []map[string]interface{}
 		for _, srv := range servers {
 			stats := srv.Stats()
+			sym := stats.Symbol
+			nodeHost := "--"
+			if coinCfg, ok := cfg.Coins[sym]; ok {
+				nodeHost = fmt.Sprintf("%s:%d", coinCfg.Node.Host, coinCfg.Node.Port)
+			}
+			uptimeSec := sysmon.Uptime().Seconds()
+			var khs float64
+			if uptimeSec > 0 {
+				khs = float64(stats.ValidShares) / uptimeSec * 1000
+			}
 			out = append(out, map[string]interface{}{
-				"symbol":   stats.Symbol,
-				"enabled":  true,
-				"miners":   stats.ConnectedMiners,
-				"hashrate": fmt.Sprintf("%.2f KH/s", float64(stats.ValidShares)/sysmon.Uptime().Seconds()*1000),
-				"blocks":   stats.BlocksFound,
-				"height":   "--",
+				"symbol":    sym,
+				"enabled":   true,
+				"miners":    stats.ConnectedMiners,
+				"hashrate":  fmt.Sprintf("%.2f KH/s", khs),
+				"blocks":    stats.BlocksFound,
+				"node":      nodeHost,
 			})
 		}
 		return ctl.Response{OK: true, Data: out}
@@ -582,7 +602,7 @@ func registerCtlHandlers(
 		if len(args) < 2 {
 			return ctl.Response{OK: false, Message: "usage: coin <enable|disable> <SYMBOL>"}
 		}
-		action, symbol := args[0], args[1]
+		action, symbol := args[0], strings.ToUpper(args[1])
 		coinCfg, ok := cfg.Coins[symbol]
 		if !ok {
 			return ctl.Response{OK: false, Message: fmt.Sprintf("unknown coin: %s", symbol)}
@@ -591,13 +611,19 @@ func registerCtlHandlers(
 		case "enable":
 			coinCfg.Enabled = true
 			cfg.Coins[symbol] = coinCfg
-			return ctl.Response{OK: true, Message: fmt.Sprintf("%s enabled (restart stratum to take full effect)", symbol)}
+			if err := config.Save(cfg, cfgPath); err != nil {
+				log.Printf("[ctl] failed to save config after enabling %s: %v", symbol, err)
+			}
+			return ctl.Response{OK: true, Message: fmt.Sprintf("%s enabled and saved (restart pipool to open stratum port)", symbol)}
 		case "disable":
 			coinCfg.Enabled = false
 			cfg.Coins[symbol] = coinCfg
-			return ctl.Response{OK: true, Message: fmt.Sprintf("%s disabled", symbol)}
+			if err := config.Save(cfg, cfgPath); err != nil {
+				log.Printf("[ctl] failed to save config after disabling %s: %v", symbol, err)
+			}
+			return ctl.Response{OK: true, Message: fmt.Sprintf("%s disabled and saved", symbol)}
 		}
-		return ctl.Response{OK: false, Message: fmt.Sprintf("unknown action: %s", action)}
+		return ctl.Response{OK: false, Message: fmt.Sprintf("unknown action: %s (use enable or disable)", action)}
 	})
 
 	ctlSrv.Register("kick", func(args []string) ctl.Response {

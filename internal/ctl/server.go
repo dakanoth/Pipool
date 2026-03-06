@@ -217,12 +217,12 @@ func renderCoins(data interface{}) {
 	json.Unmarshal(b, &coins)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "COIN\tENABLED\tMINERS\tHASHRATE\tBLOCKS\tHEIGHT\n")
-	fmt.Fprintf(w, "────\t───────\t──────\t────────\t──────\t──────\n")
+	fmt.Fprintf(w, "COIN\tENABLED\tMINERS\tHASHRATE\tBLOCKS\tNODE\n")
+	fmt.Fprintf(w, "────\t───────\t──────\t────────\t──────\t────\n")
 	for _, c := range coins {
 		fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\n",
 			c["symbol"], c["enabled"], c["miners"],
-			c["hashrate"], c["blocks"], c["height"])
+			c["hashrate"], c["blocks"], c["node"])
 	}
 	w.Flush()
 }
@@ -235,7 +235,7 @@ Usage: pipoolctl <command> [args]
 Commands:
   status                        Show pool status (uptime, hashrate, temp, RAM)
   workers                       List all connected workers with device info
-  coins                         Show per-coin stats
+  coins                         Show per-coin stats (hashrate, blocks, PC node)
   coin enable  <SYMBOL>         Enable a coin  (e.g. pipoolctl coin enable PEP)
   coin disable <SYMBOL>         Disable a coin without restarting
   kick <worker>                 Disconnect a specific worker by name

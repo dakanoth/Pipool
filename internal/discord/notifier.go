@@ -23,14 +23,14 @@ const (
 
 // Notifier sends Discord webhook notifications
 type Notifier struct {
-	cfg     config.DiscordConfig
-	httpCli *http.Client
-	// rate-limit: track last send time per event type to avoid spam
+	cfg      *config.DiscordConfig // pointer so dashboard alert-toggle changes are seen live
+	httpCli  *http.Client
 	lastSent map[string]time.Time
 }
 
-// NewNotifier creates a new Discord notifier
-func NewNotifier(cfg config.DiscordConfig) *Notifier {
+// NewNotifier creates a new Discord notifier.
+// Pass &cfg.Discord so live edits (e.g. from the dashboard) are reflected immediately.
+func NewNotifier(cfg *config.DiscordConfig) *Notifier {
 	return &Notifier{
 		cfg:      cfg,
 		lastSent: make(map[string]time.Time),
@@ -263,7 +263,7 @@ func (n *Notifier) NodeUnreachable(coin string, err error) {
 
 // HashrateDropped sends an alert when hashrate drops significantly
 func (n *Notifier) HashrateDropped(coin string, currentKHs, previousKHs float64, dropPct int) {
-	if !n.cfg.Enabled || !n.cfg.Alerts.HashrateReport {
+	if !n.cfg.Enabled || n.cfg.Alerts.HashrateDropPct <= 0 {
 		return
 	}
 	key := "drop:" + coin
