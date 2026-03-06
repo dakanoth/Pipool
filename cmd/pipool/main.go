@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -315,31 +316,78 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 	var totalKHs float64
 	var totalBlocks uint64
 
+	// Fetch per-coin RPC data concurrently — avoids serial blocking over LAN
+	type coinResult struct {
+		sym string
+		cs  dashboard.CoinStats
+	}
+	resultCh := make(chan coinResult, len(cfg.Coins))
 	for sym, coinCfg := range cfg.Coins {
-		cs := dashboard.CoinStats{
-			Symbol:        sym,
-			Enabled:       coinCfg.Enabled,
-			IsMergeAux:    coinCfg.MergeParent != "",
-			MergeParent:   coinCfg.MergeParent,
-			NodeHost:      coinCfg.Node.Host,
-			NodeLatencyMs: -1,
-		}
+		sym, coinCfg := sym, coinCfg // capture loop vars
+		go func() {
+			cs := dashboard.CoinStats{
+				Symbol:        sym,
+				Enabled:       coinCfg.Enabled,
+				IsMergeAux:    coinCfg.MergeParent != "",
+				MergeParent:   coinCfg.MergeParent,
+				NodeHost:      coinCfg.Node.Host,
+				NodeLatencyMs: -1,
+				SyncPct:       -1, // -1 = unknown
+			}
+			cli, ok := dashClients[sym]
+			if !ok {
+				cli = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
+					coinCfg.Node.User, coinCfg.Node.Password, sym)
+			}
+			t0 := time.Now()
+			if info, err := cli.GetBlockchainInfo(); err == nil {
+				cs.DaemonOnline = true
+				cs.NodeLatencyMs = time.Since(t0).Milliseconds()
+				cs.Height = info.Blocks
+				cs.Headers = info.Headers
+				cs.IBD = info.InitialBlockDownload
+				cs.SyncPct = info.VerificationProgress * 100.0
+				if cs.SyncPct > 100.0 {
+					cs.SyncPct = 100.0
+				}
+			} else {
+				// Daemon offline — try ping for latency at least
+				t1 := time.Now()
+				if err2 := cli.Ping(); err2 == nil {
+					cs.DaemonOnline = true
+					cs.NodeLatencyMs = time.Since(t1).Milliseconds()
+				}
+			}
+			resultCh <- coinResult{sym, cs}
+		}()
+	}
 
-		// Use cached RPC client — avoids allocating a new http.Client every snapshot
-		cli, ok := dashClients[sym]
-		if !ok {
-			cli = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
-				coinCfg.Node.User, coinCfg.Node.Password, sym)
+	// Collect results — timeout safety so a hung node can't block the whole snapshot
+	coinMap := make(map[string]dashboard.CoinStats, len(cfg.Coins))
+	collectTimeout := time.After(4 * time.Second)
+	for i := 0; i < len(cfg.Coins); i++ {
+		select {
+		case r := <-resultCh:
+			coinMap[r.sym] = r.cs
+		case <-collectTimeout:
+			break
 		}
-		t0 := time.Now()
-		if err := cli.Ping(); err == nil {
-			cs.DaemonOnline = true
-			cs.NodeLatencyMs = time.Since(t0).Milliseconds()
-			if h, err := cli.GetBlockCount(); err == nil {
-				cs.Height = h
+	}
+
+	for sym, coinCfg := range cfg.Coins {
+		cs, ok := coinMap[sym]
+		if !ok {
+			// timed out — use offline placeholder
+			cs = dashboard.CoinStats{
+				Symbol:        sym,
+				Enabled:       coinCfg.Enabled,
+				IsMergeAux:    coinCfg.MergeParent != "",
+				MergeParent:   coinCfg.MergeParent,
+				NodeHost:      coinCfg.Node.Host,
+				NodeLatencyMs: -1,
+				SyncPct:       -1,
 			}
 		}
-
 		if srv, ok := srvMap[sym]; ok {
 			stats := srv.Stats()
 			cs.Miners = stats.ConnectedMiners
