@@ -98,9 +98,11 @@ type StatsFn func() StatsSnapshot
 type Server struct {
 	port         int
 	pushInterval time.Duration
-	getStats     StatsFn
-	getNotifs    func() NotifSettings
-	setNotifs    func(NotifSettings)
+	getStats        StatsFn
+	getNotifs       func() NotifSettings
+	setNotifs       func(NotifSettings)
+	getCoinbaseTag  func() string
+	setCoinbaseTag  func(string)
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -108,14 +110,17 @@ type Server struct {
 
 // New creates a new dashboard server
 func New(port int, pushInterval time.Duration, stats StatsFn,
-	getNotifs func() NotifSettings, setNotifs func(NotifSettings)) *Server {
+	getNotifs func() NotifSettings, setNotifs func(NotifSettings),
+	getCoinbaseTag func() string, setCoinbaseTag func(string)) *Server {
 	return &Server{
-		port:         port,
-		pushInterval: pushInterval,
-		getStats:     stats,
-		getNotifs:    getNotifs,
-		setNotifs:    setNotifs,
-		clients:      make(map[chan string]struct{}),
+		port:           port,
+		pushInterval:   pushInterval,
+		getStats:       stats,
+		getNotifs:      getNotifs,
+		setNotifs:      setNotifs,
+		getCoinbaseTag: getCoinbaseTag,
+		setCoinbaseTag: setCoinbaseTag,
+		clients:        make(map[chan string]struct{}),
 	}
 }
 
@@ -126,6 +131,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/events", s.handleSSE)
 	mux.HandleFunc("/api/discord", s.handleDiscord)
+	mux.HandleFunc("/api/tag", s.handleTag)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("[dashboard] http://0.0.0.0%s", addr)
@@ -156,6 +162,33 @@ func (s *Server) handleDiscord(w http.ResponseWriter, r *http.Request) {
 		s.setNotifs(ns)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleTag(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]string{"tag": s.getCoinbaseTag()})
+	case http.MethodPost:
+		var body struct {
+			Tag string `json:"tag"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Sanitize: strip newlines, max 20 chars, must start/end with /
+		tag := body.Tag
+		if len(tag) > 20 {
+			tag = tag[:20]
+		}
+		s.setCoinbaseTag(tag)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"tag": tag})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -539,7 +572,18 @@ footer {
     <div class="logo-sub">Raspberry Pi 5 &bull; Solo Mining Terminal</div>
   </div>
   <div class="topbar-right">
-    <div class="tag-badge" id="coinbaseTag">&#9889; /PiPool/</div>
+    <div style="position:relative">
+      <div class="tag-badge" id="coinbaseTag" onclick="openTagEditor()" title="Click to edit" style="cursor:pointer">&#9889; /PiPool/</div>
+      <div id="tagEditor" style="display:none;position:absolute;right:0;top:110%;z-index:100;background:var(--surf);border:1px solid var(--bdr2);padding:10px;min-width:240px;box-shadow:0 4px 20px rgba(0,255,65,0.15)">
+        <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim);letter-spacing:2px;margin-bottom:6px">COINBASE TAG (MAX 20 CHARS)</div>
+        <input id="tagInput" class="notif-input" style="width:100%;text-align:left;padding:4px 8px;font-size:.72rem" maxlength="20" placeholder="/PiPool/">
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button onclick="saveTag()" style="flex:1;background:var(--off);border:1px solid var(--bdr2);color:var(--hi);font-family:var(--scan);font-size:.64rem;padding:4px;cursor:pointer;letter-spacing:1px">SAVE</button>
+          <button onclick="closeTagEditor()" style="flex:1;background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.64rem;padding:4px;cursor:pointer;letter-spacing:1px">CANCEL</button>
+        </div>
+        <div id="tagSaveStatus" style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-top:6px;text-align:center"></div>
+      </div>
+    </div>
     <div>
       <div class="live-badge"><span class="pulse"></span><span id="liveStatus">CONNECTING</span></div>
       <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-top:4px;text-align:right" id="lastUpdate">--</div>
@@ -807,7 +851,11 @@ function applyNotifs(n) {
 function apply(s) {
   document.getElementById('liveStatus').textContent = 'ONLINE';
   document.getElementById('lastUpdate').textContent = new Date(s.timestamp).toLocaleTimeString();
-  if (s.coinbase_tag) document.getElementById('coinbaseTag').textContent = '&#9889; ' + s.coinbase_tag;
+  if (s.coinbase_tag) {
+    document.getElementById('coinbaseTag').innerHTML = '&#9889; ' + s.coinbase_tag;
+    var inp = document.getElementById('tagInput');
+    if (inp && document.activeElement !== inp) inp.value = s.coinbase_tag;
+  }
 
   document.getElementById('totalKhs').textContent   = fmtHash(s.total_khs||0);
   document.getElementById('blocksFound').textContent = s.blocks_found||0;
@@ -952,6 +1000,45 @@ function apply(s) {
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
 }
+
+function openTagEditor() {
+  var ed = document.getElementById('tagEditor');
+  var inp = document.getElementById('tagInput');
+  ed.style.display = 'block';
+  inp.focus();
+  inp.select();
+}
+
+function closeTagEditor() {
+  document.getElementById('tagEditor').style.display = 'none';
+  document.getElementById('tagSaveStatus').textContent = '';
+}
+
+function saveTag() {
+  var tag = document.getElementById('tagInput').value.trim();
+  var status = document.getElementById('tagSaveStatus');
+  if (!tag) { status.textContent = 'TAG CANNOT BE EMPTY'; return; }
+  fetch('/api/tag', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tag: tag})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    document.getElementById('coinbaseTag').innerHTML = '&#9889; ' + d.tag;
+    status.textContent = 'SAVED';
+    setTimeout(closeTagEditor, 800);
+  }).catch(function() {
+    status.textContent = 'ERROR';
+  });
+}
+
+// Close tag editor if clicking outside
+document.addEventListener('click', function(e) {
+  var ed = document.getElementById('tagEditor');
+  var badge = document.getElementById('coinbaseTag');
+  if (ed && ed.style.display !== 'none' && !ed.contains(e.target) && e.target !== badge) {
+    closeTagEditor();
+  }
+});
 
 var evtSrc = new EventSource('/api/events');
 evtSrc.onmessage = function(e) { try { apply(JSON.parse(e.data)); } catch(err){} };
