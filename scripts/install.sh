@@ -87,6 +87,19 @@ if [[ "$ENABLE_PEP" =~ ^[Yy]$ ]]; then
 fi
 
 echo ""
+echo -e "${CYAN}  ── LCC (Litecoin Cash) ───────────────────────────────────────${NC}"
+read -p "  Enable LCC mining? [y/N]: " ENABLE_LCC
+LCC_RPC_PASS=""
+LCC_WALLET="YOUR_LCC_WALLET"
+LCC_ENABLED="false"
+if [[ "$ENABLE_LCC" =~ ^[Yy]$ ]]; then
+  LCC_ENABLED="true"
+  read -p "  LCC RPC password (from pipool-nodes.json): " LCC_RPC_PASS
+  read -p "  LCC wallet address: " LCC_WALLET
+  [[ -z "$LCC_RPC_PASS" ]] && err "LCC RPC password is required"
+fi
+
+echo ""
 echo -e "${CYAN}  ── Pool Identity ─────────────────────────────────────────────${NC}"
 echo ""
 read -p "  Discord webhook URL (leave blank to skip): " DISCORD_WEBHOOK
@@ -269,7 +282,25 @@ cat > "${PIPOOL_DIR}/configs/pipool.json" <<EOFJSON
         "user": "pepd", "password": "${PEP_RPC_PASS}"
       },
       "wallet": "${PEP_WALLET}",
-      "block_reward": 50000
+    },
+    "LCC": {
+      "enabled": ${LCC_ENABLED},
+      "symbol": "LCC",
+      "algorithm": "sha256d",
+      "merge_parent": "BTC",
+      "datadir": "",
+      "stratum": {
+        "port": 3338,
+        "vardiff": { "min_diff": 1, "max_diff": 1048576, "target_ms": 30000, "retarget_s": 60 },
+        "tls": { "enabled": false, "port": 3348, "cert_file": "", "key_file": "" }
+      },
+      "node": {
+        "host": "${PC_IP}", "port": 62457,
+        "user": "lccd", "password": "${LCC_RPC_PASS}",
+        "zmq_pub_hashblock": "tcp://${PC_IP}:28336"
+      },
+      "wallet": "${LCC_WALLET}",
+      "block_reward": 250
     }
   },
   "discord": {
@@ -430,6 +461,7 @@ ufw allow 3334/tcp comment "PiPool DOGE Stratum"
 ufw allow 3335/tcp comment "PiPool BTC Stratum"
 ufw allow 3336/tcp comment "PiPool BCH Stratum"
 ufw allow 3337/tcp comment "PiPool PEP Stratum"
+ufw allow 3338/tcp comment "PiPool LCC Stratum"
 ufw allow 8080/tcp comment "PiPool Dashboard"
 ufw allow 9100/tcp comment "PiPool Prometheus metrics"
 ufw --force enable
@@ -457,6 +489,9 @@ echo -e "  BCH RPC:     ${PC_IP}:8336"
 if [[ "$PEP_ENABLED" == "true" ]]; then
 echo -e "  PEP RPC:     ${PC_IP}:33873"
 fi
+if [[ "$LCC_ENABLED" == "true" ]]; then
+echo -e "  LCC RPC:     ${PC_IP}:62457"
+fi
 echo ""
 echo -e "${BOLD}Next steps:${NC}"
 echo ""
@@ -473,6 +508,9 @@ echo -e "     ${CYAN}LTC/DOGE:${NC}   stratum+tcp://${PI_IP}:3333"
 echo -e "     ${CYAN}BTC/BCH:${NC}    stratum+tcp://${PI_IP}:3335"
 if [[ "$PEP_ENABLED" == "true" ]]; then
 echo -e "     ${CYAN}PEP:${NC}        stratum+tcp://${PI_IP}:3337"
+fi
+if [[ "$LCC_ENABLED" == "true" ]]; then
+echo -e "     ${CYAN}LCC:${NC}        stratum+tcp://${PI_IP}:3338"
 fi
 echo -e "     ${CYAN}Dashboard:${NC}  http://${PI_IP}:8080"
 echo ""
