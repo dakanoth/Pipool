@@ -28,9 +28,10 @@ type Server struct {
 	rpcClient   *rpc.Client
 	coordinator *merge.Coordinator
 
-	mu         sync.RWMutex
-	workers    map[string]*Worker
+	mu          sync.RWMutex
+	workers     map[string]*Worker
 	seenWorkers map[string]*SeenWorker // all workers ever connected this session
+	shareSamples []ShareSample         // rolling buffer of last 200 shares (for difficulty chart)
 	blockLog   []BlockEntry // last 50 blocks found, shown on dashboard
 	currentJob *Job
 
@@ -94,6 +95,13 @@ type SeenWorker struct {
 	Online         bool
 }
 
+// ShareSample records a single submitted share for the difficulty chart
+type ShareSample struct {
+	Difficulty float64
+	TimeMS     int64 // unix milliseconds
+	Accepted   bool
+}
+
 // Job represents a unit of mining work sent to miners
 type Job struct {
 	ID             string
@@ -122,7 +130,8 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 
 	return &Server{
 		coin:         coin,
-		seenWorkers:  make(map[string]*SeenWorker),
+		seenWorkers:   make(map[string]*SeenWorker),
+		shareSamples:  make([]ShareSample, 0, 200),
 		poolCfg:      poolCfg,
 		coinbaseTag:  tag,
 		rpcClient:    cli,
@@ -587,6 +596,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	w.lastShareAt = time.Now()
 	s.validShares.Add(1)
 	s.updateSeenWorkerShares(w)
+	s.recordShareSample(w.difficulty, true)
 
 	// Adjust vardiff
 	s.adjustVardiff(w)
@@ -1020,6 +1030,29 @@ func (s *Server) SetCoinbaseTag(tag string) {
 	s.mu.Lock()
 	s.coinbaseTag = tag
 	s.mu.Unlock()
+}
+
+// recordShareSample appends a share difficulty sample (ring buffer, max 200)
+func (s *Server) recordShareSample(diff float64, accepted bool) {
+	s.mu.Lock()
+	s.shareSamples = append(s.shareSamples, ShareSample{
+		Difficulty: diff,
+		TimeMS:     time.Now().UnixMilli(),
+		Accepted:   accepted,
+	})
+	if len(s.shareSamples) > 200 {
+		s.shareSamples = s.shareSamples[len(s.shareSamples)-200:]
+	}
+	s.mu.Unlock()
+}
+
+// ShareSamples returns a copy of the recent share difficulty history
+func (s *Server) ShareSamples() []ShareSample {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]ShareSample, len(s.shareSamples))
+	copy(out, s.shareSamples)
+	return out
 }
 
 // BlockLog returns a copy of the found-block log for the dashboard
