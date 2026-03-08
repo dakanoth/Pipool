@@ -9,22 +9,31 @@ import (
 	"time"
 )
 
+// ShareSample is a single submitted share difficulty for the telemetry chart
+type ShareSample struct {
+	Coin       string  `json:"coin"`
+	Difficulty float64 `json:"diff"`
+	TimeMS     int64   `json:"t"`
+	Accepted   bool    `json:"ok"`
+}
+
 // StatsSnapshot is the data pushed to dashboard clients every N seconds
 type StatsSnapshot struct {
-	Timestamp   time.Time      `json:"timestamp"`
-	Uptime      string         `json:"uptime"`
-	CPUTemp     float64        `json:"cpu_temp_c"`
-	CPUUsage    float64        `json:"cpu_usage_pct"`
-	RAMUsedGB   float64        `json:"ram_used_gb"`
-	Throttling  bool           `json:"throttling"`
-	TotalKHs    float64        `json:"total_khs"`
-	BlocksFound uint64         `json:"blocks_found"`
-	CoinbaseTag string         `json:"coinbase_tag"`
-	Coins       []CoinStats    `json:"coins"`
-	Workers     []WorkerStat   `json:"workers"`
-	BlockLog    []BlockEvent   `json:"block_log"`
-	Disks       []DiskStat     `json:"disks"`
-	Notifs      NotifSettings  `json:"notifs"`
+	Timestamp    time.Time      `json:"timestamp"`
+	Uptime       string         `json:"uptime"`
+	CPUTemp      float64        `json:"cpu_temp_c"`
+	CPUUsage     float64        `json:"cpu_usage_pct"`
+	RAMUsedGB    float64        `json:"ram_used_gb"`
+	Throttling   bool           `json:"throttling"`
+	TotalKHs     float64        `json:"total_khs"`
+	BlocksFound  uint64         `json:"blocks_found"`
+	CoinbaseTag  string         `json:"coinbase_tag"`
+	Coins        []CoinStats    `json:"coins"`
+	Workers      []WorkerStat   `json:"workers"`
+	BlockLog     []BlockEvent   `json:"block_log"`
+	Disks        []DiskStat     `json:"disks"`
+	Notifs       NotifSettings  `json:"notifs"`
+	ShareHistory []ShareSample  `json:"share_history"`
 }
 
 // DiskStat holds usage info for one mount point
@@ -260,23 +269,40 @@ const dashboardHTML = `<!DOCTYPE html>
 <title>PIPOOL // TERMINAL</title>
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
+/* ── FALLOUT THEME (default) ── */
 :root {
-  --bg:      #000800;
-  --surf:    #000f00;
-  --surf2:   #001500;
-  --bdr:     #004400;
-  --bdr2:    #007700;
-  --hi:      #00ff41;
-  --hi2:     #00cc33;
-  --dim:     #008822;
-  --dim2:    #005514;
-  --off:     #002200;
-  --red:     #ff4400;
-  --amber:   #ffaa00;
-  --scan:    'Share Tech Mono', monospace;
-  --vt:      'VT323', monospace;
-  --glow:    0 0 8px rgba(0,255,65,0.6);
-  --glow2:   0 0 20px rgba(0,255,65,0.3);
+  --bg:    #000800; --surf:  #000f00; --surf2: #001500;
+  --bdr:   #004400; --bdr2:  #007700;
+  --hi:    #00ff41; --hi2:   #00cc33;
+  --dim:   #008822; --dim2:  #005514; --off:   #002200;
+  --red:   #ff4400; --amber: #ffaa00;
+  --scan:  'Share Tech Mono', monospace; --vt: 'VT323', monospace;
+  --glow:  0 0 8px rgba(0,255,65,0.6); --glow2: 0 0 20px rgba(0,255,65,0.3);
+  --chart-line: #00ff41; --chart-net: #ff4400; --chart-rej: #ff6600;
+}
+
+/* ── MARATHON CLASSIC (original 1994 terminals: black + amber, Courier) ── */
+[data-theme="marathon-classic"] {
+  --bg:    #000000; --surf:  #080800; --surf2: #0d0d00;
+  --bdr:   #443300; --bdr2:  #886600;
+  --hi:    #ff8c00; --hi2:   #cc7000;
+  --dim:   #664400; --dim2:  #442200; --off:   #1a1000;
+  --red:   #ff2200; --amber: #ffcc00;
+  --scan:  'Courier New', Courier, monospace; --vt: 'Courier New', Courier, monospace;
+  --glow:  0 0 6px rgba(255,140,0,0.5); --glow2: 0 0 16px rgba(255,140,0,0.2);
+  --chart-line: #ff8c00; --chart-net: #ff2200; --chart-rej: #ff4400;
+}
+
+/* ── MARATHON 2025 (Bungie retro-futurism: dark + neon lime + glitch) ── */
+[data-theme="marathon-2025"] {
+  --bg:    #060609; --surf:  #0c0c12; --surf2: #111118;
+  --bdr:   #1a2a1a; --bdr2:  #2aff6a44;
+  --hi:    #aaff00; --hi2:   #77dd00;
+  --dim:   #446600; --dim2:  #223300; --off:   #0a120a;
+  --red:   #ff1155; --amber: #ffdd00;
+  --scan:  'Share Tech Mono', monospace; --vt: 'VT323', monospace;
+  --glow:  0 0 10px rgba(170,255,0,0.7); --glow2: 0 0 24px rgba(170,255,0,0.25);
+  --chart-line: #aaff00; --chart-net: #ff1155; --chart-rej: #ff6600;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 html { scrollbar-width:thin; scrollbar-color:var(--bdr2) var(--bg); }
@@ -284,7 +310,26 @@ html { scrollbar-width:thin; scrollbar-color:var(--bdr2) var(--bg); }
 body {
   background:var(--bg); color:var(--hi2);
   font-family:var(--scan); min-height:100vh;
-  overflow-x:hidden;
+  overflow-x:hidden; transition: background .4s, color .4s;
+}
+[data-theme="marathon-2025"] .section,
+[data-theme="marathon-2025"] .coin-card,
+[data-theme="marathon-2025"] .card {
+  border-style: solid;
+  border-image: linear-gradient(135deg, var(--bdr2), transparent, var(--bdr2)) 1;
+}
+[data-theme="marathon-2025"] .logo-text {
+  letter-spacing: 12px;
+  text-shadow: 0 0 20px rgba(170,255,0,0.9), 0 0 60px rgba(170,255,0,0.3);
+}
+[data-theme="marathon-classic"] .section,
+[data-theme="marathon-classic"] .coin-card {
+  border-radius: 0;
+  border-style: double;
+}
+[data-theme="marathon-classic"] .logo-sub {
+  font-family: 'Courier New', Courier, monospace;
+  letter-spacing: 6px;
 }
 
 /* CRT scanlines */
@@ -584,6 +629,11 @@ footer {
         <div id="tagSaveStatus" style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-top:6px;text-align:center"></div>
       </div>
     </div>
+    <button id="themeBtn" onclick="cycleTheme()" style="
+      background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);
+      font-family:var(--scan);font-size:.6rem;padding:5px 12px;cursor:pointer;
+      letter-spacing:2px;text-transform:uppercase;transition:border-color .2s
+    " title="Switch theme">FALLOUT</button>
     <div>
       <div class="live-badge"><span class="pulse"></span><span id="liveStatus">CONNECTING</span></div>
       <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-top:4px;text-align:right" id="lastUpdate">--</div>
@@ -645,6 +695,29 @@ footer {
   </div>
   <div class="section-body">
     <div class="coin-grid" id="coinGrid"></div>
+  </div>
+</div>
+
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">DIFFICULTY TELEMETRY</span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="chartCoinFilter" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">ALL CHAINS</span>
+      <select id="chartCoin" onchange="renderChart()" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.6rem;padding:2px 6px">
+        <option value="ALL">ALL</option>
+      </select>
+    </div>
+  </div>
+  <div class="section-body">
+    <div style="margin-bottom:10px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-line);box-shadow:var(--glow)"></div><span style="font-family:var(--scan);font-size:.58rem;color:var(--dim)">SHARE DIFF</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-net);box-shadow:0 0 6px rgba(255,68,0,.6)"></div><span style="font-family:var(--scan);font-size:.58rem;color:var(--dim)">NETWORK DIFF</span></div>
+      <div id="blockPct" style="font-family:var(--scan);font-size:.68rem;color:var(--hi);letter-spacing:2px;margin-left:auto"></div>
+    </div>
+    <canvas id="diffChart" style="width:100%;height:180px;display:block"></canvas>
+    <div id="noShareData" style="font-family:var(--scan);font-size:.7rem;color:var(--dim2);text-align:center;padding:40px 0">
+      NO SHARE DATA YET — CONNECT A MINER TO BEGIN
+    </div>
   </div>
 </div>
 
@@ -996,6 +1069,13 @@ function apply(s) {
     document.getElementById('storageUpdated').textContent = new Date().toLocaleTimeString();
   }
 
+  // Update difficulty chart
+  if (s.share_history && s.share_history.length > 0) {
+    shareHistoryGlobal = s.share_history;
+  }
+  if (s.coins) populateCoinFilter(s.coins);
+  renderChart();
+
   if (s.notifs) applyNotifs(s.notifs);
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
@@ -1039,6 +1119,198 @@ document.addEventListener('click', function(e) {
     closeTagEditor();
   }
 });
+
+var THEMES = ['fallout','marathon-classic','marathon-2025'];
+var THEME_LABELS = {fallout:'FALLOUT','marathon-classic':'M-CLASSIC','marathon-2025':'M-2025'};
+var currentTheme = 'fallout';
+
+function applyTheme(t) {
+  currentTheme = t;
+  document.documentElement.setAttribute('data-theme', t === 'fallout' ? '' : t);
+  var btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = THEME_LABELS[t] || t.toUpperCase();
+  try { localStorage.setItem('pipool_theme', t); } catch(e) {}
+}
+
+function cycleTheme() {
+  var idx = THEMES.indexOf(currentTheme);
+  applyTheme(THEMES[(idx + 1) % THEMES.length]);
+}
+
+(function() {
+  try {
+    var saved = localStorage.getItem('pipool_theme');
+    if (saved && THEMES.indexOf(saved) >= 0) applyTheme(saved);
+  } catch(e) {}
+})();
+
+// ─── Difficulty Chart ──────────────────────────────────────────────────────
+var shareHistoryGlobal = [];
+var coinNetDiff = {};
+
+function populateCoinFilter(coins) {
+  var sel = document.getElementById('chartCoin');
+  var existing = {};
+  for (var i = 0; i < sel.options.length; i++) existing[sel.options[i].value] = true;
+  coins.forEach(function(c) {
+    if (!existing[c.symbol]) {
+      var opt = document.createElement('option');
+      opt.value = c.symbol; opt.textContent = c.symbol;
+      sel.appendChild(opt);
+    }
+    if (c.difficulty) coinNetDiff[c.symbol] = c.difficulty;
+  });
+}
+
+function renderChart() {
+  var canvas = document.getElementById('diffChart');
+  var noData = document.getElementById('noShareData');
+  var sel = document.getElementById('chartCoin');
+  var filter = sel ? sel.value : 'ALL';
+
+  var samples = shareHistoryGlobal.filter(function(s) {
+    return filter === 'ALL' || s.coin === filter;
+  });
+
+  if (samples.length === 0) {
+    canvas.style.display = 'none';
+    noData.style.display = 'block';
+    document.getElementById('blockPct').textContent = '';
+    return;
+  }
+  canvas.style.display = 'block';
+  noData.style.display = 'none';
+
+  // Resize canvas to actual pixel width
+  var rect = canvas.getBoundingClientRect();
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width  = rect.width  * dpr;
+  canvas.height = rect.height * dpr;
+  var ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  var W = rect.width, H = rect.height;
+
+  // Get CSS vars
+  var style = getComputedStyle(document.documentElement);
+  var cLine = style.getPropertyValue('--chart-line').trim() || '#00ff41';
+  var cNet  = style.getPropertyValue('--chart-net').trim()  || '#ff4400';
+  var cRej  = style.getPropertyValue('--chart-rej').trim()  || '#ff6600';
+  var cBdr  = style.getPropertyValue('--bdr').trim()        || '#004400';
+  var cDim2 = style.getPropertyValue('--dim2').trim()       || '#005514';
+
+  // Determine network difficulty for selected filter
+  var netDiff = 0;
+  if (filter !== 'ALL') {
+    netDiff = coinNetDiff[filter] || 0;
+  } else {
+    // average all available net diffs
+    var vals = Object.values(coinNetDiff).filter(function(v){return v>0;});
+    if (vals.length) netDiff = vals.reduce(function(a,b){return a+b;},0) / vals.length;
+  }
+
+  var maxDiff = Math.max.apply(null, samples.map(function(s){return s.diff;}));
+  if (netDiff > maxDiff) maxDiff = netDiff;
+  maxDiff *= 1.1; // headroom
+
+  var PAD = {t:10, r:10, b:28, l:60};
+  var chartW = W - PAD.l - PAD.r;
+  var chartH = H - PAD.t - PAD.b;
+
+  // Background
+  ctx.fillStyle = style.getPropertyValue('--surf').trim() || '#000f00';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid lines
+  ctx.strokeStyle = cBdr;
+  ctx.lineWidth = 0.5;
+  for (var gi = 0; gi <= 4; gi++) {
+    var gy = PAD.t + (gi / 4) * chartH;
+    ctx.beginPath(); ctx.moveTo(PAD.l, gy); ctx.lineTo(W - PAD.r, gy); ctx.stroke();
+    // Y label
+    var yVal = maxDiff * (1 - gi / 4);
+    ctx.fillStyle = cDim2;
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(fmtDiffShort(yVal), PAD.l - 4, gy + 3);
+  }
+
+  // Network difficulty line
+  if (netDiff > 0) {
+    var ny = PAD.t + chartH * (1 - netDiff / maxDiff);
+    ctx.strokeStyle = cNet;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(PAD.l, ny); ctx.lineTo(W - PAD.r, ny); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = cNet;
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('NET DIFF', PAD.l + 4, ny - 3);
+  }
+
+  // Share dots + line
+  var n = samples.length;
+  var pts = samples.map(function(s, i) {
+    return {
+      x: PAD.l + (n === 1 ? chartW / 2 : (i / (n - 1)) * chartW),
+      y: PAD.t + chartH * (1 - Math.min(s.diff, maxDiff) / maxDiff),
+      ok: s.ok
+    };
+  });
+
+  // Line
+  ctx.strokeStyle = cLine;
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = cLine;
+  ctx.shadowBlur = 4;
+  ctx.beginPath();
+  pts.forEach(function(p, i) { i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y); });
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Dots
+  pts.forEach(function(p) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = p.ok ? cLine : cRej;
+    ctx.shadowColor = p.ok ? cLine : cRej;
+    ctx.shadowBlur = 6;
+    ctx.fill();
+  });
+  ctx.shadowBlur = 0;
+
+  // X-axis time labels
+  if (samples.length >= 2) {
+    var t0 = samples[0].t, tN = samples[samples.length-1].t;
+    ctx.fillStyle = cDim2;
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    [0, 0.5, 1].forEach(function(frac) {
+      var t = t0 + (tN - t0) * frac;
+      var x = PAD.l + frac * chartW;
+      var d = new Date(t);
+      ctx.fillText(d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0') + ':' + d.getSeconds().toString().padStart(2,'0'), x, H - 6);
+    });
+  }
+
+  // Block % readout
+  var lastDiff = samples[samples.length-1].diff;
+  if (netDiff > 0 && lastDiff > 0) {
+    var pct = (lastDiff / netDiff * 100).toExponential(2);
+    document.getElementById('blockPct').textContent =
+      'LAST SHARE: ' + fmtDiffShort(lastDiff) + '  //  NET: ' + fmtDiffShort(netDiff) +
+      '  //  RATIO: ' + pct + '%';
+  }
+}
+
+function fmtDiffShort(d) {
+  if (!d || d === 0) return '0';
+  if (d >= 1e12) return (d/1e12).toFixed(1)+'T';
+  if (d >= 1e9)  return (d/1e9).toFixed(1)+'G';
+  if (d >= 1e6)  return (d/1e6).toFixed(1)+'M';
+  if (d >= 1e3)  return (d/1e3).toFixed(1)+'K';
+  return d.toFixed(2);
+}
 
 var evtSrc = new EventSource('/api/events');
 evtSrc.onmessage = function(e) { try { apply(JSON.parse(e.data)); } catch(err){} };
