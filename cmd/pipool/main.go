@@ -25,6 +25,22 @@ import (
 
 const version = "1.0.0"
 
+// fmtUptime formats a duration as "2d 3h 14m" or "47m 12s"
+func fmtUptime(d time.Duration) string {
+	d = d.Round(time.Second)
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, mins, secs)
+	}
+	return fmt.Sprintf("%dm %ds", mins, secs)
+}
+
 func main() {
 	// ─── Flags ────────────────────────────────────────────────────────────────
 	cfgPath := flag.String("config", "configs/pipool.json", "Path to pipool.json config file")
@@ -300,7 +316,7 @@ func main() {
 func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
 		Timestamp:   time.Now(),
-		Uptime:      sysmon.Uptime().String(),
+		Uptime:      fmtUptime(sysmon.Uptime()),
 		CPUTemp:     sysmon.CurrentTemp(),
 		CPUUsage:    sysmon.ReadCPUUsage(),
 		RAMUsedGB:   sysmon.ReadRAMUsage(),
@@ -408,18 +424,28 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 	// Storage stats
 	snap.Disks = collectDiskStats(cfg)
 
-	// Workers across all servers
+	// Workers across all servers — include seen but offline workers for history
 	for _, srv := range servers {
 		sym := srv.Stats().Symbol
-		for _, w := range srv.ConnectedWorkers() {
-			snap.Workers = append(snap.Workers, dashboard.WorkerStat{
-				Name:       w.Name,
-				Coin:       sym,
-				Device:     w.DeviceName,
-				Difficulty: w.Difficulty,
-				Shares:     w.ShareCount,
-				RemoteAddr: w.RemoteAddr,
-			})
+		for _, w := range srv.AllWorkers() {
+			ws := dashboard.WorkerStat{
+				Name:           w.Name,
+				Coin:           sym,
+				Device:         w.DeviceName,
+				Difficulty:     w.Difficulty,
+				SharesAccepted: w.SharesAccepted,
+				SharesRejected: w.SharesRejected,
+				SharesStale:    w.SharesStale,
+				RemoteAddr:     w.RemoteAddr,
+				Online:         w.Online,
+			}
+			if !w.ConnectedAt.IsZero() {
+				ws.ConnectedAt = w.ConnectedAt.Format("Jan 2 15:04")
+			}
+			if !w.LastSeenAt.IsZero() {
+				ws.LastSeenAt = w.LastSeenAt.Format("Jan 2 15:04:05")
+			}
+			snap.Workers = append(snap.Workers, ws)
 		}
 	}
 
