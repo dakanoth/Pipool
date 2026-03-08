@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -190,7 +191,7 @@ func main() {
 				}, quaiNode)
 				qSHA.SetCallbacks(
 					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, height, 0, worker)
+						notifier.BlockFound("QUAI", hash, int64(height), 0, worker)
 					},
 					nil,
 				)
@@ -213,7 +214,7 @@ func main() {
 				}, quaiNode)
 				qScrypt.SetCallbacks(
 					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, height, 0, worker)
+						notifier.BlockFound("QUAI", hash, int64(height), 0, worker)
 					},
 					nil,
 				)
