@@ -2,9 +2,13 @@ package stratum
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
 	"sync"
@@ -26,6 +30,7 @@ type Server struct {
 
 	mu         sync.RWMutex
 	workers    map[string]*Worker
+	seenWorkers map[string]*SeenWorker // all workers ever connected this session
 	blockLog   []BlockEntry // last 50 blocks found, shown on dashboard
 	currentJob *Job
 
@@ -64,10 +69,29 @@ type Worker struct {
 	// Per-worker difficulty (vardiff)
 	difficulty   float64
 	lastShareAt  time.Time
-	shareCount   uint64
+
+	// Share counters
+	sharesAccepted uint64
+	sharesRejected uint64
+	sharesStale    uint64
+	connectedAt    time.Time
 
 	// Extranonce assigned to this worker
 	extranonce1  string
+}
+
+// SeenWorker tracks all workers ever connected this session (for dashboard history)
+type SeenWorker struct {
+	Name           string
+	DeviceName     string
+	LastAddr       string
+	Coin           string
+	SharesAccepted uint64
+	SharesRejected uint64
+	SharesStale    uint64
+	ConnectedAt    time.Time
+	LastSeenAt     time.Time
+	Online         bool
 }
 
 // Job represents a unit of mining work sent to miners
@@ -98,6 +122,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 
 	return &Server{
 		coin:         coin,
+		seenWorkers:  make(map[string]*SeenWorker),
 		poolCfg:      poolCfg,
 		coinbaseTag:  tag,
 		rpcClient:    cli,
@@ -334,6 +359,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 		remoteAddr:  conn.RemoteAddr().String(),
 		difficulty:  s.coin.Stratum.Vardiff.MinDiff,
 		lastShareAt: time.Now(),
+		connectedAt: time.Now(),
 		extranonce1: fmt.Sprintf("%08x", rand.Uint32()),
 	}
 
@@ -350,6 +376,16 @@ func (s *Server) handleWorker(conn net.Conn) {
 		conn.Close()
 		s.mu.Lock()
 		delete(s.workers, workerID)
+		// Update seenWorkers on disconnect
+		if w.authorized && w.workerName != "" {
+			if seen, ok := s.seenWorkers[w.workerName]; ok {
+				seen.Online = false
+				seen.LastSeenAt = time.Now()
+				seen.SharesAccepted = w.sharesAccepted
+				seen.SharesRejected = w.sharesRejected
+				seen.SharesStale = w.sharesStale
+			}
+		}
 		s.mu.Unlock()
 		s.connectedMiners.Add(-1)
 		log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
@@ -456,6 +492,24 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	w.authorized = true
 	w.workerName = workerName
 
+	// Track in seenWorkers map
+	s.mu.Lock()
+	if existing, ok := s.seenWorkers[workerName]; ok {
+		existing.Online = true
+		existing.LastSeenAt = time.Now()
+		existing.LastAddr = w.remoteAddr
+	} else {
+		s.seenWorkers[workerName] = &SeenWorker{
+			Name:        workerName,
+			LastAddr:    w.remoteAddr,
+			Coin:        s.coin.Symbol,
+			ConnectedAt: time.Now(),
+			LastSeenAt:  time.Now(),
+			Online:      true,
+		}
+	}
+	s.mu.Unlock()
+
 	// ── Spiral Router: classify device and set starting difficulty ────────────
 	device := RouteWorker(w.userAgent, workerName, s.coin.Algorithm)
 	w.deviceName = device.Name
@@ -501,32 +555,52 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	// params: [worker_name, job_id, extranonce2, ntime, nonce]
 
 	if len(params) < 5 {
+		w.sharesRejected++
 		return s.reply(w, msg.ID, false, []any{20, "Malformed params", nil})
 	}
 
-	// Share validation would happen here in a full implementation.
-	// We accept the share optimistically and check if it meets block target.
-	s.validShares.Add(1)
+	// Get current job snapshot
+	s.mu.RLock()
+	job := s.currentJob
+	s.mu.RUnlock()
+
+	if job == nil {
+		w.sharesRejected++
+		return s.reply(w, msg.ID, false, []any{21, "No job", nil})
+	}
+
+	// Validate the share: assemble header and check hash meets worker difficulty
+	extranonce2 := params[2]
+	ntime := params[3]
+	nonce := params[4]
+
+	valid, isBlock := s.validateShare(job, w.extranonce1, extranonce2, ntime, nonce, w.difficulty)
+
+	if !valid {
+		w.sharesRejected++
+		s.updateSeenWorkerShares(w)
+		log.Printf("[%s] rejected share from %s (hash above target)", s.coin.Symbol, w.workerName)
+		return s.reply(w, msg.ID, false, []any{23, "Low difficulty share", nil})
+	}
+
+	w.sharesAccepted++
 	w.lastShareAt = time.Now()
-	w.shareCount++
+	s.validShares.Add(1)
+	s.updateSeenWorkerShares(w)
 
 	// Adjust vardiff
 	s.adjustVardiff(w)
 
-	// Check if share meets block difficulty (simplified check)
-	// In production, we'd do full block assembly and hash comparison here
-	isBlock := s.checkBlockSolution(params)
 	if isBlock {
 		s.blocksFound.Add(1)
-		log.Printf("[%s] 🏆 BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
+		log.Printf("[%s] BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
 
 		reward := s.coin.BlockReward
-		go s.submitBlock(params, w.workerName)
+		blockHex := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, nonce)
+		go s.submitBlock(blockHex, w.workerName, job.Height)
 
-		// Record in dashboard block log
-		s.recordBlock("(pending)", s.currentJobHeight(), reward, w.workerName)
+		s.recordBlock("(pending)", job.Height, reward, w.workerName)
 
-		// Fire Discord notification
 		if s.OnBlockFound != nil {
 			s.OnBlockFound(s.coin.Symbol, "(pending)", reward)
 		}
@@ -535,19 +609,190 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	return s.reply(w, msg.ID, true, nil)
 }
 
-// checkBlockSolution is a placeholder — full impl assembles the block and
-// double-sha256 hashes the header, comparing against the current nbits target
-func (s *Server) checkBlockSolution(params []string) bool {
-	// TODO: assemble full block header and validate hash <= target
-	// For production: reconstruct coinbase, build merkle root, pack header, hash
-	return false
+// updateSeenWorkerShares syncs current share counts to seenWorkers map
+func (s *Server) updateSeenWorkerShares(w *Worker) {
+	if w.workerName == "" {
+		return
+	}
+	s.mu.Lock()
+	if seen, ok := s.seenWorkers[w.workerName]; ok {
+		seen.SharesAccepted = w.sharesAccepted
+		seen.SharesRejected = w.sharesRejected
+		seen.SharesStale    = w.sharesStale
+		seen.LastSeenAt     = time.Now()
+	}
+	s.mu.Unlock()
 }
 
-func (s *Server) submitBlock(shareParams []string, workerName string) {
-	// TODO: assemble full block hex from share params + current job template
-	// result, err := s.rpcClient.SubmitBlock(blockHex)
-	log.Printf("[%s] submitting block found by %s", s.coin.Symbol, workerName)
+// validateShare assembles the block header and checks whether the hash meets
+// the worker's current difficulty target AND whether it meets the block target.
+// Returns (shareValid, isBlock).
+func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce string, workerDiff float64) (bool, bool) {
+	// Build coinbase transaction hash
+	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
+	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
+	if err != nil {
+		return false, false
+	}
+	coinbaseHash := dsha256(coinbaseBytes)
+
+	// Compute merkle root from coinbase hash + merkle branches
+	merkleRoot := coinbaseHash[:]
+	for _, branch := range job.MerkleBranches {
+		branchBytes, err := hex.DecodeString(branch)
+		if err != nil {
+			return false, false
+		}
+		combined := append(merkleRoot, branchBytes...)
+		h := dsha256(combined)
+		merkleRoot = h[:]
+	}
+
+	// Assemble 80-byte block header
+	versionBytes, err := hex.DecodeString(job.Version)
+	if err != nil || len(versionBytes) != 4 {
+		return false, false
+	}
+	prevHashBytes, err := hex.DecodeString(job.PrevHash)
+	if err != nil || len(prevHashBytes) != 32 {
+		return false, false
+	}
+	ntimeBytes, err := hex.DecodeString(ntime)
+	if err != nil || len(ntimeBytes) != 4 {
+		return false, false
+	}
+	nbitsBytes, err := hex.DecodeString(job.NBits)
+	if err != nil || len(nbitsBytes) != 4 {
+		return false, false
+	}
+	nonceBytes, err := hex.DecodeString(nonce)
+	if err != nil || len(nonceBytes) != 4 {
+		return false, false
+	}
+
+	header := make([]byte, 80)
+	copy(header[0:4], versionBytes)
+	copy(header[4:36], prevHashBytes)
+	copy(header[36:68], merkleRoot)
+	copy(header[68:72], ntimeBytes)
+	copy(header[72:76], nbitsBytes)
+	copy(header[76:80], nonceBytes)
+
+	// Hash the header
+	hashBytes := dsha256(header)
+
+	// The hash is in little-endian; reverse for numeric comparison
+	hashBig := new(big.Int).SetBytes(reverseBytes(hashBytes[:]))
+
+	// Compute the block target from nbits
+	blockTarget := nbitsToTarget(nbitsBytes)
+
+	// Compute the share target from worker difficulty
+	// shareTarget = blockTarget * (network_diff / worker_diff)
+	// Simpler: shareTarget = maxTarget / workerDiff
+	// We use a standard difficulty-1 target for the coin's algorithm
+	diff1 := diff1Target(s.coin.Algorithm)
+	workerDiffBig := new(big.Float).SetFloat64(workerDiff)
+	diff1Float := new(big.Float).SetInt(diff1)
+	shareTargetFloat := new(big.Float).Quo(diff1Float, workerDiffBig)
+	shareTarget, _ := shareTargetFloat.Int(nil)
+
+	shareValid := hashBig.Cmp(shareTarget) <= 0
+	isBlock    := shareValid && hashBig.Cmp(blockTarget) <= 0
+
+	return shareValid, isBlock
 }
+
+// assembleBlockHex builds the full block hex from share parameters
+func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, nonce string) string {
+	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
+	coinbaseBytes, _ := hex.DecodeString(coinbaseHex)
+	coinbaseHash := dsha256(coinbaseBytes)
+
+	merkleRoot := coinbaseHash[:]
+	for _, branch := range job.MerkleBranches {
+		branchBytes, _ := hex.DecodeString(branch)
+		combined := append(merkleRoot, branchBytes...)
+		h := dsha256(combined)
+		merkleRoot = h[:]
+	}
+
+	versionBytes, _ := hex.DecodeString(job.Version)
+	prevHashBytes, _ := hex.DecodeString(job.PrevHash)
+	ntimeBytes, _ := hex.DecodeString(ntime)
+	nbitsBytes, _ := hex.DecodeString(job.NBits)
+	nonceBytes, _ := hex.DecodeString(nonce)
+
+	header := make([]byte, 80)
+	copy(header[0:4], versionBytes)
+	copy(header[4:36], prevHashBytes)
+	copy(header[36:68], merkleRoot)
+	copy(header[68:72], ntimeBytes)
+	copy(header[72:76], nbitsBytes)
+	copy(header[76:80], nonceBytes)
+
+	return hex.EncodeToString(header) + coinbaseHex
+}
+
+func (s *Server) submitBlock(blockHex, workerName string, height int64) {
+	result, err := s.rpcClient.SubmitBlock(blockHex)
+	if err != nil {
+		log.Printf("[%s] submitblock error: %v", s.coin.Symbol, err)
+		return
+	}
+	if result != "" {
+		log.Printf("[%s] block rejected by node: %s (found by %s)", s.coin.Symbol, result, workerName)
+		return
+	}
+	log.Printf("[%s] block #%d accepted! found by %s", s.coin.Symbol, height, workerName)
+}
+
+// ─── PoW math helpers ─────────────────────────────────────────────────────────
+
+func dsha256(data []byte) [32]byte {
+	h1 := sha256.Sum256(data)
+	return sha256.Sum256(h1[:])
+}
+
+func reverseBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, v := range b {
+		out[len(b)-1-i] = v
+	}
+	return out
+}
+
+// nbitsToTarget expands compact nbits to a 32-byte big.Int target
+func nbitsToTarget(nbits []byte) *big.Int {
+	exp := int(nbits[0])
+	mantissa := new(big.Int).SetBytes(nbits[1:4])
+	shift := 8 * (exp - 3)
+	if shift >= 0 {
+		return new(big.Int).Lsh(mantissa, uint(shift))
+	}
+	return new(big.Int).Rsh(mantissa, uint(-shift))
+}
+
+// diff1Target returns the difficulty-1 target for a given algorithm
+// This is the maximum hash value that counts as difficulty 1
+func diff1Target(algo string) *big.Int {
+	switch algo {
+	case "sha256d":
+		// Bitcoin diff-1: 0x00000000FFFF0000...0000 (26 zero bytes)
+		t, _ := new(big.Int).SetString("00000000FFFF0000000000000000000000000000000000000000000000000000", 16)
+		return t
+	case "scrypt", "scryptn":
+		// Litecoin diff-1: 0x0000FFFF00000000...0000
+		t, _ := new(big.Int).SetString("0000FFFF00000000000000000000000000000000000000000000000000000000", 16)
+		return t
+	default:
+		t, _ := new(big.Int).SetString("00000000FFFF0000000000000000000000000000000000000000000000000000", 16)
+		return t
+	}
+}
+
+// ─── unused compat stub (kept to avoid removing reverseByteOrder callers) ────
+var _ = binary.LittleEndian // ensure encoding/binary stays imported
 
 // ─── Vardiff ──────────────────────────────────────────────────────────────────
 
@@ -561,7 +806,7 @@ func (s *Server) adjustVardiff(w *Worker) {
 
 	// Calculate actual share interval
 	elapsed := time.Since(w.lastShareAt).Milliseconds()
-	actual := float64(elapsed) / float64(w.shareCount+1)
+	actual := float64(elapsed) / float64(w.sharesAccepted+1)
 	target := float64(vd.TargetMs)
 
 	ratio := target / actual
@@ -576,7 +821,7 @@ func (s *Server) adjustVardiff(w *Worker) {
 
 	if newDiff != w.difficulty {
 		w.difficulty = newDiff
-		w.shareCount = 0
+		// shares not reset on vardiff retarget
 		s.sendDifficulty(w, newDiff)
 	}
 }
@@ -679,16 +924,60 @@ type BlockEntry struct {
 	FoundAt time.Time
 }
 
-// WorkerInfo is a public snapshot of a connected worker
+// WorkerInfo is a public snapshot of a worker (online or previously seen)
 type WorkerInfo struct {
-	Name       string
-	DeviceName string
-	Difficulty float64
-	ShareCount uint64
-	RemoteAddr string
+	Name           string
+	DeviceName     string
+	Difficulty     float64
+	SharesAccepted uint64
+	SharesRejected uint64
+	SharesStale    uint64
+	RemoteAddr     string
+	ConnectedAt    time.Time
+	LastSeenAt     time.Time
+	Online         bool
 }
 
-// ConnectedWorkers returns a snapshot of all currently connected authorized workers
+// AllWorkers returns all workers seen this session (online + offline)
+func (s *Server) AllWorkers() []WorkerInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Build a set of currently online worker names with live stats
+	onlineByName := make(map[string]*Worker)
+	for _, w := range s.workers {
+		if w.authorized && w.workerName != "" {
+			onlineByName[w.workerName] = w
+		}
+	}
+
+	out := make([]WorkerInfo, 0, len(s.seenWorkers))
+	for name, seen := range s.seenWorkers {
+		wi := WorkerInfo{
+			Name:           name,
+			DeviceName:     seen.DeviceName,
+			SharesAccepted: seen.SharesAccepted,
+			SharesRejected: seen.SharesRejected,
+			SharesStale:    seen.SharesStale,
+			RemoteAddr:     seen.LastAddr,
+			ConnectedAt:    seen.ConnectedAt,
+			LastSeenAt:     seen.LastSeenAt,
+			Online:         seen.Online,
+		}
+		// Use live stats if currently connected
+		if w, ok := onlineByName[name]; ok {
+			wi.Difficulty     = w.difficulty
+			wi.SharesAccepted = w.sharesAccepted
+			wi.SharesRejected = w.sharesRejected
+			wi.SharesStale    = w.sharesStale
+			wi.Online         = true
+		}
+		out = append(out, wi)
+	}
+	return out
+}
+
+// ConnectedWorkers returns only currently connected workers (kept for ctl compat)
 func (s *Server) ConnectedWorkers() []WorkerInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -696,11 +985,16 @@ func (s *Server) ConnectedWorkers() []WorkerInfo {
 	for _, w := range s.workers {
 		if w.authorized {
 			out = append(out, WorkerInfo{
-				Name:       w.workerName,
-				DeviceName: w.deviceName,
-				Difficulty: w.difficulty,
-				ShareCount: w.shareCount,
-				RemoteAddr: w.remoteAddr,
+				Name:           w.workerName,
+				DeviceName:     w.deviceName,
+				Difficulty:     w.difficulty,
+				SharesAccepted: w.sharesAccepted,
+				SharesRejected: w.sharesRejected,
+				SharesStale:    w.sharesStale,
+				RemoteAddr:     w.remoteAddr,
+				ConnectedAt:    w.connectedAt,
+				LastSeenAt:     time.Now(),
+				Online:         true,
 			})
 		}
 	}
