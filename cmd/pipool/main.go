@@ -288,6 +288,20 @@ func main() {
 					log.Printf("[dashboard] notif save failed: %v", err)
 				}
 			},
+			func() string {
+				return cfg.Pool.CoinbaseTag
+			},
+			func(tag string) {
+				cfg.Pool.CoinbaseTag = tag
+				// propagate to all stratum servers
+				for _, srv := range servers {
+					srv.SetCoinbaseTag(tag)
+				}
+				if err := config.Save(cfg, *cfgPath); err != nil {
+					log.Printf("[dashboard] tag save failed: %v", err)
+				}
+				log.Printf("[dashboard] coinbase tag updated to: %s", tag)
+			},
 		)
 		go func() {
 			if err := dash.Start(); err != nil {
