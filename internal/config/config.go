@@ -14,6 +14,7 @@ type PoolConfig struct {
 	Discord  DiscordConfig           `json:"discord"`
 	Dashboard DashboardConfig        `json:"dashboard"`
 	Logging  LoggingConfig           `json:"logging"`
+	Quai     QuaiConfig              `json:"quai"`
 }
 
 type PoolSettings struct {
@@ -210,6 +211,26 @@ func DefaultConfig() *PoolConfig {
 				Wallet:      "YOUR_PEP_WALLET",
 				BlockReward: 50000,
 			},
+			"LCC": {
+				Enabled:     false, // opt-in — SHA-256d merge mined with BTC
+				Symbol:      "LCC",
+				Algorithm:   "sha256d",
+				MergeParent: "BTC",
+				Stratum: StratumConf{
+					Port: 3338,
+					Vardiff: VardiffConf{
+						MinDiff: 1, MaxDiff: 1048576,
+						TargetMs: 30000, RetargetS: 60,
+					},
+				},
+				Node: NodeConf{
+					Host: "127.0.0.1", Port: 62457,
+					User: "lccd", Password: "changeme",
+					ZmqPubHashBlock: "tcp://127.0.0.1:28336",
+				},
+				Wallet:      "YOUR_LCC_WALLET",
+				BlockReward: 250,
+			},
 		},
 		Discord: DiscordConfig{
 			Enabled:    true,
@@ -294,4 +315,29 @@ func (c *PoolConfig) MergeChildren(parentSymbol string) []CoinConfig {
 // WorkerTimeoutDuration converts config seconds to time.Duration
 func (p *PoolSettings) WorkerTimeoutDuration() time.Duration {
 	return time.Duration(p.WorkerTimeout) * time.Second
+}
+
+// ─── Quai Network config ──────────────────────────────────────────────────────
+
+// QuaiConfig holds settings for Quai Network solo/pool mining integration.
+type QuaiConfig struct {
+	Enabled bool            `json:"enabled"`
+	Node    QuaiNodeConf    `json:"node"`
+	SHA256  QuaiStratumConf `json:"sha256"`  // for SHA-256d ASICs
+	Scrypt  QuaiStratumConf `json:"scrypt"`  // for Scrypt ASICs
+}
+
+// QuaiNodeConf points to the go-quai node WebSocket endpoint.
+type QuaiNodeConf struct {
+	Host   string `json:"host"`   // e.g. "192.168.1.92"
+	WSPort int    `json:"ws_port"` // zone WebSocket port, e.g. 8548 (zone Cyprus-1)
+}
+
+// QuaiStratumConf configures one stratum listener (SHA-256 or Scrypt).
+type QuaiStratumConf struct {
+	Enabled    bool    `json:"enabled"`
+	Port       int     `json:"port"`        // e.g. 3340 (SHA-256), 3341 (Scrypt)
+	MinDiff    float64 `json:"min_diff"`    // vardiff floor
+	MaxDiff    float64 `json:"max_diff"`    // vardiff ceiling
+	TargetTime float64 `json:"target_time"` // seconds per share (default 15)
 }

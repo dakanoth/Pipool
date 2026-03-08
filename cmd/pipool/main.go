@@ -20,6 +20,7 @@ import (
 	"github.com/dakota/pipool/internal/metrics"
 	"github.com/dakota/pipool/internal/mining"
 	"github.com/dakota/pipool/internal/rpc"
+	"github.com/dakota/pipool/internal/quai"
 	"github.com/dakota/pipool/internal/stratum"
 )
 
@@ -165,6 +166,67 @@ func main() {
 	if len(servers) == 0 {
 		log.Fatal("No stratum ports could start — check for port conflicts or config errors")
 	}
+
+	// ─── Quai Network stratum servers ─────────────────────────────────────────
+	var quaiServers []*quai.Server
+	if cfg.Quai.Enabled {
+		log.Printf("[quai] Quai integration enabled — connecting to node at %s:%d",
+			cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
+
+		quaiNode := quai.NewNodeClient(cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
+		if err := quaiNode.Connect(context.Background()); err != nil {
+			log.Printf("[quai] WARNING: could not connect to Quai node: %v", err)
+		} else {
+			quaiNode.StartPolling(context.Background(), time.Second, nil) // callbacks set per-server below
+
+			// SHA-256 server (for Goldshell, Bitmain, etc.)
+			if cfg.Quai.SHA256.Enabled {
+				qSHA := quai.NewServer(quai.ServerConfig{
+					Algo:       "sha256d",
+					ListenAddr: fmt.Sprintf("0.0.0.0:%d", cfg.Quai.SHA256.Port),
+					MinDiff:    cfg.Quai.SHA256.MinDiff,
+					MaxDiff:    cfg.Quai.SHA256.MaxDiff,
+					TargetTime: cfg.Quai.SHA256.TargetTime,
+				}, quaiNode)
+				qSHA.SetCallbacks(
+					func(height uint64, hash, worker string) {
+						notifier.BlockFound("QUAI", hash, height, 0, worker)
+					},
+					nil,
+				)
+				if err := qSHA.Start(); err != nil {
+					log.Printf("[quai/sha256d] failed to start: %v", err)
+				} else {
+					quaiServers = append(quaiServers, qSHA)
+					log.Printf("[quai/sha256d] stratum listening on port %d", cfg.Quai.SHA256.Port)
+				}
+			}
+
+			// Scrypt server (for Elphapex DG Home 1, Goldshell Mini-DOGE, etc.)
+			if cfg.Quai.Scrypt.Enabled {
+				qScrypt := quai.NewServer(quai.ServerConfig{
+					Algo:       "scrypt",
+					ListenAddr: fmt.Sprintf("0.0.0.0:%d", cfg.Quai.Scrypt.Port),
+					MinDiff:    cfg.Quai.Scrypt.MinDiff,
+					MaxDiff:    cfg.Quai.Scrypt.MaxDiff,
+					TargetTime: cfg.Quai.Scrypt.TargetTime,
+				}, quaiNode)
+				qScrypt.SetCallbacks(
+					func(height uint64, hash, worker string) {
+						notifier.BlockFound("QUAI", hash, height, 0, worker)
+					},
+					nil,
+				)
+				if err := qScrypt.Start(); err != nil {
+					log.Printf("[quai/scrypt] failed to start: %v", err)
+				} else {
+					quaiServers = append(quaiServers, qScrypt)
+					log.Printf("[quai/scrypt] stratum listening on port %d", cfg.Quai.Scrypt.Port)
+				}
+			}
+		}
+	}
+	_ = quaiServers // used in dashboard snapshot below
 
 	// ─── Metrics registry ─────────────────────────────────────────────────────
 	reg := metrics.NewRegistry()
