@@ -28,8 +28,9 @@ type PoolSettings struct {
 type CoinConfig struct {
 	Enabled     bool        `json:"enabled"`
 	Symbol      string      `json:"symbol"`
-	Algorithm   string      `json:"algorithm"`   // "scrypt", "sha256d", "scryptn"
+	Algorithm   string      `json:"algorithm"`    // "scrypt", "sha256d", "scryptn"
 	MergeParent string      `json:"merge_parent"` // e.g. "LTC" for DOGE; "" if primary
+	DataDir     string      `json:"datadir"`      // blockchain storage path, e.g. /mnt/external/litecoin
 	Stratum     StratumConf `json:"stratum"`
 	Node        NodeConf    `json:"node"`
 	Wallet      string      `json:"wallet"`
@@ -89,13 +90,10 @@ type DiscordAlerts struct {
 }
 
 type DashboardConfig struct {
-	Enabled bool   `json:"enabled"`
-	Port    int    `json:"port"`
-	// Auth for the dashboard (basic auth)
-	Username string `json:"username"`
-	Password string `json:"password"`
-	// How frequently (seconds) to refresh stats pushed to clients
-	PushIntervalS int `json:"push_interval_s"`
+	Enabled       bool `json:"enabled"`
+	Port          int  `json:"port"`
+	PushIntervalS int  `json:"push_interval_s"`
+	// No auth — dashboard is LAN-only, open by default
 }
 
 type LoggingConfig struct {
@@ -212,6 +210,26 @@ func DefaultConfig() *PoolConfig {
 				Wallet:      "YOUR_PEP_WALLET",
 				BlockReward: 50000,
 			},
+			"LCC": {
+				Enabled:     false, // opt-in — SHA-256d merge mined with BTC
+				Symbol:      "LCC",
+				Algorithm:   "sha256d",
+				MergeParent: "BTC",
+				Stratum: StratumConf{
+					Port: 3338,
+					Vardiff: VardiffConf{
+						MinDiff: 1, MaxDiff: 1048576,
+						TargetMs: 30000, RetargetS: 60,
+					},
+				},
+				Node: NodeConf{
+					Host: "127.0.0.1", Port: 62457,
+					User: "lccd", Password: "changeme",
+					ZmqPubHashBlock: "tcp://127.0.0.1:28336",
+				},
+				Wallet:      "YOUR_LCC_WALLET",
+				BlockReward: 250,
+			},
 		},
 		Discord: DiscordConfig{
 			Enabled:    true,
@@ -230,10 +248,8 @@ func DefaultConfig() *PoolConfig {
 			},
 		},
 		Dashboard: DashboardConfig{
-			Enabled:       false, // opt-in, saves RAM
+			Enabled:       true,  // on by default — open HTTP on :8080
 			Port:          8080,
-			Username:      "admin",
-			Password:      "changeme",
 			PushIntervalS: 5,
 		},
 		Logging: LoggingConfig{
