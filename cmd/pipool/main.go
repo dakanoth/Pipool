@@ -652,7 +652,8 @@ func registerCtlHandlers(
 					"coin":   srv.Stats().Symbol,
 					"device": w.DeviceName,
 					"diff":   fmt.Sprintf("%.4f", w.Difficulty),
-					"shares": w.ShareCount,
+					"shares_accepted": w.SharesAccepted,
+					"shares_rejected": w.SharesRejected,
 					"addr":   w.RemoteAddr,
 				})
 			}
