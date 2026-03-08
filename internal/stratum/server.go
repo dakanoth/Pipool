@@ -1014,6 +1014,14 @@ func (s *Server) KickWorker(name string) bool {
 	return false
 }
 
+// SetCoinbaseTag updates the coinbase tag embedded in newly built jobs.
+// Safe to call at any time — takes effect on the next block template poll.
+func (s *Server) SetCoinbaseTag(tag string) {
+	s.mu.Lock()
+	s.coinbaseTag = tag
+	s.mu.Unlock()
+}
+
 // BlockLog returns a copy of the found-block log for the dashboard
 func (s *Server) BlockLog() []BlockEntry {
 	s.mu.RLock()
