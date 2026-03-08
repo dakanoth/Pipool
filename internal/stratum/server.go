@@ -31,7 +31,9 @@ type Server struct {
 	mu          sync.RWMutex
 	workers     map[string]*Worker
 	seenWorkers map[string]*SeenWorker // all workers ever connected this session
-	shareSamples []ShareSample         // rolling buffer of last 200 shares (for difficulty chart)
+	shareSamples    []ShareSample      // rolling buffer of last 200 shares (for difficulty chart)
+	hashrateSamples []HashrateSample   // rolling buffer of last 288 hashrate snapshots (24h @ 5min)
+	bestShareEver   float64            // all-time highest share difficulty this process
 	blockLog   []BlockEntry // last 50 blocks found, shown on dashboard
 	currentJob *Job
 
@@ -76,6 +78,7 @@ type Worker struct {
 	sharesRejected uint64
 	sharesStale    uint64
 	connectedAt    time.Time
+	bestShare      float64 // highest difficulty share submitted this session
 
 	// Extranonce assigned to this worker
 	extranonce1  string
@@ -90,6 +93,7 @@ type SeenWorker struct {
 	SharesAccepted uint64
 	SharesRejected uint64
 	SharesStale    uint64
+	BestShare      float64
 	ConnectedAt    time.Time
 	LastSeenAt     time.Time
 	Online         bool
@@ -100,6 +104,12 @@ type ShareSample struct {
 	Difficulty float64
 	TimeMS     int64 // unix milliseconds
 	Accepted   bool
+}
+
+// HashrateSample is a periodic hashrate snapshot for the chart
+type HashrateSample struct {
+	KHs    float64
+	TimeMS int64
 }
 
 // Job represents a unit of mining work sent to miners
@@ -131,7 +141,8 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 	return &Server{
 		coin:         coin,
 		seenWorkers:   make(map[string]*SeenWorker),
-		shareSamples:  make([]ShareSample, 0, 200),
+		shareSamples:    make([]ShareSample, 0, 200),
+		hashrateSamples: make([]HashrateSample, 0, 288),
 		poolCfg:      poolCfg,
 		coinbaseTag:  tag,
 		rpcClient:    cli,
@@ -595,6 +606,15 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	w.sharesAccepted++
 	w.lastShareAt = time.Now()
 	s.validShares.Add(1)
+	// Track best share per worker and all-time
+	if w.difficulty > w.bestShare {
+		w.bestShare = w.difficulty
+	}
+	s.mu.Lock()
+	if w.difficulty > s.bestShareEver {
+		s.bestShareEver = w.difficulty
+	}
+	s.mu.Unlock()
 	s.updateSeenWorkerShares(w)
 	s.recordShareSample(w.difficulty, true)
 
@@ -630,6 +650,9 @@ func (s *Server) updateSeenWorkerShares(w *Worker) {
 		seen.SharesRejected = w.sharesRejected
 		seen.SharesStale    = w.sharesStale
 		seen.LastSeenAt     = time.Now()
+		if w.bestShare > seen.BestShare {
+			seen.BestShare = w.bestShare
+		}
 	}
 	s.mu.Unlock()
 }
@@ -942,6 +965,7 @@ type WorkerInfo struct {
 	SharesAccepted uint64
 	SharesRejected uint64
 	SharesStale    uint64
+	BestShare      float64
 	RemoteAddr     string
 	ConnectedAt    time.Time
 	LastSeenAt     time.Time
@@ -980,6 +1004,7 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			wi.SharesAccepted = w.sharesAccepted
 			wi.SharesRejected = w.sharesRejected
 			wi.SharesStale    = w.sharesStale
+			wi.BestShare      = w.bestShare
 			wi.Online         = true
 		}
 		out = append(out, wi)
@@ -1001,6 +1026,7 @@ func (s *Server) ConnectedWorkers() []WorkerInfo {
 				SharesAccepted: w.sharesAccepted,
 				SharesRejected: w.sharesRejected,
 				SharesStale:    w.sharesStale,
+				BestShare:      w.bestShare,
 				RemoteAddr:     w.remoteAddr,
 				ConnectedAt:    w.connectedAt,
 				LastSeenAt:     time.Now(),
@@ -1030,6 +1056,35 @@ func (s *Server) SetCoinbaseTag(tag string) {
 	s.mu.Lock()
 	s.coinbaseTag = tag
 	s.mu.Unlock()
+}
+
+// RecordHashrateSample appends a hashrate snapshot (called from main.go on each push tick)
+func (s *Server) RecordHashrateSample(khs float64) {
+	s.mu.Lock()
+	s.hashrateSamples = append(s.hashrateSamples, HashrateSample{
+		KHs:    khs,
+		TimeMS: time.Now().UnixMilli(),
+	})
+	if len(s.hashrateSamples) > 288 {
+		s.hashrateSamples = s.hashrateSamples[len(s.hashrateSamples)-288:]
+	}
+	s.mu.Unlock()
+}
+
+// HashrateSamples returns a copy of the rolling hashrate history
+func (s *Server) HashrateSamples() []HashrateSample {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]HashrateSample, len(s.hashrateSamples))
+	copy(out, s.hashrateSamples)
+	return out
+}
+
+// BestShareEver returns the all-time highest share difficulty this session
+func (s *Server) BestShareEver() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bestShareEver
 }
 
 // recordShareSample appends a share difficulty sample (ring buffer, max 200)
