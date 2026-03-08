@@ -450,6 +450,7 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				SharesAccepted: w.SharesAccepted,
 				SharesRejected: w.SharesRejected,
 				SharesStale:    w.SharesStale,
+				BestShare:      w.BestShare,
 				RemoteAddr:     w.RemoteAddr,
 				Online:         w.Online,
 			}
@@ -472,6 +473,21 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				Difficulty: ss.Difficulty,
 				TimeMS:     ss.TimeMS,
 				Accepted:   ss.Accepted,
+			})
+		}
+		// Hashrate history (record a snapshot each time dashboard is polled)
+		stats := srv.Stats()
+		upSecs := sysmon.Uptime().Seconds()
+		var khs float64
+		if upSecs > 0 {
+			khs = stats.HashrateKHs
+		}
+		srv.RecordHashrateSample(khs)
+		for _, hs := range srv.HashrateSamples() {
+			snap.HashrateHistory = append(snap.HashrateHistory, dashboard.HashrateSample{
+				Coin:   sym,
+				KHs:    hs.KHs,
+				TimeMS: hs.TimeMS,
 			})
 		}
 	}
