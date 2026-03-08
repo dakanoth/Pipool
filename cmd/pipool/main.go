@@ -463,6 +463,19 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 		}
 	}
 
+	// Share difficulty history for telemetry chart
+	for _, srv := range servers {
+		sym := srv.Stats().Symbol
+		for _, ss := range srv.ShareSamples() {
+			snap.ShareHistory = append(snap.ShareHistory, dashboard.ShareSample{
+				Coin:       sym,
+				Difficulty: ss.Difficulty,
+				TimeMS:     ss.TimeMS,
+				Accepted:   ss.Accepted,
+			})
+		}
+	}
+
 	// Block log across all servers
 	for _, srv := range servers {
 		for _, b := range srv.BlockLog() {
