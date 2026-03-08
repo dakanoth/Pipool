@@ -57,13 +57,17 @@ type CoinStats struct {
 }
 
 type WorkerStat struct {
-	Name        string  `json:"name"`
-	Coin        string  `json:"coin"`
-	Device      string  `json:"device"`
-	Difficulty  float64 `json:"difficulty"`
-	Shares      uint64  `json:"shares"`
-	RemoteAddr  string  `json:"addr"`
-	ConnectedAt string  `json:"connected_at"`
+	Name           string  `json:"name"`
+	Coin           string  `json:"coin"`
+	Device         string  `json:"device"`
+	Difficulty     float64 `json:"difficulty"`
+	SharesAccepted uint64  `json:"shares_accepted"`
+	SharesRejected uint64  `json:"shares_rejected"`
+	SharesStale    uint64  `json:"shares_stale"`
+	RemoteAddr     string  `json:"addr"`
+	ConnectedAt    string  `json:"connected_at"`
+	LastSeenAt     string  `json:"last_seen_at"`
+	Online         bool    `json:"online"`
 }
 
 type BlockEvent struct {
@@ -453,6 +457,10 @@ body::before {
   text-align:center; padding:28px; color:var(--dim2);
   font-family:var(--scan); font-size:.72rem;
 }
+.worker-status-on  { font-family:var(--scan); font-size:.6rem; color:var(--hi); letter-spacing:1px; }
+.worker-status-off { font-family:var(--scan); font-size:.6rem; color:var(--dim2); letter-spacing:1px; }
+.worker-row-offline td { opacity:.5; }
+.shares-rej { font-family:var(--scan); color:var(--red); font-size:.7rem; }
 
 /* ── BLOCK LOG ── */
 .block-log { font-family:var(--scan); }
@@ -617,10 +625,10 @@ footer {
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
         <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Diff</th><th>Shares</th><th>IP</th>
+          <th>Worker</th><th>Coin</th><th>Diff</th><th>Accepted</th><th>Rejected</th><th>Status</th><th>IP</th>
         </tr></thead>
         <tbody id="workersBody">
-          <tr><td colspan="5" class="no-workers">No miners connected</td></tr>
+          <tr><td colspan="7" class="no-workers">No miners connected</td></tr>
         </tbody>
       </table>
     </div>
