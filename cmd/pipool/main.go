@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+	"sync"
 
 	"github.com/dakota/pipool/internal/config"
 	"github.com/dakota/pipool/internal/ctl"
