@@ -955,6 +955,9 @@ func (s *Server) writeJSON(w *Worker, v any) error {
 		return err
 	}
 	data = append(data, '\n')
+        if len(data) > 800 {
+		log.Printf("[%s] WARN large message to %s: %d bytes", s.coin.Symbol, w.workerName, len(data))
+	}
 	_, err = w.writer.Write(data)
 	if err != nil {
 		return err
