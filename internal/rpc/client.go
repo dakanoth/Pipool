@@ -298,12 +298,11 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 		buf2.WriteByte(byte(value >> (i * 8)))
 	}
 
-	// Output script: P2PKH — decode Base58Check address to get the 20-byte pubkey hash.
-	outputScript, err := BuildP2PKHScript(walletAddr)
+	// Output script: supports legacy P2PKH (Base58Check) and native SegWit P2WPKH (bech32).
+	outputScript, err := BuildOutputScript(walletAddr)
 	if err != nil {
-		// Fallback: OP_RETURN makes the output provably unspendable.
-		// This should never happen if the config has a valid legacy address.
-		log.Printf("[coinbase] WARN: cannot decode wallet address %q: %v — block reward will be UNSPENDABLE. Set a valid legacy (Base58) address.", walletAddr, err)
+		// Fallback: OP_RETURN — provably unspendable. Should never happen with a valid address.
+		log.Printf("[coinbase] WARN: cannot decode wallet address %q: %v — block reward will be UNSPENDABLE. Fix the wallet address in your config.", walletAddr, err)
 		buf2.WriteByte(0x01)
 		buf2.WriteByte(0x6a) // OP_RETURN
 	} else {
