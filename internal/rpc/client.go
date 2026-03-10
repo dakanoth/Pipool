@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -136,7 +137,11 @@ type TxData struct {
 }
 
 func (c *Client) GetBlockTemplate(capabilities []string) (*BlockTemplate, error) {
-	params := map[string]any{"capabilities": capabilities, "rules": []string{"segwit"}}
+	rules := []string{"segwit"}
+	if strings.EqualFold(c.Symbol, "LTC") {
+		rules = append(rules, "mweb")
+	}
+	params := map[string]any{"capabilities": capabilities, "rules": rules}
 	var bt BlockTemplate
 	if err := c.Call("getblocktemplate", []any{params}, &bt); err != nil {
 		return nil, err

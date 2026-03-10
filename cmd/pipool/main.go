@@ -178,8 +178,11 @@ func main() {
 			cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
 
 		quaiNode := quai.NewNodeClient(cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
-		if err := quaiNode.Connect(context.Background()); err != nil {
-			log.Printf("[quai] WARNING: could not connect to Quai node: %v", err)
+		quaiCtx, quaiCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		quaiErr := quaiNode.Connect(quaiCtx)
+		quaiCancel()
+		if quaiErr != nil {
+			log.Printf("[quai] WARNING: could not connect to Quai node: %v", quaiErr)
 		} else {
 			quaiNode.StartPolling(context.Background(), time.Second, nil) // callbacks set per-server below
 

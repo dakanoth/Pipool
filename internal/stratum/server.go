@@ -335,10 +335,11 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		}
 	}
 
-	// Build merkle branch from transactions
+	// Build merkle branch from transactions.
+	// Use TxID (non-witness), reversed to internal little-endian byte order for Stratum.
 	txHashes := make([]string, len(bt.Transactions))
 	for i, tx := range bt.Transactions {
-		txHashes[i] = tx.Hash
+		txHashes[i] = hexReverseBytes(tx.TxID)
 	}
 	merkleBranches := buildMerkleBranch(txHashes)
 
@@ -476,6 +477,9 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 		return s.handleAuthorize(w, msg)
 	case "mining.submit":
 		return s.handleSubmit(w, msg)
+	case "mining.configure":
+		// Acknowledge without enabling any extensions (no version-rolling support)
+		return s.reply(w, msg.ID, map[string]any{}, nil)
 	case "mining.suggest_difficulty":
 		return s.reply(w, msg.ID, true, nil)
 	case "mining.extranonce.subscribe":
@@ -1279,34 +1283,56 @@ func (s *Server) Diag() DiagStats {
 
 // ─── Merkle helpers ───────────────────────────────────────────────────────────
 
-// buildMerkleBranch returns the merkle branch needed to combine coinbase with tx list
+// buildMerkleBranch returns the merkle branch needed to combine coinbase with tx list.
+// txHashes must NOT include the coinbase — the miner supplies the coinbase hash.
+// At each level, hashes[0] is the right sibling of the coinbase path; the remaining
+// hashes are collapsed one level up before the next iteration.
 func buildMerkleBranch(txHashes []string) []string {
 	if len(txHashes) == 0 {
 		return nil
 	}
-	// The branch is the list of hashes at each level that must be combined with
-	// the running hash to reach the root (always taking the right sibling at each level)
 	branch := []string{}
 	hashes := make([]string, len(txHashes))
 	copy(hashes, txHashes)
 
-	for len(hashes) > 1 {
+	for len(hashes) > 0 {
 		branch = append(branch, hashes[0])
-		if len(hashes)%2 != 0 {
-			hashes = append(hashes, hashes[len(hashes)-1])
+		if len(hashes) == 1 {
+			break
 		}
-		var next []string
-		for i := 0; i < len(hashes); i += 2 {
-			next = append(next, combinedHash(hashes[i], hashes[i+1]))
+		// Remaining hashes (after the branch element) are collapsed one level.
+		remaining := make([]string, len(hashes)-1)
+		copy(remaining, hashes[1:])
+		if len(remaining)%2 == 1 {
+			remaining = append(remaining, remaining[len(remaining)-1])
+		}
+		next := make([]string, len(remaining)/2)
+		for i := 0; i < len(remaining); i += 2 {
+			next[i/2] = merkleHash(remaining[i], remaining[i+1])
 		}
 		hashes = next
 	}
 	return branch
 }
 
-func combinedHash(a, b string) string {
-	// double-sha256(decode(a) + decode(b)) — simplified placeholder
-	return fmt.Sprintf("%x", a+b)
+// merkleHash returns double-SHA256(a || b) as a hex string.
+func merkleHash(a, b string) string {
+	aBytes, _ := hex.DecodeString(a)
+	bBytes, _ := hex.DecodeString(b)
+	data := append(aBytes, bBytes...)
+	h1 := sha256.Sum256(data)
+	h2 := sha256.Sum256(h1[:])
+	return hex.EncodeToString(h2[:])
+}
+
+// hexReverseBytes reverses all bytes of a hex string (for converting display-order
+// txids to the internal little-endian byte order expected by Stratum).
+func hexReverseBytes(s string) string {
+	b, _ := hex.DecodeString(s)
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return hex.EncodeToString(b)
 }
 
 // reverseByteOrder reverses a hex string's byte order (for prevhash in Stratum)
