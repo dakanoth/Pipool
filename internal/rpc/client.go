@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -297,17 +298,18 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 		buf2.WriteByte(byte(value >> (i * 8)))
 	}
 
-	// Output script: P2PKH  OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
-	// In a real implementation btcutil.DecodeAddress + PayToAddrScript handles this.
-	// We write a placeholder that the block assembly step will replace with the real script.
-	addrBytes := []byte(walletAddr)
-	buf2.WriteByte(byte(len(addrBytes) + 5))
-	buf2.WriteByte(0x76) // OP_DUP
-	buf2.WriteByte(0xa9) // OP_HASH160
-	buf2.WriteByte(byte(len(addrBytes)))
-	buf2.Write(addrBytes)
-	buf2.WriteByte(0x88) // OP_EQUALVERIFY
-	buf2.WriteByte(0xac) // OP_CHECKSIG
+	// Output script: P2PKH — decode Base58Check address to get the 20-byte pubkey hash.
+	outputScript, err := BuildP2PKHScript(walletAddr)
+	if err != nil {
+		// Fallback: OP_RETURN makes the output provably unspendable.
+		// This should never happen if the config has a valid legacy address.
+		log.Printf("[coinbase] WARN: cannot decode wallet address %q: %v — block reward will be UNSPENDABLE. Set a valid legacy (Base58) address.", walletAddr, err)
+		buf2.WriteByte(0x01)
+		buf2.WriteByte(0x6a) // OP_RETURN
+	} else {
+		buf2.WriteByte(byte(len(outputScript)))
+		buf2.Write(outputScript)
+	}
 
 	// Locktime
 	buf2.Write([]byte{0x00, 0x00, 0x00, 0x00})
@@ -327,4 +329,5 @@ func encodeHeight(h int64) []byte {
 	return append([]byte{byte(len(b))}, b...)
 }
 
-var _ = bytes.NewBuffer // suppress unused import warning
+var _ = bytes.NewBuffer  // ensure bytes stays imported
+var _ = log.Printf       // ensure log stays imported

@@ -342,11 +342,16 @@ func (s *Server) onNewHeader(h *PendingHeader) {
 
 	// Broadcast new job to all connected miners
 	for _, w := range workerList {
-		if !w.authorized {
+		// Read worker fields under w.mu to avoid race with handleSubmit/adjustDifficulties
+		w.mu.Lock()
+		authorized := w.authorized
+		diff := w.difficulty
+		w.mu.Unlock()
+		if !authorized {
 			continue
 		}
 		// Create a per-worker job with their current difficulty
-		wJob := newJob(h, floatToBigInt(w.difficulty))
+		wJob := newJob(h, floatToBigInt(diff))
 		s.mu.Lock()
 		s.jobHistory[wJob.ID] = wJob
 		s.mu.Unlock()
@@ -421,9 +426,11 @@ func (s *Server) handleMessage(w *Worker, msg map[string]json.RawMessage) {
 		json.Unmarshal(msg["params"], &params)
 		if len(params) > 0 {
 			if d, ok := params[0].(float64); ok {
+				w.mu.Lock()
 				if d >= s.minDiff && d <= s.maxDiff {
 					w.difficulty = d
 				}
+				w.mu.Unlock()
 			}
 		}
 	}
@@ -474,11 +481,14 @@ func (s *Server) handleAuthorize(w *Worker, id interface{}, rawParams json.RawMe
 	job := s.currentJob
 	s.mu.RUnlock()
 	if job != nil {
-		wJob := newJob(job.Header, floatToBigInt(w.difficulty))
+		w.mu.Lock()
+		diff := w.difficulty
+		w.mu.Unlock()
+		wJob := newJob(job.Header, floatToBigInt(diff))
 		s.mu.Lock()
 		s.jobHistory[wJob.ID] = wJob
 		s.mu.Unlock()
-		_ = w.notify("mining.set_difficulty", []interface{}{w.difficulty})
+		_ = w.notify("mining.set_difficulty", []interface{}{diff})
 		_ = w.notify("mining.notify", wJob.miningNotify(true))
 	}
 }
@@ -500,7 +510,9 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 	job, ok := s.jobHistory[jobID]
 	s.mu.RUnlock()
 	if !ok {
+		w.mu.Lock()
 		w.sharesStale++
+		w.mu.Unlock()
 		_ = w.respond(id, false, []interface{}{21, "Stale — job not found"})
 		if s.onShare != nil {
 			s.onShare(w.name, false)
@@ -508,8 +520,13 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		return
 	}
 
+	// Read extranonce1 under lock (written once at connect, but be safe)
+	w.mu.Lock()
+	en1 := w.extraNonce1
+	w.mu.Unlock()
+
 	// Build the 80-byte header the miner hashed
-	header80 := buildHeader80(job.SealHash, ntime, job.NBits, w.extraNonce1, extranonce2, nonce)
+	header80 := buildHeader80(job.SealHash, ntime, job.NBits, en1, extranonce2, nonce)
 
 	// Hash it with the appropriate algorithm
 	var hashBytes []byte
@@ -524,7 +541,9 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 
 	// Check against worker difficulty target
 	if job.Target == nil || hashInt.Cmp(job.Target) > 0 {
+		w.mu.Lock()
 		w.sharesRejected++
+		w.mu.Unlock()
 		_ = w.respond(id, false, []interface{}{23, "Low difficulty share"})
 		if s.onShare != nil {
 			s.onShare(w.name, false)
@@ -532,14 +551,16 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		return
 	}
 
-	// Valid workshare — update counters
+	// Valid workshare — update counters under w.mu
+	shareDiff := bigIntToDiff(hashInt)
+	w.mu.Lock()
 	w.sharesAccepted++
 	w.lastShareAt = time.Now()
-	s.validShares.Add(1)
-	shareDiff := bigIntToDiff(hashInt)
 	if shareDiff > w.bestShare {
 		w.bestShare = shareDiff
 	}
+	w.mu.Unlock()
+	s.validShares.Add(1)
 	_ = w.respond(id, true, nil)
 	if s.onShare != nil {
 		s.onShare(w.name, true)
@@ -629,14 +650,24 @@ func (s *Server) adjustDifficulties() {
 	s.mu.RUnlock()
 
 	for _, w := range workers {
-		if !w.authorized || w.lastShareAt.IsZero() {
+		// Snapshot mutable fields under w.mu to avoid data races
+		w.mu.Lock()
+		authorized := w.authorized
+		lastShareAt := w.lastShareAt
+		connectedAt := w.connectedAt
+		sharesAccepted := w.sharesAccepted
+		sharesRejected := w.sharesRejected
+		oldDiff := w.difficulty
+		w.mu.Unlock()
+
+		if !authorized || lastShareAt.IsZero() {
 			continue
 		}
-		elapsed := time.Since(w.connectedAt).Seconds()
+		elapsed := time.Since(connectedAt).Seconds()
 		if elapsed < 30 {
 			continue
 		}
-		totalShares := float64(w.sharesAccepted + w.sharesRejected)
+		totalShares := float64(sharesAccepted + sharesRejected)
 		if totalShares == 0 {
 			continue
 		}
@@ -644,17 +675,19 @@ func (s *Server) adjustDifficulties() {
 		// Ratio of actual time per share vs target
 		ratio := actualTime / s.targetTime
 		if ratio < 0.5 || ratio > 2.0 {
-			newDiff := w.difficulty / ratio
+			newDiff := oldDiff / ratio
 			if newDiff < s.minDiff {
 				newDiff = s.minDiff
 			}
 			if newDiff > s.maxDiff {
 				newDiff = s.maxDiff
 			}
-			if newDiff != w.difficulty {
+			if newDiff != oldDiff {
+				w.mu.Lock()
 				w.difficulty = newDiff
+				w.mu.Unlock()
 				_ = w.notify("mining.set_difficulty", []interface{}{newDiff})
-				log.Printf("[quai/%s] vardiff %s: %.0f → %.0f (ratio %.2f)", s.algo, w.name, w.difficulty, newDiff, ratio)
+				log.Printf("[quai/%s] vardiff %s: %.0f → %.0f (ratio %.2f)", s.algo, w.name, oldDiff, newDiff, ratio)
 			}
 		}
 	}
@@ -702,10 +735,17 @@ func (s *Server) Stats() Stats {
 
 func (s *Server) Workers() []WorkerInfo {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]WorkerInfo, 0, len(s.workers))
+	wlist := make([]*Worker, 0, len(s.workers))
 	for _, w := range s.workers {
-		out = append(out, WorkerInfo{
+		wlist = append(wlist, w)
+	}
+	s.mu.RUnlock()
+
+	out := make([]WorkerInfo, 0, len(wlist))
+	for _, w := range wlist {
+		// Snapshot under w.mu — fields may be updated by worker or vardiff goroutines
+		w.mu.Lock()
+		info := WorkerInfo{
 			Name:           w.name,
 			Difficulty:     w.difficulty,
 			SharesAccepted: w.sharesAccepted,
@@ -716,7 +756,9 @@ func (s *Server) Workers() []WorkerInfo {
 			ConnectedAt:    w.connectedAt,
 			LastShareAt:    w.lastShareAt,
 			Online:         true,
-		})
+		}
+		w.mu.Unlock()
+		out = append(out, info)
 	}
 	return out
 }

@@ -2,6 +2,7 @@ package stratum
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"github.com/dakota/pipool/internal/config"
 	"github.com/dakota/pipool/internal/merge"
 	"github.com/dakota/pipool/internal/rpc"
+	"golang.org/x/crypto/scrypt"
 )
 
 // Server is a Stratum V1 server for a single primary coin (with optional merge mining)
@@ -131,6 +133,9 @@ type Job struct {
 	CreatedAt      time.Time
 	// Merge mining commitment included in coinbase
 	AuxCommitment  []byte
+	// RawTxHexes holds the serialized transactions from getblocktemplate (excluding coinbase).
+	// Required for correct full-block assembly when submitting a found block.
+	RawTxHexes     []string
 }
 
 // NewServer creates a Stratum server for the given coin
@@ -338,8 +343,10 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 	// Build merkle branch from transactions.
 	// Use TxID (non-witness), reversed to internal little-endian byte order for Stratum.
 	txHashes := make([]string, len(bt.Transactions))
+	txHexes := make([]string, len(bt.Transactions))
 	for i, tx := range bt.Transactions {
 		txHashes[i] = hexReverseBytes(tx.TxID)
+		txHexes[i] = tx.Data // raw serialized transaction for block assembly
 	}
 	merkleBranches := buildMerkleBranch(txHashes)
 
@@ -367,6 +374,7 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		Height:         bt.Height,
 		Target:         bt.Target,
 		AuxCommitment:  auxCommitment,
+		RawTxHexes:     txHexes,
 		CreatedAt:      time.Now(),
 	}
 
@@ -395,7 +403,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 		extranonce1:    fmt.Sprintf("%08x", rand.Uint32()),
 	}
 
-	conn.SetDeadline(time.Now().Add(s.poolCfg.Pool.WorkerTimeoutDuration()))
+	conn.SetReadDeadline(time.Now().Add(s.poolCfg.Pool.WorkerTimeoutDuration()))
 
 	s.mu.Lock()
 	s.workers[workerID] = w
@@ -430,7 +438,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 	scanner.Buffer(make([]byte, 4096), 4096) // cap per-worker buffer for RAM
 
 	for scanner.Scan() {
-		conn.SetDeadline(time.Now().Add(s.poolCfg.Pool.WorkerTimeoutDuration()))
+		conn.SetReadDeadline(time.Now().Add(s.poolCfg.Pool.WorkerTimeoutDuration()))
 
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -525,16 +533,26 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		workerName = params[0]
 	}
 
-	w.mu.Lock()
-	w.authorized = true
-	w.workerName = workerName
+	// ── Spiral Router: classify device BEFORE acquiring any locks ─────────────
+	// Doing routing first avoids holding w.mu and s.mu simultaneously (deadlock risk:
+	// broadcastJobs holds s.mu.RLock then tries w.mu; we must not do the reverse).
+	device := RouteWorker(w.userAgent, workerName, s.coin.Algorithm)
+	vd := s.coin.Stratum.Vardiff
+	startDiff := device.StartDiff
+	if startDiff < vd.MinDiff {
+		startDiff = vd.MinDiff
+	}
+	if startDiff > vd.MaxDiff {
+		startDiff = vd.MaxDiff
+	}
 
-	// Track in seenWorkers map (capped at 500 — evict oldest on overflow)
+	// Update seenWorkers under s.mu only (never while holding w.mu).
 	s.mu.Lock()
 	if existing, ok := s.seenWorkers[workerName]; ok {
 		existing.Online = true
 		existing.LastSeenAt = time.Now()
 		existing.LastAddr = w.remoteAddr
+		existing.DeviceName = device.Name
 	} else {
 		if len(s.seenWorkers) >= 500 {
 			// Evict the least-recently-seen offline worker
@@ -552,6 +570,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		}
 		s.seenWorkers[workerName] = &SeenWorker{
 			Name:        workerName,
+			DeviceName:  device.Name,
 			LastAddr:    w.remoteAddr,
 			Coin:        s.coin.Symbol,
 			ConnectedAt: time.Now(),
@@ -561,18 +580,12 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	}
 	s.mu.Unlock()
 
-	// ── Spiral Router: classify device and set starting difficulty ────────────
-	device := RouteWorker(w.userAgent, workerName, s.coin.Algorithm)
+	// Update worker fields under w.mu only (never while holding s.mu).
+	w.mu.Lock()
+	prevDiff := w.difficulty
+	w.authorized = true
+	w.workerName = workerName
 	w.deviceName = device.Name
-	// Use device's recommended starting diff, clamped to our vardiff bounds
-	vd := s.coin.Stratum.Vardiff
-	startDiff := device.StartDiff
-	if startDiff < vd.MinDiff {
-		startDiff = vd.MinDiff
-	}
-	if startDiff > vd.MaxDiff {
-		startDiff = vd.MaxDiff
-	}
 	w.difficulty = startDiff
 	w.mu.Unlock()
 
@@ -581,6 +594,14 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 
 	if err := s.reply(w, msg.ID, true, nil); err != nil {
 		return err
+	}
+
+	// If device routing changed the difficulty from the subscribe-time default,
+	// push an updated mining.set_difficulty before sending the job.
+	if startDiff != prevDiff {
+		if err := s.sendDifficulty(w, startDiff); err != nil {
+			return err
+		}
 	}
 
 	if s.OnMinerConnect != nil {
@@ -760,11 +781,16 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce 
 	copy(header[72:76], nbitsBytes)
 	copy(header[76:80], nonceBytes)
 
-	// Hash the header
-	hashBytes := dsha256(header)
+	// Hash the header using the coin's proof-of-work algorithm.
+	// Scrypt (LTC, DOGE): N=1024, r=1, p=1, keyLen=32 — password and salt are both the header.
+	// SHA-256d (BTC, BCH): standard double-SHA256.
+	hashRaw, err := hashHeader(header, s.coin.Algorithm)
+	if err != nil {
+		return false, false
+	}
 
-	// The hash is in little-endian; reverse for numeric comparison
-	hashBig := new(big.Int).SetBytes(reverseBytes(hashBytes[:]))
+	// The hash is in little-endian byte order; reverse for big-integer comparison.
+	hashBig := new(big.Int).SetBytes(reverseBytes(hashRaw))
 
 	// Compute the block target from nbits
 	blockTarget := nbitsToTarget(nbitsBytes)
@@ -785,7 +811,8 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce 
 	return shareValid, isBlock
 }
 
-// assembleBlockHex builds the full block hex from share parameters
+// assembleBlockHex builds a complete serialized block hex ready for submitblock.
+// Format: 80-byte header | varint(tx_count) | coinbase_tx | tx_1 | tx_2 | ...
 func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, nonce string) string {
 	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
 	coinbaseBytes, _ := hex.DecodeString(coinbaseHex)
@@ -815,7 +842,18 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, non
 	copy(header[72:76], nbitsBytes)
 	copy(header[76:80], nonceBytes)
 
-	return hex.EncodeToString(header) + coinbaseHex
+	// Build the complete block: header + varint(txcount) + coinbase + other txs.
+	// The daemon (submitblock) requires a fully serialized block, not just the header.
+	var block bytes.Buffer
+	block.Write(header)
+	txCount := 1 + len(job.RawTxHexes)
+	block.Write(varInt(uint64(txCount)))
+	block.Write(coinbaseBytes)
+	for _, txHex := range job.RawTxHexes {
+		txBytes, _ := hex.DecodeString(txHex)
+		block.Write(txBytes)
+	}
+	return hex.EncodeToString(block.Bytes())
 }
 
 func (s *Server) submitBlock(blockHex, workerName string, height int64) {
@@ -836,6 +874,38 @@ func (s *Server) submitBlock(blockHex, workerName string, height int64) {
 func dsha256(data []byte) [32]byte {
 	h1 := sha256.Sum256(data)
 	return sha256.Sum256(h1[:])
+}
+
+// hashHeader hashes an 80-byte block header using the coin's proof-of-work algorithm.
+// Returns the raw hash bytes in little-endian order (as produced by the hash function).
+func hashHeader(header []byte, algo string) ([]byte, error) {
+	switch algo {
+	case "scrypt", "scryptn":
+		// Litecoin/Dogecoin scrypt: N=1024, r=1, p=1, keyLen=32.
+		// Both password and salt are the 80-byte header.
+		return scrypt.Key(header, header, 1024, 1, 1, 32)
+	default:
+		// sha256d for BTC, BCH, and any unknown algorithm.
+		h := dsha256(header)
+		return h[:], nil
+	}
+}
+
+// varInt encodes n as a Bitcoin-style compact variable-length integer.
+func varInt(n uint64) []byte {
+	switch {
+	case n < 0xfd:
+		return []byte{byte(n)}
+	case n <= 0xffff:
+		return []byte{0xfd, byte(n), byte(n >> 8)}
+	case n <= 0xffffffff:
+		return []byte{0xfe, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+	default:
+		return []byte{0xff,
+			byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24),
+			byte(n >> 32), byte(n >> 40), byte(n >> 48), byte(n >> 56),
+		}
+	}
 }
 
 func reverseBytes(b []byte) []byte {
