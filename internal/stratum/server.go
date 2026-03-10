@@ -476,6 +476,8 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 		return s.handleAuthorize(w, msg)
 	case "mining.submit":
 		return s.handleSubmit(w, msg)
+	case "mining.suggest_difficulty":
+		return s.reply(w, msg.ID, true, nil)
 	case "mining.extranonce.subscribe":
 		// Acknowledge but don't change extranonce dynamically for now
 		return s.reply(w, msg.ID, true, nil)

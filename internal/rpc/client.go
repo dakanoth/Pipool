@@ -28,7 +28,7 @@ func NewClient(host string, port int, user, pass, symbol string) *Client {
 		pass:   pass,
 		Symbol: symbol,
 		httpCli: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 3 * time.Second,
 		},
 	}
 }

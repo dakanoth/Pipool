@@ -251,7 +251,7 @@ func DefaultConfig() *PoolConfig {
 		Dashboard: DashboardConfig{
 			Enabled:       true,  // on by default — open HTTP on :8080
 			Port:          8080,
-			PushIntervalS: 5,
+			PushIntervalS: 15,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

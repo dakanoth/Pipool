@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"os/signal"
@@ -50,6 +51,7 @@ func main() {
 	genConfig := flag.Bool("init", false, "Generate a default config file and exit")
 	metricsPort := flag.Int("metrics-port", 9100, "Prometheus metrics port (0 to disable)")
 	flag.Parse()
+	go func() { log.Println(http.ListenAndServe("localhost:6060", nil)) }()
 
 	fmt.Printf(`
   ╔══════════════════════════════════════════════════════╗
@@ -313,7 +315,7 @@ func main() {
 		}
 		pushInterval := time.Duration(cfg.Dashboard.PushIntervalS) * time.Second
 		if pushInterval == 0 {
-			pushInterval = 5 * time.Second
+			pushInterval = 15 * time.Second
 		}
 		// Pre-build one RPC client per coin — reused every dashboard snapshot
 		// instead of allocating a new http.Client every 5 seconds
