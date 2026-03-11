@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +75,7 @@ type Worker struct {
 
 	// Per-worker difficulty (vardiff)
 	difficulty          float64
+	prevDifficulty      float64 // difficulty before last increase — grace period for in-flight shares
 	lastShareAt         time.Time
 	lastRetargetAt      time.Time
 	sharesSinceRetarget uint64
@@ -357,13 +359,18 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		s.coin.Wallet,
 		bt.CoinbaseValue,
 		bt.Height,
-		4, // extranonce2 size in bytes
+		8, // extranonce1 (4 bytes) + extranonce2 (4 bytes) = 8 bytes total in coinbase script
 		s.coinbaseTag,
+		bt.DefaultWitnessCommitment,
 	)
 
 	job := &Job{
 		ID:             fmt.Sprintf("%x", rand.Uint32()),
-		PrevHash:       reverseByteOrder(bt.PreviousBlockHash),
+		// ESP-Miner/BitAxe firmware applies reverseByteOrder to the pool's prevhash
+		// before placing it in the ASIC header. To ensure the miner hashes the correct
+		// wire-format prevhash (hexReverseBytes of display hash), we send the inverse:
+		// reverseByteOrder(wire) so that reverseByteOrder(reverseByteOrder(wire)) = wire.
+		PrevHash: reverseByteOrder(hexReverseBytes(bt.PreviousBlockHash)),
 		CoinbasePart1:  fmt.Sprintf("%x", cbPart1),
 		CoinbasePart2:  fmt.Sprintf("%x", cbPart2),
 		MerkleBranches: merkleBranches,
@@ -424,6 +431,9 @@ func (s *Server) handleWorker(conn net.Conn) {
 				seen.SharesAccepted = w.sharesAccepted
 				seen.SharesRejected = w.sharesRejected
 				seen.SharesStale = w.sharesStale
+				if w.bestShare > seen.BestShare {
+					seen.BestShare = w.bestShare
+				}
 			}
 		}
 		s.mu.Unlock()
@@ -486,8 +496,36 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 	case "mining.submit":
 		return s.handleSubmit(w, msg)
 	case "mining.configure":
-		// Acknowledge without enabling any extensions (no version-rolling support)
-		return s.reply(w, msg.ID, map[string]any{}, nil)
+		// Parse requested extensions and acknowledge version rolling (BIP310 / overt AsicBoost).
+		// Params: [["version-rolling", ...], {"version-rolling.mask": "1fffe000", ...}]
+		result := map[string]any{}
+		var rawParams []json.RawMessage
+		if json.Unmarshal(msg.Params, &rawParams) == nil && len(rawParams) >= 1 {
+			var exts []string
+			if json.Unmarshal(rawParams[0], &exts) == nil {
+				for _, ext := range exts {
+					if ext == "version-rolling" {
+						// Allow overt AsicBoost. Use the mask the miner requested if available,
+						// falling back to the standard BIP310 range.
+						mask := "1fffe000"
+						if len(rawParams) >= 2 {
+							var opts map[string]json.RawMessage
+							if json.Unmarshal(rawParams[1], &opts) == nil {
+								if m, ok := opts["version-rolling.mask"]; ok {
+									var s string
+									if json.Unmarshal(m, &s) == nil && s != "" {
+										mask = s
+									}
+								}
+							}
+						}
+						result["version-rolling"] = true
+						result["version-rolling.mask"] = mask
+					}
+				}
+			}
+		}
+		return s.reply(w, msg.ID, result, nil)
 	case "mining.suggest_difficulty":
 		return s.reply(w, msg.ID, true, nil)
 	case "mining.extranonce.subscribe":
@@ -507,6 +545,7 @@ func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 	if len(params) > 0 {
 		w.userAgent = params[0]
 	}
+	log.Printf("[%s] subscribe from %s: user-agent=%q params=%s", s.coin.Symbol, w.remoteAddr, w.userAgent, msg.Params)
 
 	// Reply: [session_id, extranonce1, extranonce2_size]
 	result := []any{
@@ -624,8 +663,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 
 	var params []string
 	json.Unmarshal(msg.Params, &params)
-	// params: [worker_name, job_id, extranonce2, ntime, nonce]
-
+	// params: [worker_name, job_id, extranonce2, ntime, nonce] or [... nonce, version_bits]
 	if len(params) < 5 {
 		w.sharesRejected++
 		return s.reply(w, msg.ID, false, []any{20, "Malformed params", nil})
@@ -662,7 +700,33 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	ntime := params[3]
 	nonce := params[4]
 
-	valid, isBlock := s.validateShare(job, w.extranonce1, extranonce2, ntime, nonce, w.difficulty)
+	// Handle version rolling (BIP310 / overt AsicBoost).
+	// Miners like ESP-Miner/NerdOCTAXE submit a 6th param (version_bits) when
+	// they modify the version field. The actual version = job.Version | version_bits.
+	effectiveVersion := job.Version
+	if len(params) >= 6 && params[5] != "" {
+		jobVI, err1 := strconv.ParseUint(job.Version, 16, 32)
+		vbI, err2 := strconv.ParseUint(params[5], 16, 32)
+		if err1 == nil && err2 == nil {
+			effectiveVersion = fmt.Sprintf("%08x", jobVI|vbI)
+		}
+	}
+
+	log.Printf("[%s] SUBMIT from %s: extranonce1=%s en2=%s ntime=%s nonce=%s versionBits=%s effectiveVersion=%s diff=%.4f",
+		s.coin.Symbol, w.workerName, w.extranonce1, extranonce2, ntime, nonce,
+		func() string { if len(params) >= 6 { return params[5] }; return "none" }(),
+		effectiveVersion, w.difficulty)
+
+	// Use the lower of current and previous difficulty for validation.
+	// When vardiff raises difficulty, the miner may still have in-flight shares
+	// computed at the old (lower) difficulty. Validate at whichever is easier
+	// so these transitional shares aren't unfairly rejected.
+	validationDiff := w.difficulty
+	if w.prevDifficulty > 0 && w.prevDifficulty < w.difficulty {
+		validationDiff = w.prevDifficulty
+	}
+
+	valid, isBlock, effectiveNonce := s.validateShare(job, w.extranonce1, extranonce2, ntime, nonce, effectiveVersion, validationDiff)
 
 	if !valid {
 		w.sharesRejected++
@@ -675,26 +739,28 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	w.lastShareAt = time.Now()
 	s.validShares.Add(1)
 	// Track best share per worker and all-time
-	if w.difficulty > w.bestShare {
-		w.bestShare = w.difficulty
+	if validationDiff > w.bestShare {
+		w.bestShare = validationDiff
 	}
 	s.mu.Lock()
-	if w.difficulty > s.bestShareEver {
-		s.bestShareEver = w.difficulty
+	if validationDiff > s.bestShareEver {
+		s.bestShareEver = validationDiff
 	}
 	s.mu.Unlock()
 	s.updateSeenWorkerShares(w)
-	s.recordShareSample(w.difficulty, true)
+	s.recordShareSample(validationDiff, true)
 
 	// Adjust vardiff
 	s.adjustVardiff(w)
+
+	log.Printf("[%s] share accepted from %s diff=%.4g", s.coin.Symbol, w.workerName, w.difficulty)
 
 	if isBlock {
 		s.blocksFound.Add(1)
 		log.Printf("[%s] BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
 
 		reward := s.coin.BlockReward
-		blockHex := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, nonce)
+		blockHex := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion)
 		go s.submitBlock(blockHex, w.workerName, job.Height)
 
 		s.recordBlock("(pending)", job.Height, reward, w.workerName)
@@ -727,15 +793,21 @@ func (s *Server) updateSeenWorkerShares(w *Worker) {
 
 // validateShare assembles the block header and checks whether the hash meets
 // the worker's current difficulty target AND whether it meets the block target.
-// Returns (shareValid, isBlock).
-func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce string, workerDiff float64) (bool, bool) {
-	// Build coinbase transaction hash
+// Returns (shareValid, isBlock, effectiveNonce).
+//
+// effectiveNonce is the nonce hex string (possibly byte-reversed from submitted)
+// that produced the valid hash. Some firmware (ESP-Miner/BitAxe) submits the
+// nonce with bytes reversed relative to what they placed in the header; we try
+// both orientations and accept whichever validates.
+func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce, effectiveVersion string, workerDiff float64) (bool, bool, string) {
+	// Build coinbase transaction hash (same regardless of nonce orientation)
 	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
-		return false, false
+		return false, false, nonce
 	}
 	coinbaseHash := dsha256(coinbaseBytes)
+
 
 	// Compute merkle root from coinbase hash + merkle branches
 	merkleRoot := make([]byte, 32)
@@ -743,7 +815,7 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce 
 	for _, branch := range job.MerkleBranches {
 		branchBytes, err := hex.DecodeString(branch)
 		if err != nil {
-			return false, false
+			return false, false, nonce
 		}
 		combined := append(merkleRoot, branchBytes...)
 		h := dsha256(combined)
@@ -751,88 +823,157 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce 
 		copy(merkleRoot, h[:])
 	}
 
-	// Assemble 80-byte block header
-	versionBytes, err := hex.DecodeString(job.Version)
-	if err != nil || len(versionBytes) != 4 {
-		return false, false
-	}
-	prevHashBytes, err := hex.DecodeString(job.PrevHash)
-	if err != nil || len(prevHashBytes) != 32 {
-		return false, false
-	}
-	ntimeBytes, err := hex.DecodeString(ntime)
-	if err != nil || len(ntimeBytes) != 4 {
-		return false, false
-	}
-	nbitsBytes, err := hex.DecodeString(job.NBits)
-	if err != nil || len(nbitsBytes) != 4 {
-		return false, false
-	}
-	nonceBytes, err := hex.DecodeString(nonce)
-	if err != nil || len(nonceBytes) != 4 {
-		return false, false
-	}
-
-	header := make([]byte, 80)
-	copy(header[0:4], versionBytes)
-	copy(header[4:36], prevHashBytes)
-	copy(header[36:68], merkleRoot)
-	copy(header[68:72], ntimeBytes)
-	copy(header[72:76], nbitsBytes)
-	copy(header[76:80], nonceBytes)
-
-	// Hash the header using the coin's proof-of-work algorithm.
-	// Scrypt (LTC, DOGE): N=1024, r=1, p=1, keyLen=32 — password and salt are both the header.
-	// SHA-256d (BTC, BCH): standard double-SHA256.
-	hashRaw, err := hashHeader(header, s.coin.Algorithm)
+	// Decode fixed fields.
+	// version, ntime, and nbits are sent by pools as big-endian hex strings, but
+	// the Bitcoin wire format (what the ASIC actually hashes) requires them as
+	// little-endian 4-byte values. We parse each as a uint32 and write LE.
+	versionInt, err := strconv.ParseUint(effectiveVersion, 16, 32)
 	if err != nil {
-		return false, false
+		return false, false, nonce
+	}
+	versionBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(versionBytes, uint32(versionInt))
+
+	// job.PrevHash is sent as reverseByteOrder(wire). The miner applies reverseByteOrder
+	// to produce wire-format bytes in the ASIC header. Reconstruct the same bytes here.
+	prevHashBytes, err := hex.DecodeString(reverseByteOrder(job.PrevHash))
+	if err != nil || len(prevHashBytes) != 32 {
+		return false, false, nonce
 	}
 
-	// The hash is in little-endian byte order; reverse for big-integer comparison.
-	hashBig := new(big.Int).SetBytes(reverseBytes(hashRaw))
+	ntimeInt, err := strconv.ParseUint(ntime, 16, 32)
+	if err != nil {
+		return false, false, nonce
+	}
+	ntimeBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(ntimeBytes, uint32(ntimeInt))
 
-	// Compute the block target from nbits
-	blockTarget := nbitsToTarget(nbitsBytes)
+	nbitsInt, err := strconv.ParseUint(job.NBits, 16, 32)
+	if err != nil {
+		return false, false, nonce
+	}
+	nbitsBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(nbitsBytes, uint32(nbitsInt))
 
-	// Compute the share target from worker difficulty
-	// shareTarget = blockTarget * (network_diff / worker_diff)
-	// Simpler: shareTarget = maxTarget / workerDiff
-	// We use a standard difficulty-1 target for the coin's algorithm
+	// Compute share and block targets using big-endian nbits (as returned by node).
+	nbitsForTarget, _ := hex.DecodeString(job.NBits)
+	blockTarget := nbitsToTarget(nbitsForTarget)
 	diff1 := diff1Target(s.coin.Algorithm)
 	workerDiffBig := new(big.Float).SetFloat64(workerDiff)
 	diff1Float := new(big.Float).SetInt(diff1)
 	shareTargetFloat := new(big.Float).Quo(diff1Float, workerDiffBig)
 	shareTarget, _ := shareTargetFloat.Int(nil)
 
-	shareValid := hashBig.Cmp(shareTarget) <= 0
-	isBlock    := shareValid && hashBig.Cmp(blockTarget) <= 0
+	// Try both nonce orientations.
+	// ESP-Miner/BitAxe firmware submits the nonce byte-reversed from what
+	// the ASIC chip placed in the header — we must try both to be compatible.
+	nonceHexes := []string{nonce, hexReverseBytes(nonce)}
+	for _, tryNonce := range nonceHexes {
+		nonceBytes, err := hex.DecodeString(tryNonce)
+		if err != nil || len(nonceBytes) != 4 {
+			continue
+		}
 
-	return shareValid, isBlock
+		header := make([]byte, 80)
+		copy(header[0:4], versionBytes)
+		copy(header[4:36], prevHashBytes)
+		copy(header[36:68], merkleRoot)
+		copy(header[68:72], ntimeBytes)
+		copy(header[72:76], nbitsBytes)
+		copy(header[76:80], nonceBytes)
+
+		hashRaw, err := hashHeader(header, s.coin.Algorithm)
+		if err != nil {
+			continue
+		}
+
+		// Reverse hash bytes for big-integer comparison (Bitcoin convention:
+		// the display/comparison hash is the byte-reverse of the SHA-256d output).
+		hashBig := new(big.Int).SetBytes(reverseBytes(hashRaw))
+
+		if hashBig.Cmp(shareTarget) <= 0 {
+			isBlock := hashBig.Cmp(blockTarget) <= 0
+			return true, isBlock, tryNonce
+		}
+	}
+
+	return false, false, nonce
 }
 
 // assembleBlockHex builds a complete serialized block hex ready for submitblock.
 // Format: 80-byte header | varint(tx_count) | coinbase_tx | tx_1 | tx_2 | ...
-func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, nonce string) string {
+//
+// effectiveNonce is the nonce string (from validateShare) that produced the
+// valid hash — it may differ from the originally submitted nonce if byte-reversal
+// was needed for ESP-Miner/BitAxe compatibility.
+//
+// All header fields are converted to Bitcoin wire format (little-endian) as
+// required by the node's submitblock RPC.
+func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion string) string {
 	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
-	coinbaseBytes, _ := hex.DecodeString(coinbaseHex)
+	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
+	if err != nil {
+		log.Printf("[%s] assembleBlockHex: invalid coinbase hex: %v", s.coin.Symbol, err)
+		return ""
+	}
 	coinbaseHash := dsha256(coinbaseBytes)
 
 	merkleRoot := make([]byte, 32)
 	copy(merkleRoot, coinbaseHash[:])
 	for _, branch := range job.MerkleBranches {
-		branchBytes, _ := hex.DecodeString(branch)
+		branchBytes, err := hex.DecodeString(branch)
+		if err != nil {
+			log.Printf("[%s] assembleBlockHex: invalid merkle branch hex: %v", s.coin.Symbol, err)
+			return ""
+		}
 		combined := append(merkleRoot, branchBytes...)
 		h := dsha256(combined)
 		merkleRoot = make([]byte, 32)
 		copy(merkleRoot, h[:])
 	}
 
-	versionBytes, _ := hex.DecodeString(job.Version)
-	prevHashBytes, _ := hex.DecodeString(job.PrevHash)
-	ntimeBytes, _ := hex.DecodeString(ntime)
-	nbitsBytes, _ := hex.DecodeString(job.NBits)
-	nonceBytes, _ := hex.DecodeString(nonce)
+	// Bitcoin wire format requires all 32-bit fields as little-endian uint32.
+	// The Stratum fields are big-endian hex; reverse 4-byte groups to get LE.
+
+	// version: parse effective version (big-endian Stratum hex) → little-endian wire bytes
+	versionInt, _ := strconv.ParseUint(effectiveVersion, 16, 32)
+	versionBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(versionBytes, uint32(versionInt))
+
+	// prevhash: job.PrevHash is sent to miners as reverseByteOrder(wire), so the miner's
+	// reverseByteOrder transform produces the correct wire bytes. Use the same wire bytes
+	// here so the submitted block header matches what was actually hashed.
+	prevHashBytes, err := hex.DecodeString(reverseByteOrder(job.PrevHash))
+	if err != nil || len(prevHashBytes) != 32 {
+		log.Printf("[%s] assembleBlockHex: invalid prevhash: %v", s.coin.Symbol, err)
+		return ""
+	}
+
+	// ntime: big-endian Stratum hex → little-endian wire bytes (byte-swap in place)
+	ntimeBytes, err := hex.DecodeString(ntime)
+	if err != nil || len(ntimeBytes) != 4 {
+		log.Printf("[%s] assembleBlockHex: invalid ntime %q: %v", s.coin.Symbol, ntime, err)
+		return ""
+	}
+	ntimeBytes[0], ntimeBytes[3] = ntimeBytes[3], ntimeBytes[0]
+	ntimeBytes[1], ntimeBytes[2] = ntimeBytes[2], ntimeBytes[1]
+
+	// nbits: big-endian Stratum hex → little-endian wire bytes (byte-swap in place)
+	nbitsBytes, err := hex.DecodeString(job.NBits)
+	if err != nil || len(nbitsBytes) != 4 {
+		log.Printf("[%s] assembleBlockHex: invalid nbits %q: %v", s.coin.Symbol, job.NBits, err)
+		return ""
+	}
+	nbitsBytes[0], nbitsBytes[3] = nbitsBytes[3], nbitsBytes[0]
+	nbitsBytes[1], nbitsBytes[2] = nbitsBytes[2], nbitsBytes[1]
+
+	// nonce: effectiveNonce bytes are already the correct wire bytes
+	// (validateShare already resolved any byte-order ambiguity)
+	nonceBytes, err := hex.DecodeString(effectiveNonce)
+	if err != nil || len(nonceBytes) != 4 {
+		log.Printf("[%s] assembleBlockHex: invalid nonce %q: %v", s.coin.Symbol, effectiveNonce, err)
+		return ""
+	}
 
 	header := make([]byte, 80)
 	copy(header[0:4], versionBytes)
@@ -843,14 +984,17 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, non
 	copy(header[76:80], nonceBytes)
 
 	// Build the complete block: header + varint(txcount) + coinbase + other txs.
-	// The daemon (submitblock) requires a fully serialized block, not just the header.
 	var block bytes.Buffer
 	block.Write(header)
 	txCount := 1 + len(job.RawTxHexes)
 	block.Write(varInt(uint64(txCount)))
 	block.Write(coinbaseBytes)
 	for _, txHex := range job.RawTxHexes {
-		txBytes, _ := hex.DecodeString(txHex)
+		txBytes, err := hex.DecodeString(txHex)
+		if err != nil {
+			log.Printf("[%s] assembleBlockHex: invalid tx hex: %v", s.coin.Symbol, err)
+			return ""
+		}
 		block.Write(txBytes)
 	}
 	return hex.EncodeToString(block.Bytes())
@@ -983,7 +1127,14 @@ func (s *Server) adjustVardiff(w *Worker) {
 	w.lastRetargetAt = time.Now()
 	w.sharesSinceRetarget = 0
 
+	// Grace period expired — clear prevDifficulty before possibly setting a new one
+	w.prevDifficulty = 0
+
 	if newDiff != w.difficulty {
+		if newDiff > w.difficulty {
+			// Raising difficulty: miner may still have in-flight shares at the old level
+			w.prevDifficulty = w.difficulty
+		}
 		w.difficulty = newDiff
 		s.sendDifficulty(w, newDiff)
 	}
@@ -1126,6 +1277,7 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			SharesAccepted: seen.SharesAccepted,
 			SharesRejected: seen.SharesRejected,
 			SharesStale:    seen.SharesStale,
+			BestShare:      seen.BestShare,
 			RemoteAddr:     seen.LastAddr,
 			ConnectedAt:    seen.ConnectedAt,
 			LastSeenAt:     seen.LastSeenAt,
@@ -1284,6 +1436,7 @@ func (s *Server) recordBlock(hash string, height int64, reward float64, worker s
 
 type Stats struct {
 	Symbol          string
+	Algorithm       string
 	ConnectedMiners int32
 	TotalShares     uint64
 	ValidShares     uint64
@@ -1294,6 +1447,7 @@ type Stats struct {
 func (s *Server) Stats() Stats {
 	return Stats{
 		Symbol:          s.coin.Symbol,
+		Algorithm:       s.coin.Algorithm,
 		ConnectedMiners: s.connectedMiners.Load(),
 		TotalShares:     s.totalShares.Load(),
 		ValidShares:     s.validShares.Load(),
@@ -1316,6 +1470,7 @@ type DiagStats struct {
 
 // Diag returns a snapshot of chain-level diagnostic data
 func (s *Server) Diag() DiagStats {
+	// Hold a single read lock for the entire snapshot to keep values consistent.
 	s.mu.RLock()
 	jobID := ""
 	jobAge := int64(0)
@@ -1326,12 +1481,9 @@ func (s *Server) Diag() DiagStats {
 		hasJob = true
 	}
 	workerCount := len(s.workers)
-	s.mu.RUnlock()
-
 	// Tally stale/rejected from seenWorkers (includes both online and offline workers,
 	// and is kept in sync with active workers via updateSeenWorkerShares)
 	var stale, rejected uint64
-	s.mu.RLock()
 	for _, sw := range s.seenWorkers {
 		stale += sw.SharesStale
 		rejected += sw.SharesRejected

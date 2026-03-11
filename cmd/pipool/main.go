@@ -492,12 +492,34 @@ collect:
 			stats := srv.Stats()
 			cs.Miners = stats.ConnectedMiners
 			cs.Blocks = stats.BlocksFound
-			upSecs := sysmon.Uptime().Seconds()
-			if upSecs > 0 {
-				cs.HashrateKHs = float64(stats.ValidShares) * coinCfg.Stratum.Vardiff.MinDiff / upSecs * 1000
+			// Estimate hashrate from recent share difficulty samples (more accurate than
+			// using MinDiff which would be stale once vardiff ramps up)
+			samples := srv.ShareSamples()
+			if len(samples) >= 2 {
+				var diffSum float64
+				for _, ss := range samples {
+					if ss.Accepted {
+						diffSum += ss.Difficulty
+					}
+				}
+				spanSec := float64(samples[len(samples)-1].TimeMS-samples[0].TimeMS) / 1000.0
+				if spanSec > 0 {
+					// diff1 constants: scrypt=65536, sha256d≈2^32
+					diff1 := 65536.0
+					if coinCfg.Algorithm == "sha256d" {
+						diff1 = 4294967296.0
+					}
+					cs.HashrateKHs = diffSum * diff1 / spanSec / 1000.0
+				}
 			}
 			totalKHs += cs.HashrateKHs
 			totalBlocks += cs.Blocks
+		} else if coinCfg.MergeParent != "" {
+			// Merge aux coins (DOGE, BCH) share the parent's stratum server.
+			// Reflect the parent's connected miner count so the coin card isn't misleadingly 0.
+			if parentSrv, ok := srvMap[coinCfg.MergeParent]; ok {
+				cs.Miners = parentSrv.Stats().ConnectedMiners
+			}
 		}
 		snap.Coins = append(snap.Coins, cs)
 	}
@@ -545,12 +567,14 @@ collect:
 				Accepted:   ss.Accepted,
 			})
 		}
-		// Hashrate history (record a snapshot each time dashboard is polled)
-		stats := srv.Stats()
-		upSecs := sysmon.Uptime().Seconds()
+		// Hashrate history — use the already-computed HashrateKHs for this coin
+		// (stats.HashrateKHs from Stats() is never set; look up the value we computed above)
 		var khs float64
-		if upSecs > 0 {
-			khs = stats.HashrateKHs
+		for _, cs := range snap.Coins {
+			if cs.Symbol == sym {
+				khs = cs.HashrateKHs
+				break
+			}
 		}
 		srv.RecordHashrateSample(khs)
 		for _, hs := range srv.HashrateSamples() {
@@ -598,16 +622,31 @@ collect:
 		if !d.HasJob {
 			cd.Issues = append(cd.Issues, "No active job — node may be unreachable or syncing")
 		}
-		if d.CurrentJobAge > 120 {
-			cd.Issues = append(cd.Issues, fmt.Sprintf("Job is %ds old — block template not refreshing (check node ZMQ)", d.CurrentJobAge))
+		// Warn only when job age exceeds ~4× the coin's expected block time.
+		// BTC/BCH average 600s, LTC 150s, DOGE/PEP ~60s. Normal variance can
+		// double these, so the threshold is generous to avoid false alarms.
+		jobAgeWarnSec := map[string]int64{
+			"BTC": 2400, "BCH": 2400,
+			"LTC": 600,
+			"DOGE": 300, "PEP": 300,
 		}
-		if cd.StalePct >= 10 {
-			cd.Issues = append(cd.Issues, fmt.Sprintf("High stale rate: %.1f%% — check network latency or job broadcast timing", cd.StalePct))
-		} else if cd.StalePct >= 3 {
-			cd.Issues = append(cd.Issues, fmt.Sprintf("Elevated stale rate: %.1f%%", cd.StalePct))
+		warnSec, ok := jobAgeWarnSec[d.Symbol]
+		if !ok {
+			warnSec = 600 // safe default for unknown coins
 		}
-		if cd.RejectPct >= 5 {
-			cd.Issues = append(cd.Issues, fmt.Sprintf("High reject rate: %.1f%% — possible difficulty mismatch or wrong algorithm", cd.RejectPct))
+		if d.CurrentJobAge > warnSec {
+			cd.Issues = append(cd.Issues, fmt.Sprintf("Job is %ds old — no new block seen in a long time (node may be stalled)", d.CurrentJobAge))
+		}
+		// Only flag rate-based issues after enough shares to be meaningful
+		if d.TotalShares >= 20 {
+			if cd.StalePct >= 10 {
+				cd.Issues = append(cd.Issues, fmt.Sprintf("High stale rate: %.1f%% — check network latency or job broadcast timing", cd.StalePct))
+			} else if cd.StalePct >= 3 {
+				cd.Issues = append(cd.Issues, fmt.Sprintf("Elevated stale rate: %.1f%%", cd.StalePct))
+			}
+			if cd.RejectPct >= 5 {
+				cd.Issues = append(cd.Issues, fmt.Sprintf("High reject rate: %.1f%% — possible difficulty mismatch or wrong algorithm", cd.RejectPct))
+			}
 		}
 		if d.WorkerCount == 0 {
 			cd.Issues = append(cd.Issues, "No miners connected to this chain")
@@ -652,7 +691,25 @@ func buildReportData(servers []*stratum.Server, sysmon *mining.SystemMonitor) di
 	}
 	for _, srv := range servers {
 		stats := srv.Stats()
-		khs := float64(stats.ValidShares) / sysmon.Uptime().Seconds() * 1000
+		// Use the same diff1-weighted formula as the dashboard for accuracy.
+		var khs float64
+		samples := srv.ShareSamples()
+		if len(samples) >= 2 {
+			var diffSum float64
+			for _, ss := range samples {
+				if ss.Accepted {
+					diffSum += ss.Difficulty
+				}
+			}
+			spanSec := float64(samples[len(samples)-1].TimeMS-samples[0].TimeMS) / 1000.0
+			if spanSec > 0 {
+				diff1 := 65536.0
+				if stats.Algorithm == "sha256d" {
+					diff1 = 4294967296.0
+				}
+				khs = diffSum * diff1 / spanSec / 1000.0
+			}
+		}
 		data.ActiveCoins = append(data.ActiveCoins, discord.CoinStat{
 			Symbol:      stats.Symbol,
 			HashrateKHs: khs,

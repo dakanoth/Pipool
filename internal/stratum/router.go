@@ -24,13 +24,15 @@ type deviceSignature struct {
 // Hashrate estimates are conservative medians; vardiff will tune from there.
 var RouterTable = []deviceSignature{
 
-	// ── BitAxe family (ESP32-based open source ASIC boards) ─────────────────
+	// ── BitAxe / ESP-Miner family (ESP32-based open source ASIC boards) ─────
 	// SHA-256d ~200–500 GH/s depending on chip
-	{"bitaxe", DeviceClass{"BitAxe", "sha256d", 512, 4096, "BitAxe ESP32 ASIC ~200-500 GH/s"}},
 	{"bitaxeultra", DeviceClass{"BitAxe Ultra", "sha256d", 1024, 8192, "BitAxe Ultra BM1366 ~500 GH/s"}},
 	{"bitaxegamma", DeviceClass{"BitAxe Gamma", "sha256d", 2048, 16384, "BitAxe Gamma BM1370 ~1.2 TH/s"}},
+	{"bitaxe", DeviceClass{"BitAxe", "sha256d", 512, 4096, "BitAxe ESP32 ASIC ~200-500 GH/s"}},
+	{"octaxe", DeviceClass{"Octaxe", "sha256d", 1024, 8192, "Octaxe 8-ASIC ESP32 board ~1-4 TH/s"}},
 	{"nerdaxe", DeviceClass{"NerdAxe", "sha256d", 256, 2048, "NerdAxe ~200 GH/s"}},
 	{"nerdqaxe", DeviceClass{"NerdQAxe", "sha256d", 1024, 8192, "NerdQAxe quad ~800 GH/s"}},
+	{"esp-miner", DeviceClass{"ESP-Miner", "sha256d", 512, 4096, "ESP-Miner firmware (generic)"}},
 
 	// ── Antminer S-series (SHA-256d) ─────────────────────────────────────────
 	{"antminer s9", DeviceClass{"Antminer S9", "sha256d", 8192, 65536, "Bitmain S9 ~14 TH/s"}},

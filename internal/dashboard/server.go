@@ -839,7 +839,7 @@ footer {
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
         <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Share</th><th>Status</th>
+          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Status</th>
         </tr></thead>
         <tbody id="workersBody">
           <tr><td colspan="8" class="no-workers">No miners connected</td></tr>
@@ -1045,7 +1045,7 @@ function apply(s) {
   document.getElementById('cpuTemp').textContent     = (s.cpu_temp_c||0).toFixed(1)+'C';
   document.getElementById('throttleStatus').textContent = s.throttling ? '! THROTTLING' : '';
 
-  document.getElementById('totalMiners').textContent = (s.workers||[]).length;
+  document.getElementById('totalMiners').textContent = (s.workers||[]).filter(function(w){return w.online;}).length;
 
   var cpu = s.cpu_usage_pct||0, ram = s.ram_used_gb||0, temp = s.cpu_temp_c||0;
   document.getElementById('cpuPct').textContent = cpu.toFixed(1)+'%';
@@ -1126,6 +1126,14 @@ function apply(s) {
   if (workers.length === 0) {
     tbody.innerHTML = '<tr><td colspan="8" class="no-workers">NO MINERS CONNECTED</td></tr>';
   } else {
+    // Build map of primary coin → merge-mined children (e.g. {LTC:['DOGE'], BTC:['BCH']})
+    var mergeChildren = {};
+    (s.coins||[]).forEach(function(c) {
+      if (c.is_merge_aux && c.merge_parent) {
+        if (!mergeChildren[c.merge_parent]) mergeChildren[c.merge_parent] = [];
+        mergeChildren[c.merge_parent].push(c.symbol);
+      }
+    });
     var sorted = workers.slice().sort(function(a,b){
       if (a.online && !b.online) return -1;
       if (!a.online && b.online) return 1;
@@ -1139,11 +1147,21 @@ function apply(s) {
       var invHigh   = parseFloat(invPct)   >= 1;
       var statusCls = w.online ? 'worker-status-on' : 'worker-status-off';
       var statusTxt = w.online ? 'ONLINE' : (w.last_seen_at||'OFFLINE');
-      var hrHtml = w.online ? '<span class="shares-val">'+fmtHash(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
+      var diffHtml = w.online ? '<span class="shares-val">'+fmtDiffShort(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
       var bestHtml = (w.best_share&&w.best_share>0) ? '<span class="shares-val">'+fmtDiffShort(w.best_share)+'</span>' : '<span class="worker-device">--</span>';
+      // Split "address.workername" → show only workername prominently; abbreviate address + show IP below
+      var nameParts = (w.name||'ANON').split('.');
+      var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
+      var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
+      var ip = (w.addr||'').replace(/:\d+$/, '');
+      var subLine = [w.device||'', addrAbbrev, ip].filter(Boolean).join(' · ');
+      // Show merge children alongside primary coin (e.g. "LTC+DOGE", "BTC+BCH")
+      var children = mergeChildren[w.coin];
+      var coinLabel = children && children.length ? w.coin+'+'+children.join('+') : w.coin;
       return '<tr class="'+(w.online?'':'worker-row-offline')+'">' +
-        '<td><div class="worker-name">'+(w.name||'ANON')+'</div><div class="worker-device">'+(w.device||w.coin)+'</div></td>' +
-        '<td>'+hrHtml+'</td>' +
+        '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
+        '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
+        '<td>'+diffHtml+'</td>' +
         '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
         '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
         '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
@@ -1425,8 +1443,15 @@ function renderChart() {
   var cSurf = cssSt.getPropertyValue('--surf').trim()       || '#000f00';
 
   if (chartMode === 'hashrate') {
-    var samples = hashrateHistoryGlobal.filter(function(s){ return filter==='ALL' || s.coin===filter; });
-    if (samples.length < 2) {
+    // Group hashrate history by coin so each chain gets its own line
+    var coinGroups = {};
+    hashrateHistoryGlobal.forEach(function(s) {
+      if (filter !== 'ALL' && s.coin !== filter) return;
+      if (!coinGroups[s.coin]) coinGroups[s.coin] = [];
+      coinGroups[s.coin].push(s);
+    });
+    var activeCoins = Object.keys(coinGroups).filter(function(c){ return coinGroups[c].length >= 2; });
+    if (activeCoins.length === 0) {
       canvas.style.display = 'none'; noData.style.display = 'block'; return;
     }
     canvas.style.display = 'block'; noData.style.display = 'none';
@@ -1440,58 +1465,133 @@ function renderChart() {
     var PAD = {t:14, r:12, b:28, l:68};
     var cW = W-PAD.l-PAD.r, cH = H-PAD.t-PAD.b;
 
-    var maxKHs = Math.max.apply(null, samples.map(function(s){return s.khs;})) * 1.15 || 1;
+    // Unified time range across all shown coins
+    var allSamples = [].concat.apply([], activeCoins.map(function(c){ return coinGroups[c]; }));
+    var tMin = Math.min.apply(null, allSamples.map(function(s){return s.t;}));
+    var tMax = Math.max.apply(null, allSamples.map(function(s){return s.t;}));
+    var tSpan = tMax - tMin || 1;
+    function xPos(t) { return PAD.l + (t - tMin) / tSpan * cW; }
 
-    // Background + grid
-    ctx.fillStyle = cSurf; ctx.fillRect(0,0,W,H);
-    ctx.strokeStyle = cBdr; ctx.lineWidth = 0.5;
-    for (var gi=0; gi<=4; gi++) {
-      var gy = PAD.t + (gi/4)*cH;
-      ctx.beginPath(); ctx.moveTo(PAD.l,gy); ctx.lineTo(W-PAD.r,gy); ctx.stroke();
-      ctx.fillStyle = cDim2; ctx.font='9px monospace'; ctx.textAlign='right';
-      ctx.fillText(fmtKHs(maxKHs*(1-gi/4)), PAD.l-4, gy+3);
-    }
+    // Per-coin color palette
+    var COIN_COLORS = {'LTC':cLine,'BTC':'#ff8c00','DOGE':'#ccbb00','BCH':'#00cc88','PEP':'#ff44aa'};
+    var FALLBACK_COLORS = [cLine,'#ff8c00','#00aaff','#ff4466','#aa44ff'];
 
-    // Net diff as dashed overlay line (scaled to KHs axis where diff line = 50% height)
-    var netDiff = coinNetDiff[filter] || (filter==='ALL' ? Object.values(coinNetDiff)[0] : 0) || 0;
-    if (netDiff > 0) {
-      var ny = PAD.t + cH*0.15; // top 15% = "above your hashrate" visual reference
-      ctx.strokeStyle = cNet; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
-      ctx.beginPath(); ctx.moveTo(PAD.l,ny); ctx.lineTo(W-PAD.r,ny); ctx.stroke();
-      ctx.setLineDash([]); ctx.fillStyle=cNet; ctx.font='9px monospace'; ctx.textAlign='left';
-      ctx.fillText('NET DIFF ~'+fmtDiffShort(netDiff), PAD.l+4, ny-3);
-    }
+    // In ALL mode each coin is normalized to its own max (avoids BTC dwarfing LTC).
+    // In single-coin mode use log scale when range > 100× so ramp-up is visible.
+    var multiCoin = activeCoins.length > 1;
 
-    // Build points
-    var n = samples.length;
-    var pts = samples.map(function(s,i){
-      return { x: PAD.l+(i/(n-1))*cW, y: PAD.t+cH*(1-s.khs/maxKHs) };
+    // Compute per-coin max for normalization
+    var coinMax = {};
+    activeCoins.forEach(function(c) {
+      coinMax[c] = Math.max.apply(null, coinGroups[c].map(function(s){return s.khs;})) * 1.15 || 1;
     });
 
-    // Area fill
-    var grad = canvas.getContext('2d').createLinearGradient(0, PAD.t, 0, PAD.t+cH);
-    grad.addColorStop(0, cLine.replace(')',',0.35)').replace('rgb','rgba').replace('#','rgba(').replace(/rgba\(([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2}),/, function(m,r,g,b){return 'rgba('+parseInt(r,16)+','+parseInt(g,16)+','+parseInt(b,16)+',';}));
-    // simpler: just use a semitransparent fill
-    ctx.beginPath();
-    ctx.moveTo(pts[0].x, PAD.t+cH);
-    pts.forEach(function(p){ ctx.lineTo(p.x,p.y); });
-    ctx.lineTo(pts[pts.length-1].x, PAD.t+cH);
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(0,200,60,0.12)';
-    ctx.fill();
+    // For single-coin: decide log vs linear
+    var useLog = false;
+    if (!multiCoin) {
+      var singleMax = coinMax[activeCoins[0]];
+      var posKHs = coinGroups[activeCoins[0]].filter(function(s){return s.khs>0;}).map(function(s){return s.khs;});
+      var singleMin = posKHs.length ? Math.min.apply(null, posKHs) : singleMax;
+      useLog = singleMax / Math.max(singleMin, 1e-9) > 100;
+    }
+    var logMax = useLog ? Math.log10(coinMax[activeCoins[0]]) : 0;
+    var logMin = useLog ? Math.log10(Math.max(coinMax[activeCoins[0]] * 1e-6, 0.001)) : 0;
 
-    // Line
-    ctx.beginPath();
-    ctx.strokeStyle = cLine; ctx.lineWidth=2;
-    ctx.shadowColor=cLine; ctx.shadowBlur=5;
-    pts.forEach(function(p,i){ i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y); });
-    ctx.stroke(); ctx.shadowBlur=0;
+    function yPos(khs, coin) {
+      if (multiCoin) return PAD.t + cH * (1 - Math.min(khs / coinMax[coin], 1));
+      if (useLog) {
+        var v = Math.max(khs, Math.pow(10, logMin));
+        return PAD.t + cH * (1 - (Math.log10(v) - logMin) / (logMax - logMin));
+      }
+      return PAD.t + cH * (1 - khs / coinMax[activeCoins[0]]);
+    }
+
+    // Background
+    ctx.fillStyle = cSurf; ctx.fillRect(0,0,W,H);
+
+    // Y-axis grid + labels
+    ctx.strokeStyle = cBdr; ctx.lineWidth = 0.5;
+    if (multiCoin) {
+      // Normalized: 0%, 25%, 50%, 75%, 100% per coin — just draw the grid
+      for (var gi=0; gi<=4; gi++) {
+        var gy = PAD.t + (gi/4)*cH;
+        ctx.beginPath(); ctx.moveTo(PAD.l,gy); ctx.lineTo(W-PAD.r,gy); ctx.stroke();
+        ctx.fillStyle = cDim2; ctx.font='9px monospace'; ctx.textAlign='right';
+        ctx.fillText((100-gi*25)+'%', PAD.l-4, gy+3);
+      }
+    } else if (useLog) {
+      // Log scale: draw a grid line at each power of 10 within range
+      var p0 = Math.floor(logMin), p1 = Math.ceil(logMax);
+      for (var p=p0; p<=p1; p++) {
+        [1,2,5].forEach(function(m) {
+          var v = m * Math.pow(10, p);
+          if (v < Math.pow(10,logMin) || v > Math.pow(10,logMax)) return;
+          var gy2 = yPos(v, activeCoins[0]);
+          ctx.beginPath(); ctx.moveTo(PAD.l,gy2); ctx.lineTo(W-PAD.r,gy2); ctx.stroke();
+          ctx.fillStyle = cDim2; ctx.font='9px monospace'; ctx.textAlign='right';
+          ctx.fillText(fmtKHs(v), PAD.l-4, gy2+3);
+        });
+      }
+    } else {
+      var linMax = coinMax[activeCoins[0]];
+      for (var gi2=0; gi2<=4; gi2++) {
+        var gy3 = PAD.t + (gi2/4)*cH;
+        ctx.beginPath(); ctx.moveTo(PAD.l,gy3); ctx.lineTo(W-PAD.r,gy3); ctx.stroke();
+        ctx.fillStyle = cDim2; ctx.font='9px monospace'; ctx.textAlign='right';
+        ctx.fillText(fmtKHs(linMax*(1-gi2/4)), PAD.l-4, gy3+3);
+      }
+    }
+
+    // Net diff dashed line (single coin only)
+    if (!multiCoin) {
+      var netDiff = coinNetDiff[filter] || 0;
+      if (netDiff > 0) {
+        var ny = PAD.t + cH*0.15;
+        ctx.strokeStyle = cNet; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
+        ctx.beginPath(); ctx.moveTo(PAD.l,ny); ctx.lineTo(W-PAD.r,ny); ctx.stroke();
+        ctx.setLineDash([]); ctx.fillStyle=cNet; ctx.font='9px monospace'; ctx.textAlign='left';
+        ctx.fillText('NET DIFF ~'+fmtDiffShort(netDiff), PAD.l+4, ny-3);
+      }
+    }
+
+    // Draw each coin's line
+    activeCoins.forEach(function(coin, ci) {
+      var csamps = coinGroups[coin];
+      var color = COIN_COLORS[coin] || FALLBACK_COLORS[ci % FALLBACK_COLORS.length];
+      var pts = csamps.map(function(s){ return {x:xPos(s.t), y:yPos(s.khs, coin)}; });
+
+      // Area fill (single coin only)
+      if (!multiCoin) {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, PAD.t+cH);
+        pts.forEach(function(p){ ctx.lineTo(p.x,p.y); });
+        ctx.lineTo(pts[pts.length-1].x, PAD.t+cH);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0,200,60,0.10)';
+        ctx.fill();
+      }
+
+      // Line
+      ctx.beginPath();
+      ctx.strokeStyle = color; ctx.lineWidth = 2;
+      ctx.shadowColor = color; ctx.shadowBlur = 4;
+      pts.forEach(function(p,i){ i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y); });
+      ctx.stroke(); ctx.shadowBlur = 0;
+
+      // Coin label at end of line (multi-coin mode)
+      if (multiCoin) {
+        var lp = pts[pts.length-1];
+        var lastKHs = csamps[csamps.length-1].khs;
+        ctx.fillStyle = color; ctx.font = 'bold 8px monospace'; ctx.textAlign = 'left';
+        var lx = Math.min(lp.x+4, W-80), ly = Math.max(PAD.t+8, Math.min(lp.y, PAD.t+cH-4));
+        ctx.fillText(coin+': '+fmtKHs(lastKHs), lx, ly);
+      }
+    });
 
     // Time labels
-    var t0=samples[0].t, tN=samples[n-1].t;
     ctx.fillStyle=cDim2; ctx.font='9px monospace'; ctx.textAlign='center';
     [0,0.25,0.5,0.75,1].forEach(function(f){
-      var t=t0+(tN-t0)*f, d=new Date(t);
+      var t=tMin+tSpan*f, d=new Date(t);
       ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'), PAD.l+f*cW, H-6);
     });
 

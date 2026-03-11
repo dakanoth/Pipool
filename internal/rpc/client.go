@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -126,6 +127,9 @@ type BlockTemplate struct {
 	// AuxPoW fields (for merge mining)
 	AuxTarget      string   `json:"auxtarget,omitempty"`
 	AuxHash        string   `json:"auxhash,omitempty"`
+	// SegWit witness commitment (BTC/BCH). When present, the coinbase must
+	// include an OP_RETURN output with this commitment as the second output.
+	DefaultWitnessCommitment string `json:"default_witness_commitment,omitempty"`
 }
 
 type TxData struct {
@@ -239,7 +243,11 @@ func (c *Client) GetBlockCount() (int64, error) {
 // Returns two halves — part1 ends just before extranonce, part2 starts after.
 // The miner fills in extranonce1 + extranonce2 between the two parts.
 // The coinbaseTag (e.g. "/PiPool/") is permanently visible on block explorers.
-func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int, coinbaseTag string) (part1, part2 []byte) {
+//
+// witnessCommitment (hex, from getblocktemplate's default_witness_commitment) is
+// required for SegWit blocks (BTC height ≥ 481824). When non-empty, a second output
+// is added: value=0, script=OP_RETURN OP_PUSHDATA(36) 0xaa21a9ed <commitment>.
+func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int, coinbaseTag, witnessCommitment string) (part1, part2 []byte) {
 	heightScript := encodeHeight(height)
 
 	// Sanitize tag — ASCII only, max 20 bytes, ensure it won't blow the 100-byte script limit
@@ -290,9 +298,30 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 	// Sequence
 	buf2.Write([]byte{0xff, 0xff, 0xff, 0xff})
 
-	// Output count: 1
-	buf2.WriteByte(0x01)
+	// Output count: 1 normally, 2 when a witness commitment is present.
+	// Bitcoin Core's getblocktemplate returns default_witness_commitment as the
+	// full OP_RETURN scriptPubKey (typically 38 bytes: 6a24aa21a9ed<32-byte-hash>).
+	// If only a bare 32-byte hash is provided, wrap it in the standard OP_RETURN script.
+	var witnessCommBytes []byte
+	if witnessCommitment != "" {
+		decoded, err := hex.DecodeString(witnessCommitment)
+		if err == nil && len(decoded) > 0 {
+			if len(decoded) == 32 {
+				// Bare 32-byte hash — wrap in standard OP_RETURN script
+				witnessCommBytes = append([]byte{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed}, decoded...)
+			} else {
+				// Full script as returned by Bitcoin Core (38 bytes)
+				witnessCommBytes = decoded
+			}
+		}
+	}
+	if witnessCommBytes != nil {
+		buf2.WriteByte(0x02)
+	} else {
+		buf2.WriteByte(0x01)
+	}
 
+	// Output 0: block reward → wallet
 	// Value (int64 LE) — satoshis
 	for i := 0; i < 8; i++ {
 		buf2.WriteByte(byte(value >> (i * 8)))
@@ -308,6 +337,17 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 	} else {
 		buf2.WriteByte(byte(len(outputScript)))
 		buf2.Write(outputScript)
+	}
+
+	// Output 1 (SegWit only): OP_RETURN witness commitment
+	// Bitcoin Core's getblocktemplate returns default_witness_commitment as the
+	// full scriptPubKey hex (38 bytes: 6a 24 aa21a9ed <32-byte hash>).
+	// We use it directly as the output script.
+	if witnessCommBytes != nil {
+		// Value: 0 satoshis
+		buf2.Write([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		buf2.WriteByte(byte(len(witnessCommBytes))) // script length
+		buf2.Write(witnessCommBytes)
 	}
 
 	// Locktime
