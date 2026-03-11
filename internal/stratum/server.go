@@ -415,7 +415,6 @@ func (s *Server) handleWorker(conn net.Conn) {
 	s.mu.Lock()
 	s.workers[workerID] = w
 	s.mu.Unlock()
-	s.connectedMiners.Add(1)
 
 	log.Printf("[%s] miner connected: %s", s.coin.Symbol, conn.RemoteAddr())
 
@@ -437,7 +436,9 @@ func (s *Server) handleWorker(conn net.Conn) {
 			}
 		}
 		s.mu.Unlock()
-		s.connectedMiners.Add(-1)
+		if w.authorized {
+			s.connectedMiners.Add(-1)
+		}
 		log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
 		if s.OnMinerDisconnect != nil && w.authorized {
 			s.OnMinerDisconnect(w.workerName)
@@ -627,6 +628,10 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	w.deviceName = device.Name
 	w.difficulty = startDiff
 	w.mu.Unlock()
+
+	// Count only authorized workers so the coin "Miners" card stays in sync
+	// with the workers table (which only shows authorized workers).
+	s.connectedMiners.Add(1)
 
 	log.Printf("[%s] worker authorized: %s | device: %s | start-diff: %.4f | from: %s",
 		s.coin.Symbol, workerName, device.Name, startDiff, w.remoteAddr)
