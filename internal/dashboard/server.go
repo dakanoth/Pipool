@@ -43,6 +43,17 @@ type StatsSnapshot struct {
 	ShareHistory     []ShareSample    `json:"share_history"`
 	HashrateHistory  []HashrateSample `json:"hashrate_history"`
 	ChainDiags   []ChainDiag    `json:"chain_diags"`
+	PoolName     string             `json:"pool_name"`
+	Endpoints    []StratumEndpoint  `json:"endpoints"`
+}
+
+// StratumEndpoint holds connection info for a single stratum port
+type StratumEndpoint struct {
+	Symbol    string `json:"symbol"`    // e.g. "LTC"
+	MergeDesc string `json:"merge_desc"` // e.g. "LTC+DOGE" when merge mining
+	Algorithm string `json:"algorithm"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
 }
 
 // ChainDiag holds per-chain stratum health data for the debug panel
@@ -680,6 +691,20 @@ footer {
   font-family:var(--scan); font-size:.58rem; color:var(--dim2);
   border-top:1px solid var(--bdr); margin-top:8px; letter-spacing:2px;
 }
+.connect-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
+.connect-card { background:var(--surf2); border:1px solid var(--bdr); padding:16px; }
+.connect-card-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.connect-sym { font-family:var(--scan); font-size:.9rem; color:var(--hi); letter-spacing:3px; }
+.connect-algo { font-family:var(--scan); font-size:.52rem; color:var(--dim); background:var(--off); border:1px solid var(--bdr); padding:2px 6px; letter-spacing:1px; }
+.connect-field { margin-bottom:10px; }
+.connect-label { font-family:var(--scan); font-size:.5rem; color:var(--dim2); letter-spacing:2px; margin-bottom:3px; }
+.connect-val { display:flex; align-items:center; gap:6px; background:var(--off); border:1px solid var(--bdr); padding:6px 10px; }
+.connect-val-text { font-family:var(--vt); font-size:.72rem; color:var(--hi2); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.connect-copy { background:none; border:1px solid var(--bdr2); color:var(--dim); font-family:var(--scan); font-size:.48rem; padding:2px 6px; cursor:pointer; letter-spacing:1px; white-space:nowrap; flex-shrink:0; }
+.connect-copy:hover { color:var(--hi); border-color:var(--hi); }
+.connect-copy.copied { color:var(--hi); border-color:var(--hi); }
+.connect-hint { font-family:var(--scan); font-size:.52rem; color:var(--dim2); margin-top:10px; padding-top:8px; border-top:1px solid var(--bdr); line-height:1.6; }
+.connect-hint span { color:var(--hi2); }
 </style>
 </head>
 <body>
@@ -854,6 +879,18 @@ footer {
     </div>
     <div class="section-body" id="blockLog">
       <div class="no-blocks">No blocks found this session.<br>Keep hashing.</div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">CONNECT</span>
+    <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">STRATUM ENDPOINTS</span>
+  </div>
+  <div class="section-body">
+    <div class="connect-grid" id="connectGrid">
+      <div style="font-family:var(--scan);font-size:.6rem;color:var(--dim2)">Waiting for data...</div>
     </div>
   </div>
 </div>
@@ -1225,6 +1262,7 @@ function apply(s) {
 
   if (s.notifs) applyNotifs(s.notifs);
   if (s.chain_diags) renderDiag(s.chain_diags);
+  renderConnect(s);
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
 }
@@ -1285,6 +1323,73 @@ function renderDiag(diags) {
         '<span>'+d.worker_count+' MINER'+(d.worker_count!==1?'S':'')+'</span>' +
       '</div>' +
       '<div class="diag-issues">'+issuesHtml+'</div>' +
+    '</div>';
+  }).join('');
+}
+
+function copyToClipboard(text, btnEl) {
+  navigator.clipboard.writeText(text).then(function() {
+    var orig = btnEl.textContent;
+    btnEl.textContent = 'COPIED';
+    btnEl.classList.add('copied');
+    setTimeout(function(){ btnEl.textContent = orig; btnEl.classList.remove('copied'); }, 1500);
+  }).catch(function() {
+    // Fallback for non-HTTPS
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    var orig = btnEl.textContent;
+    btnEl.textContent = 'COPIED';
+    btnEl.classList.add('copied');
+    setTimeout(function(){ btnEl.textContent = orig; btnEl.classList.remove('copied'); }, 1500);
+  });
+}
+
+function renderConnect(s) {
+  var grid = document.getElementById('connectGrid');
+  var endpoints = s.endpoints || [];
+  var poolName = s.pool_name || 'PiPool';
+  if (endpoints.length === 0) {
+    grid.innerHTML = '<div style="font-family:var(--scan);font-size:.6rem;color:var(--dim2)">No endpoints configured.</div>';
+    return;
+  }
+  grid.innerHTML = endpoints.map(function(ep) {
+    var url = 'stratum+tcp://' + ep.host + ':' + ep.port;
+    var workerFmt = 'YOUR_ADDRESS.WORKER_NAME';
+    var algoLabel = ep.algorithm === 'scrypt' ? 'SCRYPT' : ep.algorithm === 'sha256d' ? 'SHA-256D' : ep.algorithm.toUpperCase();
+    var mergeNote = ep.merge_desc && ep.merge_desc !== ep.symbol
+      ? '<div style="font-family:var(--scan);font-size:.52rem;color:var(--hi2);margin-top:6px">&#9889; Merge mining: <span style="color:var(--hi)">'+ep.merge_desc+'</span> — single connection mines both coins</div>'
+      : '';
+    return '<div class="connect-card">' +
+      '<div class="connect-card-head">' +
+        '<span class="connect-sym">'+ep.merge_desc+'</span>' +
+        '<span class="connect-algo">'+algoLabel+'</span>' +
+      '</div>' +
+      '<div class="connect-field">' +
+        '<div class="connect-label">STRATUM URL</div>' +
+        '<div class="connect-val">' +
+          '<span class="connect-val-text">'+url+'</span>' +
+          '<button class="connect-copy" onclick="copyToClipboard(\''+url+'\',this)">COPY</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="connect-field">' +
+        '<div class="connect-label">WORKER / USERNAME</div>' +
+        '<div class="connect-val">' +
+          '<span class="connect-val-text">'+workerFmt+'</span>' +
+          '<button class="connect-copy" onclick="copyToClipboard(\''+workerFmt+'\',this)">COPY</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="connect-field">' +
+        '<div class="connect-label">PASSWORD</div>' +
+        '<div class="connect-val"><span class="connect-val-text">x</span></div>' +
+      '</div>' +
+      '<div class="connect-hint">' +
+        'Replace <span>YOUR_ADDRESS</span> with your wallet address and <span>WORKER_NAME</span> with any label (e.g. <span>rig1</span>).' +
+        mergeNote +
+      '</div>' +
     '</div>';
   }).join('');
 }

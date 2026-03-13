@@ -405,6 +405,39 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 		RAMUsedGB:   sysmon.ReadRAMUsage(),
 		Throttling:  sysmon.IsThrottling(),
 		CoinbaseTag: cfg.Pool.CoinbaseTag,
+		PoolName:    cfg.Pool.Name,
+	}
+
+	// Build stratum connection endpoints for the Connect section.
+	// Build a map of primary coin → list of merge children for display.
+	mergeMap := make(map[string][]string)
+	for sym, coinCfg := range cfg.Coins {
+		if coinCfg.MergeParent != "" {
+			mergeMap[coinCfg.MergeParent] = append(mergeMap[coinCfg.MergeParent], sym)
+		}
+	}
+	for _, srv := range servers {
+		stats := srv.Stats()
+		sym := stats.Symbol
+		coinCfg, ok := cfg.Coins[sym]
+		if !ok || !coinCfg.Enabled {
+			continue
+		}
+		host := cfg.Pool.Host
+		if host == "" {
+			host = "YOUR_POOL_IP"
+		}
+		mergeDesc := sym
+		if children, ok := mergeMap[sym]; ok && len(children) > 0 {
+			mergeDesc = sym + "+" + strings.Join(children, "+")
+		}
+		snap.Endpoints = append(snap.Endpoints, dashboard.StratumEndpoint{
+			Symbol:    sym,
+			MergeDesc: mergeDesc,
+			Algorithm: coinCfg.Algorithm,
+			Host:      host,
+			Port:      coinCfg.Stratum.Port,
+		})
 	}
 
 	srvMap := make(map[string]*stratum.Server)
