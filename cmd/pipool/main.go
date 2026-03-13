@@ -498,9 +498,7 @@ collect:
 			if len(samples) >= 2 {
 				var diffSum float64
 				for _, ss := range samples {
-					if ss.Accepted {
-						diffSum += ss.Difficulty
-					}
+					diffSum += ss.Difficulty
 				}
 				spanSec := float64(samples[len(samples)-1].TimeMS-samples[0].TimeMS) / 1000.0
 				if spanSec > 0 {

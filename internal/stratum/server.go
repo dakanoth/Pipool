@@ -77,6 +77,7 @@ type Worker struct {
 	difficulty          float64
 	prevDifficulty      float64 // difficulty before last increase — grace period for in-flight shares
 	lastShareAt         time.Time
+	lastAcceptedAt      time.Time // time of last ACCEPTED share — used for vardiff decay
 	lastRetargetAt      time.Time
 	sharesSinceRetarget uint64
 
@@ -736,12 +737,15 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	if !valid {
 		w.sharesRejected++
 		s.updateSeenWorkerShares(w)
+		s.recordShareSample(validationDiff, false)
+		s.decayVardiff(w)
 		log.Printf("[%s] rejected share from %s (hash above target)", s.coin.Symbol, w.workerName)
 		return s.reply(w, msg.ID, false, []any{23, "Low difficulty share", nil})
 	}
 
 	w.sharesAccepted++
 	w.lastShareAt = time.Now()
+	w.lastAcceptedAt = time.Now()
 	s.validShares.Add(1)
 	// Track best share per worker and all-time
 	if validationDiff > w.bestShare {
@@ -1143,6 +1147,40 @@ func (s *Server) adjustVardiff(w *Worker) {
 		w.difficulty = newDiff
 		s.sendDifficulty(w, newDiff)
 	}
+}
+
+// decayVardiff halves difficulty when all recent shares have been rejected.
+// Called on each rejected share. Only acts if no accepted share has been seen
+// for 2× the retarget window — prevents thrashing while allowing fast recovery.
+func (s *Server) decayVardiff(w *Worker) {
+	vd := s.coin.Stratum.Vardiff
+	decayWindow := 2 * time.Duration(vd.RetargetS) * time.Second
+
+	// Don't decay if we never had an accepted share yet (miner is still warming up)
+	// or if the last accepted share was recent enough.
+	if !w.lastAcceptedAt.IsZero() && time.Since(w.lastAcceptedAt) < decayWindow {
+		return
+	}
+	// Also don't decay more often than once per retarget window.
+	if time.Since(w.lastRetargetAt) < time.Duration(vd.RetargetS)*time.Second {
+		return
+	}
+
+	newDiff := w.difficulty / 2
+	if newDiff < vd.MinDiff {
+		newDiff = vd.MinDiff
+	}
+	if newDiff == w.difficulty {
+		return
+	}
+
+	w.prevDifficulty = 0
+	w.difficulty = newDiff
+	w.lastRetargetAt = time.Now()
+	w.sharesSinceRetarget = 0
+	log.Printf("[%s] vardiff decay: %s difficulty %.4g → %.4g (no accepted share in %.0fs)",
+		s.coin.Symbol, w.workerName, w.difficulty*2, newDiff, decayWindow.Seconds())
+	s.sendDifficulty(w, newDiff)
 }
 
 // ─── Send helpers ─────────────────────────────────────────────────────────────
