@@ -1,10 +1,12 @@
 package merge
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -12,36 +14,36 @@ import (
 	"github.com/dakota/pipool/internal/rpc"
 )
 
-// MagicHeader is the AuxPoW commitment marker embedded in the coinbase
-// "Merged Mining Marker" = fabe6d6d (big-endian) followed by aux hash
+// MagicBytes is the AuxPoW commitment marker embedded in the coinbase:
+// "Merged Mining Marker" = fabe6d6d followed by the aux merkle root.
 var MagicBytes = []byte{0xfa, 0xbe, 0x6d, 0x6d}
 
-// AuxWork holds a snapshot of work from an auxiliary chain (e.g. DOGE, BCH)
+// AuxWork holds a snapshot of work from an auxiliary chain (e.g. DOGE, BCH).
 type AuxWork struct {
-	Symbol     string
-	ChainID    uint32
-	Hash       []byte // merkle root of aux block header
-	Target     []byte // packed target
-	Height     int64
-	FetchedAt  time.Time
-	BlockTemplate interface{} // raw block template from aux daemon
+	Symbol    string
+	ChainID   uint32
+	Hash      []byte // commitment hash bytes (little-endian)
+	HashHex   string // original hash string as returned by getauxblock (for submitauxblock)
+	Target    []byte // packed target
+	Height    int64
+	FetchedAt time.Time
 }
 
 // AuxPoWCommitment is embedded in the parent coinbase to commit to aux chain work
 type AuxPoWCommitment struct {
-	AuxHash  [32]byte // hash of the aux block header
+	AuxHash      [32]byte
 	MerkleBranch [][]byte
-	Index    uint32
-	ChainID  uint32
+	Index        uint32
+	ChainID      uint32
 }
 
 // Coordinator manages merge mining across multiple aux chains
 type Coordinator struct {
-	mu       sync.RWMutex
-	clients  map[string]*rpc.Client
-	auxWork  map[string]*AuxWork // symbol -> current work
-	config   map[string]config.CoinConfig
-	stopCh   chan struct{}
+	mu      sync.RWMutex
+	clients map[string]*rpc.Client
+	auxWork map[string]*AuxWork // symbol -> current work
+	config  map[string]config.CoinConfig
+	stopCh  chan struct{}
 }
 
 // NewCoordinator creates a merge mining coordinator
@@ -76,7 +78,7 @@ func (c *Coordinator) Stop() {
 	close(c.stopCh)
 }
 
-// pollAuxChain fetches new work from an aux daemon every ~500ms
+// pollAuxChain calls getauxblock on the aux daemon every 500ms to keep work fresh.
 func (c *Coordinator) pollAuxChain(symbol string) {
 	cli := c.clients[symbol]
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -89,23 +91,19 @@ func (c *Coordinator) pollAuxChain(symbol string) {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			hash, err := cli.GetBestBlockHash()
+			ab, err := cli.GetAuxBlock(c.config[symbol].Wallet)
 			if err != nil {
 				// daemon unreachable — back off
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			if hash == lastHash {
+
+			if ab.Hash == lastHash {
 				continue
 			}
-			lastHash = hash
+			lastHash = ab.Hash
 
-			bt, err := cli.GetBlockTemplate([]string{"coinbasetxn", "workid", "coinbase/append"})
-			if err != nil {
-				continue
-			}
-
-			auxWork := c.buildAuxWork(symbol, bt)
+			auxWork := buildAuxWork(symbol, ab)
 			c.mu.Lock()
 			c.auxWork[symbol] = auxWork
 			c.mu.Unlock()
@@ -113,24 +111,30 @@ func (c *Coordinator) pollAuxChain(symbol string) {
 	}
 }
 
-// buildAuxWork constructs an AuxWork from a block template
-func (c *Coordinator) buildAuxWork(symbol string, bt *rpc.BlockTemplate) *AuxWork {
-	cfg := c.config[symbol]
-	_ = cfg
+// buildAuxWork constructs an AuxWork from a getauxblock result.
+func buildAuxWork(symbol string, ab *rpc.AuxBlockResult) *AuxWork {
+	// The hash from getauxblock is in display (reversed) byte order.
+	// Convert to internal little-endian byte order for the commitment.
+	hashBytes, err := hex.DecodeString(ab.Hash)
+	if err != nil {
+		// fallback — use zero hash
+		hashBytes = make([]byte, 32)
+	}
+	// Reverse bytes: getauxblock returns display order, commitment needs LE
+	for i, j := 0, len(hashBytes)-1; i < j; i, j = i+1, j-1 {
+		hashBytes[i], hashBytes[j] = hashBytes[j], hashBytes[i]
+	}
 
-	// Compute a pseudo aux hash from block template data for commitment
-	h := sha256.Sum256([]byte(bt.PreviousBlockHash + bt.Bits))
-
-	target, _ := hex.DecodeString(bt.Target)
+	target, _ := hex.DecodeString(ab.Target)
 
 	return &AuxWork{
-		Symbol:        symbol,
-		ChainID:       chainID(symbol),
-		Hash:          h[:],
-		Target:        target,
-		Height:        bt.Height,
-		FetchedAt:     time.Now(),
-		BlockTemplate: bt,
+		Symbol:    symbol,
+		ChainID:   ab.ChainID,
+		Hash:      hashBytes,
+		HashHex:   ab.Hash, // keep original for submitauxblock
+		Target:    target,
+		Height:    ab.Height,
+		FetchedAt: time.Now(),
 	}
 }
 
@@ -154,19 +158,25 @@ func (c *Coordinator) GetAllAuxWork() map[string]*AuxWork {
 }
 
 // BuildCoinbaseCommitment creates the AuxPoW data to embed in the parent coinbase.
-// The commitment format follows the Namecoin/merged mining standard:
-//   MAGIC (4 bytes) | aux_hash (32 bytes) | aux_merkle_size (4 bytes) | aux_merkle_nonce (4 bytes)
-func BuildCoinbaseCommitment(works map[string]*AuxWork) []byte {
+// works is the set of aux chains to commit to.
+// sortedSymbols returns the symbol order used to build the merkle tree — this MUST be
+// passed to BuildAuxPoWHex when constructing the proof so the same ordering is used.
+func BuildCoinbaseCommitment(works map[string]*AuxWork) (commitment []byte, sortedSymbols []string) {
 	if len(works) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// For single aux: use its hash directly.
-	// For multiple aux: compute the aux chain merkle tree.
+	// Sort symbols for deterministic merkle tree construction
+	sortedSymbols = make([]string, 0, len(works))
+	for sym := range works {
+		sortedSymbols = append(sortedSymbols, sym)
+	}
+	sort.Strings(sortedSymbols)
+
 	var auxHashes [][32]byte
-	for _, w := range works {
+	for _, sym := range sortedSymbols {
 		var h [32]byte
-		copy(h[:], w.Hash)
+		copy(h[:], works[sym].Hash)
 		auxHashes = append(auxHashes, h)
 	}
 
@@ -175,31 +185,97 @@ func BuildCoinbaseCommitment(works map[string]*AuxWork) []byte {
 	out := make([]byte, 0, 4+32+4+4)
 	out = append(out, MagicBytes...)
 	out = append(out, merkleRoot[:]...)
-	// aux_merkle_size: number of aux chains (little-endian uint32)
 	out = append(out, uint32LE(uint32(len(works)))...)
-	// nonce placeholder
-	out = append(out, 0x00, 0x00, 0x00, 0x00)
-	return out
+	out = append(out, 0x00, 0x00, 0x00, 0x00) // nonce placeholder
+	return out, sortedSymbols
 }
 
-// SubmitAuxBlock submits a solved aux block to the aux chain daemon.
-// parentCoinbase, parentHash, and merkle branch are extracted from the
-// solved parent block and packaged as an AuxPoW proof.
-func (c *Coordinator) SubmitAuxBlock(symbol string, parentBlockHex string) error {
+// BuildAuxPoWHex serializes the AuxPoW proof required by submitauxblock.
+// coinbaseMerkleBranch: branch from coinbase tx to the block merkle root (raw bytes per element).
+// chainIndex: index of this aux chain in the sorted symbol list (0 for single chain).
+// allHashes: all aux chain hashes in sorted order (for computing aux merkle branch).
+func BuildAuxPoWHex(coinbaseTx []byte, coinbaseMerkleBranch [][]byte, parentHeader []byte, allHashes [][32]byte, chainIndex int) string {
+	var buf bytes.Buffer
+
+	// Coinbase transaction
+	buf.Write(coinbaseTx)
+
+	// Coinbase merkle branch (from coinbase to block merkle root)
+	buf.Write(varInt(uint64(len(coinbaseMerkleBranch))))
+	for _, b := range coinbaseMerkleBranch {
+		buf.Write(b)
+	}
+	// Coinbase index = 0 (coinbase is always the first transaction)
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x00})
+
+	// Aux chain merkle branch (from this chain's hash to the aux merkle root)
+	auxBranch, auxIndex := computeAuxMerkleBranch(allHashes, chainIndex)
+	buf.Write(varInt(uint64(len(auxBranch))))
+	for _, b := range auxBranch {
+		buf.Write(b[:])
+	}
+	// Write aux index as int32 LE
+	buf.Write([]byte{
+		byte(auxIndex),
+		byte(auxIndex >> 8),
+		byte(auxIndex >> 16),
+		byte(auxIndex >> 24),
+	})
+
+	// Parent block header (80 bytes)
+	buf.Write(parentHeader)
+
+	return hex.EncodeToString(buf.Bytes())
+}
+
+// computeAuxMerkleBranch computes the merkle branch (proof path) for element at chainIndex
+// in the aux merkle tree. Returns the branch hashes and the index used to reconstruct the root.
+func computeAuxMerkleBranch(hashes [][32]byte, chainIndex int) ([][32]byte, int) {
+	if len(hashes) <= 1 {
+		// Single chain: empty branch, index 0
+		return nil, 0
+	}
+
+	var branch [][32]byte
+	idx := chainIndex
+	work := make([][32]byte, len(hashes))
+	copy(work, hashes)
+
+	for len(work) > 1 {
+		if len(work)%2 != 0 {
+			work = append(work, work[len(work)-1])
+		}
+		// Sibling of idx
+		sibling := idx ^ 1
+		if sibling < len(work) {
+			branch = append(branch, work[sibling])
+		}
+		// Move to next level
+		var next [][32]byte
+		for i := 0; i < len(work); i += 2 {
+			combined := append(work[i][:], work[i+1][:]...)
+			h := sha256.Sum256(combined)
+			h = sha256.Sum256(h[:])
+			next = append(next, h)
+		}
+		work = next
+		idx /= 2
+	}
+	return branch, chainIndex
+}
+
+// SubmitAuxBlock submits a solved aux block to the aux chain daemon using submitauxblock.
+// auxHash is the work hash from GetAuxBlock (must match what was committed to in the parent coinbase).
+// auxPoWHex is the serialized AuxPoW proof from BuildAuxPoWHex.
+func (c *Coordinator) SubmitAuxBlock(symbol, auxHash, auxPoWHex string) error {
 	cli, ok := c.clients[symbol]
 	if !ok {
 		return fmt.Errorf("no rpc client for aux coin %s", symbol)
 	}
 
-	// In a full implementation, we'd construct the complete AuxPoW structure here:
-	// - parent block header (80 bytes)
-	// - coinbase transaction
-	// - coinbase merkle branch
-	// - aux chain merkle branch
-	// For now we pass the raw parent block and let the daemon validate AuxPoW
-	result, err := cli.SubmitBlock(parentBlockHex)
+	result, err := cli.SubmitAuxBlockRPC(auxHash, auxPoWHex)
 	if err != nil {
-		return fmt.Errorf("[%s] submitblock: %w", symbol, err)
+		return fmt.Errorf("[%s] submitauxblock: %w", symbol, err)
 	}
 	if result != "" {
 		return fmt.Errorf("[%s] block rejected: %s", symbol, result)
@@ -209,8 +285,7 @@ func (c *Coordinator) SubmitAuxBlock(symbol string, parentBlockHex string) error
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// chainID returns a unique 16-bit chain ID for each supported aux coin.
-// These are conventional values used by merge mining.
+// chainID returns a unique chain ID for each supported aux coin.
 func chainID(symbol string) uint32 {
 	switch symbol {
 	case "DOGE":
@@ -218,7 +293,7 @@ func chainID(symbol string) uint32 {
 	case "BCH":
 		return 0x0051
 	case "LCC":
-		return 0x0157 // Litecoin Cash
+		return 0x0157
 	case "PEP":
 		return 0x0101
 	default:
@@ -241,7 +316,7 @@ func computeAuxMerkleRoot(hashes [][32]byte) [32]byte {
 		for i := 0; i < len(hashes); i += 2 {
 			combined := append(hashes[i][:], hashes[i+1][:]...)
 			h := sha256.Sum256(combined)
-			h = sha256.Sum256(h[:]) // double-sha256
+			h = sha256.Sum256(h[:])
 			next = append(next, h)
 		}
 		hashes = next
@@ -249,8 +324,27 @@ func computeAuxMerkleRoot(hashes [][32]byte) [32]byte {
 	return hashes[0]
 }
 
+func varInt(n uint64) []byte {
+	switch {
+	case n < 0xfd:
+		return []byte{byte(n)}
+	case n <= 0xffff:
+		return []byte{0xfd, byte(n), byte(n >> 8)}
+	case n <= 0xffffffff:
+		return []byte{0xfe, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+	default:
+		return []byte{0xff,
+			byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24),
+			byte(n >> 32), byte(n >> 40), byte(n >> 48), byte(n >> 56),
+		}
+	}
+}
+
 func uint32LE(v uint32) []byte {
 	b := make([]byte, 4)
 	binary.LittleEndian.PutUint32(b, v)
 	return b
 }
+
+// keep chainID referenced so the compiler doesn't complain
+var _ = chainID

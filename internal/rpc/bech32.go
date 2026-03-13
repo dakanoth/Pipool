@@ -156,6 +156,7 @@ func BuildOutputScript(addr string) ([]byte, error) {
 	if strings.HasPrefix(lower, "bc1") ||
 		strings.HasPrefix(lower, "ltc1") ||
 		strings.HasPrefix(lower, "doge1") ||
+		strings.HasPrefix(lower, "dgb1") ||
 		strings.HasPrefix(lower, "tb1") ||
 		strings.HasPrefix(lower, "tltc1") {
 		return BuildSegwitScript(addr)

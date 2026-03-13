@@ -23,6 +23,20 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
+// AuxBlockInfo bundles the data needed to submit a found parent block to aux chains.
+type AuxBlockInfo struct {
+	// CoinbaseTx is the full serialized coinbase transaction (for the AuxPoW proof).
+	CoinbaseTx []byte
+	// MerkleBranch is the branch from the coinbase to the block merkle root (each element is 32 raw bytes).
+	MerkleBranch [][]byte
+	// HeaderBytes is the 80-byte block header.
+	HeaderBytes []byte
+	// AuxSortedSyms is the deterministically sorted aux chain symbol list used to build the aux merkle tree.
+	AuxSortedSyms []string
+	// AuxWorkSnap is a snapshot of the aux work at the time this job was built.
+	AuxWorkSnap map[string]*merge.AuxWork
+}
+
 // Server is a Stratum V1 server for a single primary coin (with optional merge mining)
 type Server struct {
 	coin        config.CoinConfig
@@ -39,7 +53,7 @@ type Server struct {
 	bestShareEver   float64            // all-time highest share difficulty this process
 	blockLog        []BlockEntry       // last 50 blocks found, shown on dashboard
 	currentJob      *Job
-	recentJobIDs    []string           // last 4 job IDs — shares for any of these are NOT stale
+	recentJobs      map[string]*Job    // last 4 jobs by ID — used to validate non-stale shares
 
 	// Stats (updated atomically for lock-free reads)
 	totalShares   atomic.Uint64
@@ -59,6 +73,11 @@ type Server struct {
 	OnMinerDisconnect func(worker string)
 	OnNodeUnreachable func(err error)
 	OnNodeOnline      func()
+	// Called when a block is found — provides components needed for AuxPoW submission.
+	// Only fires when there are active merge-mining children.
+	OnAuxBlockFound func(info AuxBlockInfo)
+	// Callback fired when a block becomes orphaned
+	OnBlockOrphaned func(coin, hash string, height int64)
 }
 
 // Worker represents a connected miner
@@ -135,7 +154,9 @@ type Job struct {
 	Target         string
 	CreatedAt      time.Time
 	// Merge mining commitment included in coinbase
-	AuxCommitment  []byte
+	AuxCommitment   []byte
+	AuxSortedSyms   []string // aux chain symbols in sorted order used to build AuxCommitment
+	AuxWorks        map[string]*merge.AuxWork // snapshot of aux work at job-build time
 	// RawTxHexes holds the serialized transactions from getblocktemplate (excluding coinbase).
 	// Required for correct full-block assembly when submitting a found block.
 	RawTxHexes     []string
@@ -160,6 +181,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		rpcClient:    cli,
 		coordinator:  coord,
 		workers:      make(map[string]*Worker),
+		recentJobs:   make(map[string]*Job),
 		jobBroadcast: make(chan *Job, 16),
 		stopCh:       make(chan struct{}),
 	}
@@ -207,6 +229,9 @@ func (s *Server) Start() error {
 
 	// Broadcast new jobs as they arrive — recovers from panics internally
 	go s.broadcastJobs()
+
+	// Start block confirmation tracker
+	go s.trackConfirmations()
 
 	return nil
 }
@@ -304,10 +329,20 @@ func (s *Server) pollBlockTemplate() {
 
 			s.mu.Lock()
 			s.currentJob = job
-			// Keep last 4 job IDs so miners finishing the previous job aren't falsely staled
-			s.recentJobIDs = append(s.recentJobIDs, job.ID)
-			if len(s.recentJobIDs) > 4 {
-				s.recentJobIDs = s.recentJobIDs[len(s.recentJobIDs)-4:]
+			// Keep the last 4 jobs so miners finishing a recent job aren't falsely staled.
+			// Shares for any of these jobs are valid; we validate against the job they were computed on.
+			s.recentJobs[job.ID] = job
+			if len(s.recentJobs) > 4 {
+				// Find and remove the oldest job
+				var oldestID string
+				var oldestTime time.Time
+				for id, j := range s.recentJobs {
+					if oldestID == "" || j.CreatedAt.Before(oldestTime) {
+						oldestID = id
+						oldestTime = j.CreatedAt
+					}
+				}
+				delete(s.recentJobs, oldestID)
 			}
 			s.mu.Unlock()
 
@@ -328,6 +363,8 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 
 	// Gather AuxPoW commitment if we have merge mining children
 	var auxCommitment []byte
+	var auxSortedSyms []string
+	var auxWorkSnap map[string]*merge.AuxWork
 	if s.coordinator != nil {
 		children := s.poolCfg.MergeChildren(s.coin.Symbol)
 		if len(children) > 0 {
@@ -338,7 +375,8 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 				}
 			}
 			if len(auxWorks) > 0 {
-				auxCommitment = merge.BuildCoinbaseCommitment(auxWorks)
+				auxCommitment, auxSortedSyms = merge.BuildCoinbaseCommitment(auxWorks)
+				auxWorkSnap = auxWorks
 			}
 		}
 	}
@@ -363,6 +401,7 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		8, // extranonce1 (4 bytes) + extranonce2 (4 bytes) = 8 bytes total in coinbase script
 		s.coinbaseTag,
 		bt.DefaultWitnessCommitment,
+		auxCommitment, // ← new parameter
 	)
 
 	job := &Job{
@@ -382,6 +421,8 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		Height:         bt.Height,
 		Target:         bt.Target,
 		AuxCommitment:  auxCommitment,
+		AuxSortedSyms:  auxSortedSyms,
+		AuxWorks:       auxWorkSnap,
 		RawTxHexes:     txHexes,
 		CreatedAt:      time.Now(),
 	}
@@ -675,34 +716,34 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 		return s.reply(w, msg.ID, false, []any{20, "Malformed params", nil})
 	}
 
-	// Get current job snapshot + recent job IDs for stale detection
+	// Look up the exact job the miner was working on.
+	// Shares for any of the last 4 jobs are accepted (not stale).
 	s.mu.RLock()
-	job := s.currentJob
-	recentIDs := s.recentJobIDs
+	submittedJobID := params[1]
+	job, jobFound := s.recentJobs[submittedJobID]
+	hasAnyJob := s.currentJob != nil
 	s.mu.RUnlock()
 
-	if job == nil {
+	if !hasAnyJob {
 		w.sharesRejected++
 		return s.reply(w, msg.ID, false, []any{21, "No job", nil})
 	}
 
-	submittedJobID := params[1]
-	isStale := true
-	for _, id := range recentIDs {
-		if id == submittedJobID {
-			isStale = false
-			break
-		}
-	}
-	if isStale {
+	if !jobFound {
 		w.sharesStale++
 		s.updateSeenWorkerShares(w)
-		log.Printf("[%s] stale share from %s (job %s, current %s)", s.coin.Symbol, w.workerName, submittedJobID, job.ID)
+		log.Printf("[%s] stale share from %s (job %s not in recent window)", s.coin.Symbol, w.workerName, submittedJobID)
 		return s.reply(w, msg.ID, false, []any{21, "Stale share", nil})
 	}
 
 	// Validate the share: assemble header and check hash meets worker difficulty
 	extranonce2 := params[2]
+	// Extranonce2 must be exactly 4 bytes (8 hex chars) as declared in mining.subscribe
+	if len(extranonce2) != 8 {
+		w.sharesRejected++
+		s.recordShareSample(w.difficulty, false)
+		return s.reply(w, msg.ID, false, []any{20, "Invalid extranonce2 length", nil})
+	}
 	ntime := params[3]
 	nonce := params[4]
 
@@ -769,13 +810,30 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 		log.Printf("[%s] BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
 
 		reward := s.coin.BlockReward
-		blockHex := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion)
+		blockHex, blockHash, headerBytes, coinbaseTxBytes := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion)
 		go s.submitBlock(blockHex, w.workerName, job.Height)
 
-		s.recordBlock("(pending)", job.Height, reward, w.workerName)
+		s.recordBlock(blockHash, job.Height, reward, w.workerName)
 
 		if s.OnBlockFound != nil {
-			s.OnBlockFound(s.coin.Symbol, "(pending)", reward)
+			s.OnBlockFound(s.coin.Symbol, blockHash, reward)
+		}
+
+		// Notify merge mining coordinator so it can submit aux chain blocks
+		if s.OnAuxBlockFound != nil && blockHex != "" {
+			// Decode merkle branch from hex strings to [][]byte
+			merkleBranch := make([][]byte, len(job.MerkleBranches))
+			for i, br := range job.MerkleBranches {
+				b, _ := hex.DecodeString(br)
+				merkleBranch[i] = b
+			}
+			s.OnAuxBlockFound(AuxBlockInfo{
+				CoinbaseTx:    coinbaseTxBytes,
+				MerkleBranch:  merkleBranch,
+				HeaderBytes:   headerBytes,
+				AuxSortedSyms: job.AuxSortedSyms,
+				AuxWorkSnap:   job.AuxWorks,
+			})
 		}
 	}
 
@@ -918,12 +976,12 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce,
 //
 // All header fields are converted to Bitcoin wire format (little-endian) as
 // required by the node's submitblock RPC.
-func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion string) string {
+func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion string) (blockHex, blockHash string, headerBytes, coinbaseTxBytes []byte) {
 	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
 		log.Printf("[%s] assembleBlockHex: invalid coinbase hex: %v", s.coin.Symbol, err)
-		return ""
+		return "", "", nil, nil
 	}
 	coinbaseHash := dsha256(coinbaseBytes)
 
@@ -933,7 +991,7 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 		branchBytes, err := hex.DecodeString(branch)
 		if err != nil {
 			log.Printf("[%s] assembleBlockHex: invalid merkle branch hex: %v", s.coin.Symbol, err)
-			return ""
+			return "", "", nil, nil
 		}
 		combined := append(merkleRoot, branchBytes...)
 		h := dsha256(combined)
@@ -955,14 +1013,14 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 	prevHashBytes, err := hex.DecodeString(reverseByteOrder(job.PrevHash))
 	if err != nil || len(prevHashBytes) != 32 {
 		log.Printf("[%s] assembleBlockHex: invalid prevhash: %v", s.coin.Symbol, err)
-		return ""
+		return "", "", nil, nil
 	}
 
 	// ntime: big-endian Stratum hex → little-endian wire bytes (byte-swap in place)
 	ntimeBytes, err := hex.DecodeString(ntime)
 	if err != nil || len(ntimeBytes) != 4 {
 		log.Printf("[%s] assembleBlockHex: invalid ntime %q: %v", s.coin.Symbol, ntime, err)
-		return ""
+		return "", "", nil, nil
 	}
 	ntimeBytes[0], ntimeBytes[3] = ntimeBytes[3], ntimeBytes[0]
 	ntimeBytes[1], ntimeBytes[2] = ntimeBytes[2], ntimeBytes[1]
@@ -971,7 +1029,7 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 	nbitsBytes, err := hex.DecodeString(job.NBits)
 	if err != nil || len(nbitsBytes) != 4 {
 		log.Printf("[%s] assembleBlockHex: invalid nbits %q: %v", s.coin.Symbol, job.NBits, err)
-		return ""
+		return "", "", nil, nil
 	}
 	nbitsBytes[0], nbitsBytes[3] = nbitsBytes[3], nbitsBytes[0]
 	nbitsBytes[1], nbitsBytes[2] = nbitsBytes[2], nbitsBytes[1]
@@ -981,7 +1039,7 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 	nonceBytes, err := hex.DecodeString(effectiveNonce)
 	if err != nil || len(nonceBytes) != 4 {
 		log.Printf("[%s] assembleBlockHex: invalid nonce %q: %v", s.coin.Symbol, effectiveNonce, err)
-		return ""
+		return "", "", nil, nil
 	}
 
 	header := make([]byte, 80)
@@ -1002,11 +1060,14 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 		txBytes, err := hex.DecodeString(txHex)
 		if err != nil {
 			log.Printf("[%s] assembleBlockHex: invalid tx hex: %v", s.coin.Symbol, err)
-			return ""
+			return "", "", nil, nil
 		}
 		block.Write(txBytes)
 	}
-	return hex.EncodeToString(block.Bytes())
+	h := dsha256(header)
+	blockHash = hex.EncodeToString(reverseBytes(h[:]))
+	blockHex = hex.EncodeToString(block.Bytes())
+	return blockHex, blockHash, header, coinbaseBytes
 }
 
 func (s *Server) submitBlock(blockHex, workerName string, height int64) {
@@ -1276,12 +1337,16 @@ func (s *Server) broadcastJobs() {
 
 // BlockEntry records a found block for the dashboard log
 type BlockEntry struct {
-	Coin    string
-	Height  int64
-	Hash    string
-	Reward  string
-	Worker  string
-	FoundAt time.Time
+	Coin          string
+	Height        int64
+	Hash          string
+	Reward        string
+	Worker        string
+	FoundAt       time.Time
+	Confirmations int64  // -1 = orphaned, 0 = unconfirmed, N = confirmations
+	IsOrphaned    bool
+	IsAux         bool   // true for DOGE/BCH (merge-mined) blocks
+	AuxParentCoin string // e.g. "LTC" for a DOGE block
 }
 
 // WorkerInfo is a public snapshot of a worker (online or previously seen)
@@ -1475,6 +1540,26 @@ func (s *Server) recordBlock(hash string, height int64, reward float64, worker s
 	s.mu.Unlock()
 }
 
+// RecordBlock publicly records a found block (used by main.go for aux chain blocks).
+func (s *Server) RecordBlock(symbol, hash string, height int64, reward float64, worker, auxParent string) {
+	entry := BlockEntry{
+		Coin:          symbol,
+		Height:        height,
+		Hash:          hash,
+		Reward:        fmt.Sprintf("%.4f %s", reward, symbol),
+		Worker:        worker,
+		FoundAt:       time.Now(),
+		IsAux:         auxParent != "",
+		AuxParentCoin: auxParent,
+	}
+	s.mu.Lock()
+	s.blockLog = append(s.blockLog, entry)
+	if len(s.blockLog) > 50 {
+		s.blockLog = s.blockLog[len(s.blockLog)-50:]
+	}
+	s.mu.Unlock()
+}
+
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 type Stats struct {
@@ -1548,6 +1633,70 @@ func (s *Server) Diag() DiagStats {
 		CurrentJobAge:  jobAge,
 		HasJob:         hasJob,
 		WorkerCount:    workerCount,
+	}
+}
+
+// trackConfirmations polls the node every 30 seconds and updates confirmation counts
+// for all blocks in the log that haven't matured (120+ confirmations) or been orphaned.
+func (s *Server) trackConfirmations() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			// Snapshot entries that need checking (avoid holding lock during RPC)
+			s.mu.RLock()
+			var toCheck []BlockEntry
+			for _, e := range s.blockLog {
+				if !e.IsOrphaned && e.Confirmations < 120 && e.Hash != "" && e.Hash != "(pending)" {
+					toCheck = append(toCheck, e)
+				}
+			}
+			s.mu.RUnlock()
+
+			if len(toCheck) == 0 {
+				continue
+			}
+
+			// RPC calls outside the lock
+			type update struct {
+				hash          string
+				confirmations int64
+				orphaned      bool
+			}
+			var updates []update
+			for _, e := range toCheck {
+				info, err := s.rpcClient.GetBlock(e.Hash)
+				if err != nil {
+					continue // daemon unreachable — skip this round
+				}
+				orphaned := info.Confirmations < 0
+				updates = append(updates, update{e.Hash, info.Confirmations, orphaned})
+			}
+
+			// Apply updates under write lock
+			s.mu.Lock()
+			for i := range s.blockLog {
+				for _, u := range updates {
+					if s.blockLog[i].Hash != u.hash {
+						continue
+					}
+					if u.orphaned {
+						if !s.blockLog[i].IsOrphaned {
+							s.blockLog[i].IsOrphaned = true
+							if s.OnBlockOrphaned != nil {
+								go s.OnBlockOrphaned(s.blockLog[i].Coin, u.hash, s.blockLog[i].Height)
+							}
+						}
+					} else {
+						s.blockLog[i].Confirmations = u.confirmations
+					}
+				}
+			}
+			s.mu.Unlock()
+		}
 	}
 }
 

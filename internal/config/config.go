@@ -231,6 +231,25 @@ func DefaultConfig() *PoolConfig {
 				Wallet:      "YOUR_LCC_WALLET",
 				BlockReward: 250,
 			},
+			"DGB": {
+				Enabled:   false, // opt-in — SHA-256d primary chain; ~30 GB blockchain, safe for Pi
+				Symbol:    "DGB",
+				Algorithm: "sha256d",
+				Stratum: StratumConf{
+					Port: 3339,
+					Vardiff: VardiffConf{
+						MinDiff: 1, MaxDiff: 1048576,
+						TargetMs: 30000, RetargetS: 60,
+					},
+				},
+				Node: NodeConf{
+					Host: "127.0.0.1", Port: 14022,
+					User: "digibyted", Password: "changeme",
+					ZmqPubHashBlock: "tcp://127.0.0.1:28337",
+				},
+				Wallet:      "YOUR_DGB_WALLET",
+				BlockReward: 665,
+			},
 		},
 		Discord: DiscordConfig{
 			Enabled:    true,

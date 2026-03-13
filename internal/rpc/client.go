@@ -145,8 +145,19 @@ func (c *Client) GetBlockTemplate(capabilities []string) (*BlockTemplate, error)
 	rules := []string{"segwit"}
 	if strings.EqualFold(c.Symbol, "LTC") {
 		rules = append(rules, "mweb")
+	} else if strings.EqualFold(c.Symbol, "BCH") {
+		rules = []string{} // Bitcoin Cash does not support the segwit rule
 	}
 	params := map[string]any{"capabilities": capabilities, "rules": rules}
+	// DGB MultiAlgo: specify sha256d algorithm so digibyted produces SHA-256d work.
+	// Without this, digibyted defaults to the network's current algo rotation.
+	if strings.EqualFold(c.Symbol, "DGB") || strings.EqualFold(c.Symbol, "DGBS") {
+		algo := "sha256d"
+		if strings.EqualFold(c.Symbol, "DGBS") {
+			algo = "scrypt"
+		}
+		params["algo"] = algo
+	}
 	var bt BlockTemplate
 	if err := c.Call("getblocktemplate", []any{params}, &bt); err != nil {
 		return nil, err
@@ -207,6 +218,35 @@ func (c *Client) Ping() error {
 	return c.Call("ping", nil, nil)
 }
 
+// AuxBlockResult holds the result of getauxblock (for merge mining)
+type AuxBlockResult struct {
+	Hash    string `json:"hash"`
+	ChainID uint32 `json:"chainid"`
+	Target  string `json:"target"`
+	Height  int64  `json:"height"`
+}
+
+// GetAuxBlock fetches current merged mining work from an aux chain daemon.
+// walletAddr is the address where the aux block reward should be paid.
+// Passing an empty string uses the daemon's default wallet address.
+func (c *Client) GetAuxBlock(walletAddr string) (*AuxBlockResult, error) {
+	var result AuxBlockResult
+	var params []any
+	if walletAddr != "" {
+		params = []any{walletAddr}
+	}
+	err := c.Call("getauxblock", params, &result)
+	return &result, err
+}
+
+// SubmitAuxBlockRPC submits a solved aux block.
+// hash is the work hash from GetAuxBlock.
+// auxpow is the serialized AuxPoW proof hex (parent coinbase + merkle branch + parent header).
+func (c *Client) SubmitAuxBlockRPC(hash, auxpow string) (string, error) {
+	var result string
+	err := c.Call("submitauxblock", []any{hash, auxpow}, &result)
+	return result, err
+}
 
 // BlockchainInfo holds sync state from getblockchaininfo
 type BlockchainInfo struct {
@@ -236,6 +276,32 @@ func (c *Client) GetBlockCount() (int64, error) {
 	return count, err
 }
 
+// BlockInfo holds the data returned by getblock
+type BlockInfo struct {
+	Hash          string  `json:"hash"`
+	Confirmations int64   `json:"confirmations"` // -1 if block is on a side chain (orphaned)
+	Height        int64   `json:"height"`
+	Time          int64   `json:"time"`
+}
+
+// GetBlock fetches block info by hash. Returns (nil, nil) if block not found.
+// Confirmations < 0 means the block is on a side chain (orphaned).
+func (c *Client) GetBlock(hash string) (*BlockInfo, error) {
+	var info BlockInfo
+	// verbosity=1 returns full block info as JSON
+	if err := c.Call("getblock", []any{hash, 1}, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// GetBlockHash returns the block hash at the given height.
+func (c *Client) GetBlockHash(height int64) (string, error) {
+	var hash string
+	err := c.Call("getblockhash", []any{height}, &hash)
+	return hash, err
+}
+
 // CreateCoinbaseTx builds a coinbase transaction split around the extranonce space.
 // The coinbase script sig is structured as:
 //   [block height (BIP34)] [coinbase tag bytes] [extranonce placeholder]
@@ -247,7 +313,7 @@ func (c *Client) GetBlockCount() (int64, error) {
 // witnessCommitment (hex, from getblocktemplate's default_witness_commitment) is
 // required for SegWit blocks (BTC height ≥ 481824). When non-empty, a second output
 // is added: value=0, script=OP_RETURN OP_PUSHDATA(36) 0xaa21a9ed <commitment>.
-func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int, coinbaseTag, witnessCommitment string) (part1, part2 []byte) {
+func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSize int, coinbaseTag, witnessCommitment string, auxCommitment []byte) (part1, part2 []byte) {
 	heightScript := encodeHeight(height)
 
 	// Sanitize tag — ASCII only, max 20 bytes, ensure it won't blow the 100-byte script limit
@@ -257,15 +323,15 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 	}
 
 	// Total coinbase script length:
-	// height script + tag + extranonce (extranonceSize bytes)
-	scriptLen := len(heightScript) + len(tagBytes) + extranonceSize
+	// height script + tag + extranonce (extranonceSize bytes) + auxCommitment
+	scriptLen := len(heightScript) + len(tagBytes) + extranonceSize + len(auxCommitment)
 	if scriptLen > 100 {
 		// Trim tag if we'd exceed the protocol limit
 		trim := scriptLen - 100
 		if trim < len(tagBytes) {
 			tagBytes = tagBytes[:len(tagBytes)-trim]
 		}
-		scriptLen = len(heightScript) + len(tagBytes) + extranonceSize
+		scriptLen = len(heightScript) + len(tagBytes) + extranonceSize + len(auxCommitment)
 	}
 
 	// ── Part 1: version + input + script up to (not including) extranonce ────
@@ -292,9 +358,13 @@ func CreateCoinbaseTx(walletAddr string, value int64, height int64, extranonceSi
 	// Coinbase tag — this is what shows up on block explorers
 	buf1.Write(tagBytes)
 
-	// ── Part 2: after extranonce — sequence + output + locktime ──────────────
+	// ── Part 2: after extranonce — auxCommitment + sequence + output + locktime ──────────────
 	var buf2 bytes.Buffer
 
+	// AuxPoW commitment — still inside the coinbase scriptSig, after extranonce
+	if len(auxCommitment) > 0 {
+		buf2.Write(auxCommitment)
+	}
 	// Sequence
 	buf2.Write([]byte{0xff, 0xff, 0xff, 0xff})
 
@@ -364,6 +434,12 @@ func encodeHeight(h int64) []byte {
 	for h > 0 {
 		b = append(b, byte(h&0xff))
 		h >>= 8
+	}
+	// BIP34 uses CScript signed integer encoding.
+	// If the high bit of the last byte is set, the value would be interpreted
+	// as negative. Append a zero byte to preserve the positive sign.
+	if b[len(b)-1]&0x80 != 0 {
+		b = append(b, 0x00)
 	}
 	return append([]byte{byte(len(b))}, b...)
 }

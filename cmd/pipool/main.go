@@ -57,7 +57,7 @@ func main() {
   ╔══════════════════════════════════════════════════════╗
   ║   ⛏️  PiPool v%s                                    ║
   ║   Raspberry Pi 5 Solo Mining Pool                    ║
-  ║   LTC+DOGE · BTC+BCH · PEP (opt-in)                 ║
+  ║   LTC+DOGE · BTC+BCH · DGB · PEP (opt-in)           ║
   ╚══════════════════════════════════════════════════════╝
 `, version)
 
@@ -156,6 +156,46 @@ func main() {
 		}
 		srv.OnBlockFound = func(sym, hash string, reward float64) {
 			notifier.BlockFound(sym, hash, 0, reward, "unknown")
+		}
+		srv.OnAuxBlockFound = func(info stratum.AuxBlockInfo) {
+			// Build the allHashes slice in sorted symbol order (same order used when
+			// building the coinbase commitment so the merkle tree is identical).
+			syms := info.AuxSortedSyms
+			allHashes := make([][32]byte, len(syms))
+			for i, sym := range syms {
+				if aw, ok := info.AuxWorkSnap[sym]; ok {
+					copy(allHashes[i][:], aw.Hash)
+				}
+			}
+
+			children := cfg.MergeChildren(coin.Symbol)
+			for _, child := range children {
+				child := child // capture
+				go func() {
+					auxWork, ok := coord.GetAuxWork(child.Symbol)
+					if !ok {
+						log.Printf("[%s] no aux work available for submitauxblock", child.Symbol)
+						return
+					}
+
+					// Find this child's index in the sorted symbol list
+					chainIdx := 0
+					for i, sym := range syms {
+						if sym == child.Symbol {
+							chainIdx = i
+							break
+						}
+					}
+
+					auxPoWHex := merge.BuildAuxPoWHex(info.CoinbaseTx, info.MerkleBranch, info.HeaderBytes, allHashes, chainIdx)
+					if err := coord.SubmitAuxBlock(child.Symbol, auxWork.HashHex, auxPoWHex); err != nil {
+						log.Printf("[%s] submitauxblock failed: %v", child.Symbol, err)
+					} else {
+						log.Printf("[%s] aux block submitted successfully! (merged via %s)", child.Symbol, coin.Symbol)
+						notifier.BlockFound(child.Symbol, auxWork.HashHex, 0, child.BlockReward, "merged")
+					}
+				}()
+			}
 		}
 
 		if err := srv.Start(); err != nil {
@@ -671,6 +711,7 @@ collect:
 		jobAgeWarnSec := map[string]int64{
 			"BTC": 2400, "BCH": 2400,
 			"LTC": 600,
+			"DGB": 60,
 			"DOGE": 300, "PEP": 300,
 		}
 		warnSec, ok := jobAgeWarnSec[d.Symbol]
