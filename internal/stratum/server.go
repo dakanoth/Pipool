@@ -1523,7 +1523,12 @@ func (s *Server) Diag() DiagStats {
 		jobAge = int64(time.Since(s.currentJob.CreatedAt).Seconds())
 		hasJob = true
 	}
-	workerCount := len(s.workers)
+	var workerCount int
+	for _, w := range s.workers {
+		if w.authorized {
+			workerCount++
+		}
+	}
 	// Tally stale/rejected from seenWorkers (includes both online and offline workers,
 	// and is kept in sync with active workers via updateSeenWorkerShares)
 	var stale, rejected uint64

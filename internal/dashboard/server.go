@@ -1259,7 +1259,8 @@ function renderDiag(diags) {
     var staleCls = stalePct >= 10 ? 'diag-stat-val crit' : (stalePct >= 3 ? 'diag-stat-val warn' : 'diag-stat-val');
     var rejectCls = rejectPct >= 5 ? 'diag-stat-val crit' : (rejectPct >= 1 ? 'diag-stat-val warn' : 'diag-stat-val');
     var jobAge = d.current_job_age_s || 0;
-    var jobAgeCls = jobAge > 120 ? 'diag-job-age warn' : 'diag-job-age';
+    var hasJobAgeIssue = issues.some(function(i){ return i.indexOf('Job is') >= 0; });
+    var jobAgeCls = hasJobAgeIssue ? 'diag-job-age warn' : 'diag-job-age';
     var jobAgeStr = d.has_job ? (jobAge < 60 ? jobAge+'s' : Math.floor(jobAge/60)+'m'+jobAge%60+'s') : 'NO JOB';
     var issuesHtml = issues.length === 0
       ? '<div class="diag-ok">&#10003; NO ISSUES</div>'

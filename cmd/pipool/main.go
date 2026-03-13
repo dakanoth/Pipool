@@ -492,15 +492,23 @@ collect:
 			stats := srv.Stats()
 			cs.Miners = stats.ConnectedMiners
 			cs.Blocks = stats.BlocksFound
-			// Estimate hashrate from recent share difficulty samples (more accurate than
-			// using MinDiff which would be stale once vardiff ramps up)
+			// Estimate hashrate from recent share difficulty samples.
+			// Only use samples from the last 5 minutes so hashrate decays to 0
+			// when a miner goes quiet instead of staying stuck at an old value.
 			samples := srv.ShareSamples()
-			if len(samples) >= 2 {
+			cutoffMS := (time.Now().Add(-5 * time.Minute)).UnixMilli()
+			var recentSamples []stratum.ShareSample
+			for _, ss := range samples {
+				if ss.TimeMS >= cutoffMS {
+					recentSamples = append(recentSamples, ss)
+				}
+			}
+			if len(recentSamples) >= 2 {
 				var diffSum float64
-				for _, ss := range samples {
+				for _, ss := range recentSamples {
 					diffSum += ss.Difficulty
 				}
-				spanSec := float64(samples[len(samples)-1].TimeMS-samples[0].TimeMS) / 1000.0
+				spanSec := float64(recentSamples[len(recentSamples)-1].TimeMS-recentSamples[0].TimeMS) / 1000.0
 				if spanSec > 0 {
 					// diff1 constants: scrypt=65536, sha256d≈2^32
 					diff1 := 65536.0
@@ -612,9 +620,13 @@ collect:
 			WorkerCount:    d.WorkerCount,
 			HasJob:         d.HasJob,
 		}
-		if d.TotalShares > 0 {
-			cd.StalePct = float64(d.StaleShares) / float64(d.TotalShares) * 100
-			cd.RejectPct = float64(d.RejectedShares) / float64(d.TotalShares) * 100
+		// Use consistent denominator: valid+stale+rejected from seenWorkers.
+		// TotalShares (atomic) counts all submissions including unauthorized
+		// workers, making stale% and reject% appear artificially low.
+		trackTotal := d.ValidShares + d.StaleShares + d.RejectedShares
+		if trackTotal > 0 {
+			cd.StalePct = float64(d.StaleShares) / float64(trackTotal) * 100
+			cd.RejectPct = float64(d.RejectedShares) / float64(trackTotal) * 100
 		}
 		// Issue detection
 		if !d.HasJob {
