@@ -172,19 +172,28 @@ func main() {
 			for _, child := range children {
 				child := child // capture
 				go func() {
-					auxWork, ok := coord.GetAuxWork(child.Symbol)
+					// Use the snapshotted aux work — it must match exactly what was
+					// committed in the parent coinbase when the job was built.
+					// Using coord.GetAuxWork() here would be wrong: if the aux chain
+					// found a new block after job creation, the hash would differ from
+					// the coinbase commitment and submitauxblock would fail.
+					auxWork, ok := info.AuxWorkSnap[child.Symbol]
 					if !ok {
-						log.Printf("[%s] no aux work available for submitauxblock", child.Symbol)
+						// This child had no work when the job was built — not committed.
 						return
 					}
 
-					// Find this child's index in the sorted symbol list
-					chainIdx := 0
+					// Find this child's index in the sorted symbol list used at job creation.
+					chainIdx := -1
 					for i, sym := range syms {
 						if sym == child.Symbol {
 							chainIdx = i
 							break
 						}
+					}
+					if chainIdx < 0 {
+						log.Printf("[%s] child symbol not found in aux snapshot syms — skipping submitauxblock", child.Symbol)
+						return
 					}
 
 					auxPoWHex := merge.BuildAuxPoWHex(info.CoinbaseTx, info.MerkleBranch, info.HeaderBytes, allHashes, chainIdx)
@@ -486,6 +495,8 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 	}
 
 	var totalKHs float64
+	var sha256KHs float64
+	var scryptKHs float64
 	var totalBlocks uint64
 
 	// Fetch per-coin RPC data concurrently — avoids serial blocking over LAN
@@ -592,6 +603,11 @@ collect:
 				}
 			}
 			totalKHs += cs.HashrateKHs
+			if coinCfg.Algorithm == "sha256d" {
+				sha256KHs += cs.HashrateKHs
+			} else if coinCfg.Algorithm == "scrypt" || coinCfg.Algorithm == "scryptn" {
+				scryptKHs += cs.HashrateKHs
+			}
 			totalBlocks += cs.Blocks
 		} else if coinCfg.MergeParent != "" {
 			// Merge aux coins (DOGE, BCH) share the parent's stratum server.
@@ -604,6 +620,8 @@ collect:
 	}
 
 	snap.TotalKHs = totalKHs
+	snap.Sha256KHs = sha256KHs
+	snap.ScryptKHs = scryptKHs
 	snap.BlocksFound = totalBlocks
 
 	// Storage stats

@@ -189,14 +189,16 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 
 // Start begins listening for miner connections and polling for new work
 func (s *Server) Start() error {
-	addr := fmt.Sprintf("%s:%d", s.poolCfg.Pool.Host, s.coin.Stratum.Port)
-	ln, err := net.Listen("tcp", addr)
+	// Bind on all interfaces so startup succeeds even if the pool's public IP
+	// is not yet assigned (e.g. immediately after a reboot / DHCP renewal).
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", s.coin.Stratum.Port)
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("[%s] stratum listen on %s: %w", s.coin.Symbol, addr, err)
+		return fmt.Errorf("[%s] stratum listen on %s: %w", s.coin.Symbol, listenAddr, err)
 	}
 	s.ln = ln
 
-	log.Printf("[%s] Stratum server listening on %s", s.coin.Symbol, addr)
+	log.Printf("[%s] Stratum server listening on %s (pool addr %s)", s.coin.Symbol, listenAddr, s.poolCfg.Pool.Host)
 
 	// Start block template poller — recovers from panics internally
 	go s.pollBlockTemplate()
@@ -811,29 +813,33 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 
 		reward := s.coin.BlockReward
 		blockHex, blockHash, headerBytes, coinbaseTxBytes := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion)
-		go s.submitBlock(blockHex, w.workerName, job.Height)
+		if blockHex == "" {
+			log.Printf("[%s] failed to assemble block hex — block cannot be submitted", s.coin.Symbol)
+		} else {
+			go s.submitBlock(blockHex, w.workerName, job.Height)
 
-		s.recordBlock(blockHash, job.Height, reward, w.workerName)
+			s.recordBlock(blockHash, job.Height, reward, w.workerName)
 
-		if s.OnBlockFound != nil {
-			s.OnBlockFound(s.coin.Symbol, blockHash, reward)
-		}
-
-		// Notify merge mining coordinator so it can submit aux chain blocks
-		if s.OnAuxBlockFound != nil && blockHex != "" {
-			// Decode merkle branch from hex strings to [][]byte
-			merkleBranch := make([][]byte, len(job.MerkleBranches))
-			for i, br := range job.MerkleBranches {
-				b, _ := hex.DecodeString(br)
-				merkleBranch[i] = b
+			if s.OnBlockFound != nil {
+				s.OnBlockFound(s.coin.Symbol, blockHash, reward)
 			}
-			s.OnAuxBlockFound(AuxBlockInfo{
-				CoinbaseTx:    coinbaseTxBytes,
-				MerkleBranch:  merkleBranch,
-				HeaderBytes:   headerBytes,
-				AuxSortedSyms: job.AuxSortedSyms,
-				AuxWorkSnap:   job.AuxWorks,
-			})
+
+			// Notify merge mining coordinator so it can submit aux chain blocks
+			if s.OnAuxBlockFound != nil {
+				// Decode merkle branch from hex strings to [][]byte
+				merkleBranch := make([][]byte, len(job.MerkleBranches))
+				for i, br := range job.MerkleBranches {
+					b, _ := hex.DecodeString(br)
+					merkleBranch[i] = b
+				}
+				s.OnAuxBlockFound(AuxBlockInfo{
+					CoinbaseTx:    coinbaseTxBytes,
+					MerkleBranch:  merkleBranch,
+					HeaderBytes:   headerBytes,
+					AuxSortedSyms: job.AuxSortedSyms,
+					AuxWorkSnap:   job.AuxWorks,
+				})
+			}
 		}
 	}
 

@@ -54,6 +54,14 @@ read -p "  LTC  RPC password: " LTC_RPC_PASS
 read -p "  DOGE RPC password: " DOGE_RPC_PASS
 read -p "  BTC  RPC password: " BTC_RPC_PASS
 read -p "  BCH  RPC password: " BCH_RPC_PASS
+read -p "  DGB  RPC password (leave blank to skip DGB): " DGB_RPC_PASS
+DGB_WALLET="YOUR_DGB_WALLET"
+DGB_ENABLED="false"
+if [[ -n "$DGB_RPC_PASS" ]]; then
+  DGB_ENABLED="true"
+  read -p "  DGB wallet address (D...): " DGB_WALLET
+  [[ -z "$DGB_WALLET" ]] && err "DGB wallet is required when DGB is enabled"
+fi
 
 [[ -z "$LTC_RPC_PASS"  ]] && err "LTC RPC password is required"
 [[ -z "$DOGE_RPC_PASS" ]] && err "DOGE RPC password is required"
@@ -266,6 +274,25 @@ cat > "${PIPOOL_DIR}/configs/pipool.json" <<EOFJSON
       "wallet": "${BCH_WALLET}",
       "block_reward": 6.25
     },
+    "DGB": {
+      "enabled": ${DGB_ENABLED},
+      "symbol": "DGB",
+      "algorithm": "sha256d",
+      "merge_parent": "",
+      "datadir": "",
+      "stratum": {
+        "port": 3339,
+        "vardiff": { "min_diff": 65536, "max_diff": 8388608, "target_ms": 30000, "retarget_s": 90 },
+        "tls": { "enabled": false, "port": 3349, "cert_file": "", "key_file": "" }
+      },
+      "node": {
+        "host": "${PC_IP}", "port": 14022,
+        "user": "digibyted", "password": "${DGB_RPC_PASS}",
+        "zmq_pub_hashblock": "tcp://${PC_IP}:28338"
+      },
+      "wallet": "${DGB_WALLET}",
+      "block_reward": 665
+    },
     "PEP": {
       "enabled": ${PEP_ENABLED},
       "symbol": "PEP",
@@ -462,6 +489,7 @@ ufw allow 3335/tcp comment "PiPool BTC Stratum"
 ufw allow 3336/tcp comment "PiPool BCH Stratum"
 ufw allow 3337/tcp comment "PiPool PEP Stratum"
 ufw allow 3338/tcp comment "PiPool LCC Stratum"
+ufw allow 3339/tcp comment "PiPool DGB Stratum"
 ufw allow 8080/tcp comment "PiPool Dashboard"
 ufw allow 9100/tcp comment "PiPool Prometheus metrics"
 ufw --force enable
@@ -486,6 +514,9 @@ echo -e "  LTC RPC:     ${PC_IP}:9332"
 echo -e "  DOGE RPC:    ${PC_IP}:22555"
 echo -e "  BTC RPC:     ${PC_IP}:8332"
 echo -e "  BCH RPC:     ${PC_IP}:8336"
+if [[ "$DGB_ENABLED" == "true" ]]; then
+echo -e "  DGB RPC:     ${PC_IP}:14022"
+fi
 if [[ "$PEP_ENABLED" == "true" ]]; then
 echo -e "  PEP RPC:     ${PC_IP}:33873"
 fi
@@ -506,6 +537,9 @@ echo ""
 echo "  3. Point your miner at this Pi:"
 echo -e "     ${CYAN}LTC/DOGE:${NC}   stratum+tcp://${PI_IP}:3333"
 echo -e "     ${CYAN}BTC/BCH:${NC}    stratum+tcp://${PI_IP}:3335"
+if [[ "$DGB_ENABLED" == "true" ]]; then
+echo -e "     ${CYAN}DGB:${NC}        stratum+tcp://${PI_IP}:3339"
+fi
 if [[ "$PEP_ENABLED" == "true" ]]; then
 echo -e "     ${CYAN}PEP:${NC}        stratum+tcp://${PI_IP}:3337"
 fi

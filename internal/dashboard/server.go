@@ -33,6 +33,8 @@ type StatsSnapshot struct {
 	RAMUsedGB    float64        `json:"ram_used_gb"`
 	Throttling   bool           `json:"throttling"`
 	TotalKHs     float64        `json:"total_khs"`
+	Sha256KHs    float64        `json:"sha256_khs"`
+	ScryptKHs    float64        `json:"scrypt_khs"`
 	BlocksFound  uint64         `json:"blocks_found"`
 	CoinbaseTag  string         `json:"coinbase_tag"`
 	Coins        []CoinStats    `json:"coins"`
@@ -742,8 +744,14 @@ footer {
 
 <div class="cards">
   <div class="card">
-    <div class="card-val" id="totalKhs">--</div>
-    <div class="card-label">Total Hashrate</div>
+    <div class="card-val" id="sha256Khs">--</div>
+    <div class="card-label">SHA-256D Hashrate</div>
+    <div class="card-sub" style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">BTC · BCH</div>
+  </div>
+  <div class="card">
+    <div class="card-val" id="scryptKhs">--</div>
+    <div class="card-label">SCRYPT Hashrate</div>
+    <div class="card-sub" style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">LTC · DOGE · DGB</div>
   </div>
   <div class="card">
     <div class="card-val" id="blocksFound">0</div>
@@ -977,7 +985,7 @@ var notifState = {
   node_unreachable: true
 };
 
-var ALGO = {LTC:'SCRYPT',DOGE:'SCRYPT / AUXPOW',BTC:'SHA-256D',BCH:'SHA-256D / AUXPOW',PEP:'SCRYPT-N'};
+var ALGO = {LTC:'SCRYPT',DOGE:'SCRYPT / AUXPOW',BTC:'SHA-256D',BCH:'SHA-256D / AUXPOW',PEP:'SCRYPT-N',DGB:'SHA-256D',DGBS:'SCRYPT',LCC:'SHA-256D / AUXPOW'};
 
 function fmtHash(khs) {
   if (!khs) return '0 KH/S';
@@ -1076,7 +1084,8 @@ function apply(s) {
     if (inp && document.activeElement !== inp) inp.value = s.coinbase_tag;
   }
 
-  document.getElementById('totalKhs').textContent   = fmtHash(s.total_khs||0);
+  document.getElementById('sha256Khs').textContent  = fmtHash(s.sha256_khs||0);
+  document.getElementById('scryptKhs').textContent  = fmtHash(s.scrypt_khs||0);
   document.getElementById('blocksFound').textContent = s.blocks_found||0;
   document.getElementById('uptime').textContent      = s.uptime||'--';
   document.getElementById('cpuTemp').textContent     = (s.cpu_temp_c||0).toFixed(1)+'C';
