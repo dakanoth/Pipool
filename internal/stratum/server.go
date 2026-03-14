@@ -120,6 +120,10 @@ type SeenWorker struct {
 	SharesAccepted uint64
 	SharesRejected uint64
 	SharesStale    uint64
+	// Base counts accumulated from all prior sessions; current session adds on top.
+	SharesAcceptedBase uint64
+	SharesRejectedBase uint64
+	SharesStaleBase    uint64
 	BestShare      float64
 	ConnectedAt    time.Time
 	LastSeenAt     time.Time
@@ -471,9 +475,9 @@ func (s *Server) handleWorker(conn net.Conn) {
 			if seen, ok := s.seenWorkers[w.workerName]; ok {
 				seen.Online = false
 				seen.LastSeenAt = time.Now()
-				seen.SharesAccepted = w.sharesAccepted
-				seen.SharesRejected = w.sharesRejected
-				seen.SharesStale = w.sharesStale
+				seen.SharesAccepted = seen.SharesAcceptedBase + w.sharesAccepted
+				seen.SharesRejected = seen.SharesRejectedBase + w.sharesRejected
+				seen.SharesStale    = seen.SharesStaleBase    + w.sharesStale
 				if w.bestShare > seen.BestShare {
 					seen.BestShare = w.bestShare
 				}
@@ -633,6 +637,11 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	// Update seenWorkers under s.mu only (never while holding w.mu).
 	s.mu.Lock()
 	if existing, ok := s.seenWorkers[workerName]; ok {
+		// Snapshot the running total as the base for this new session so share
+		// counts accumulate across reconnects rather than resetting to zero.
+		existing.SharesAcceptedBase = existing.SharesAccepted
+		existing.SharesRejectedBase = existing.SharesRejected
+		existing.SharesStaleBase    = existing.SharesStale
 		existing.Online = true
 		existing.LastSeenAt = time.Now()
 		existing.LastAddr = w.remoteAddr
@@ -846,16 +855,18 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	return s.reply(w, msg.ID, true, nil)
 }
 
-// updateSeenWorkerShares syncs current share counts to seenWorkers map
+// updateSeenWorkerShares syncs current share counts to seenWorkers map.
+// Total counts accumulate across reconnects by adding the current session
+// onto the base saved when the worker last authorized.
 func (s *Server) updateSeenWorkerShares(w *Worker) {
 	if w.workerName == "" {
 		return
 	}
 	s.mu.Lock()
 	if seen, ok := s.seenWorkers[w.workerName]; ok {
-		seen.SharesAccepted = w.sharesAccepted
-		seen.SharesRejected = w.sharesRejected
-		seen.SharesStale    = w.sharesStale
+		seen.SharesAccepted = seen.SharesAcceptedBase + w.sharesAccepted
+		seen.SharesRejected = seen.SharesRejectedBase + w.sharesRejected
+		seen.SharesStale    = seen.SharesStaleBase    + w.sharesStale
 		seen.LastSeenAt     = time.Now()
 		if w.bestShare > seen.BestShare {
 			seen.BestShare = w.bestShare
@@ -1397,14 +1408,11 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			LastSeenAt:     seen.LastSeenAt,
 			Online:         seen.Online,
 		}
-		// Use live stats if currently connected
+		// Use live difficulty from the connected Worker; share counts come from
+		// seen.Shares* which updateSeenWorkerShares keeps current (base + session).
 		if w, ok := onlineByName[name]; ok {
-			wi.Difficulty     = w.difficulty
-			wi.SharesAccepted = w.sharesAccepted
-			wi.SharesRejected = w.sharesRejected
-			wi.SharesStale    = w.sharesStale
-			wi.BestShare      = w.bestShare
-			wi.Online         = true
+			wi.Difficulty = w.difficulty
+			wi.Online     = true
 		}
 		out = append(out, wi)
 	}
