@@ -125,6 +125,7 @@ type SeenWorker struct {
 	SharesRejectedBase uint64
 	SharesStaleBase    uint64
 	BestShare      float64
+	LastDifficulty float64 // difficulty at last disconnect — restored on next reconnect
 	ConnectedAt    time.Time
 	LastSeenAt     time.Time
 	Online         bool
@@ -284,15 +285,57 @@ func (s *Server) pollBlockTemplate() {
 	var lastHash string
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	// Periodic job refresh — keeps cpuminer-based miners (e.g. Elphapex DG1 Home) connected
+	// by sending an updated mining.notify even when the block hasn't changed.
+	refreshTicker := time.NewTicker(45 * time.Second)
+	defer refreshTicker.Stop()
 
 	daemonWasDown := false
 	retryDelay := 5 * time.Second
 	const maxRetryDelay = 60 * time.Second
 
+	broadcastJob := func(cleanJobs bool) {
+		job, err := s.buildJob(cleanJobs)
+		if err != nil {
+			log.Printf("[%s] buildJob: %v", s.coin.Symbol, err)
+			return
+		}
+		s.mu.Lock()
+		s.currentJob = job
+		s.recentJobs[job.ID] = job
+		if len(s.recentJobs) > 4 {
+			var oldestID string
+			var oldestTime time.Time
+			for id, j := range s.recentJobs {
+				if oldestID == "" || j.CreatedAt.Before(oldestTime) {
+					oldestID = id
+					oldestTime = j.CreatedAt
+				}
+			}
+			delete(s.recentJobs, oldestID)
+		}
+		s.mu.Unlock()
+		select {
+		case s.jobBroadcast <- job:
+		default:
+		}
+	}
+
 	for {
 		select {
 		case <-s.stopCh:
 			return
+		case <-refreshTicker.C:
+			if lastHash == "" || daemonWasDown {
+				continue // not ready yet
+			}
+			s.mu.RLock()
+			hasWorkers := len(s.workers) > 0
+			s.mu.RUnlock()
+			if !hasWorkers {
+				continue
+			}
+			broadcastJob(false)
 		case <-ticker.C:
 			hash, err := s.rpcClient.GetBestBlockHash()
 			if err != nil {
@@ -326,37 +369,7 @@ func (s *Server) pollBlockTemplate() {
 				continue
 			}
 			lastHash = hash
-
-			job, err := s.buildJob(true)
-			if err != nil {
-				log.Printf("[%s] buildJob: %v", s.coin.Symbol, err)
-				continue
-			}
-
-			s.mu.Lock()
-			s.currentJob = job
-			// Keep the last 4 jobs so miners finishing a recent job aren't falsely staled.
-			// Shares for any of these jobs are valid; we validate against the job they were computed on.
-			s.recentJobs[job.ID] = job
-			if len(s.recentJobs) > 4 {
-				// Find and remove the oldest job
-				var oldestID string
-				var oldestTime time.Time
-				for id, j := range s.recentJobs {
-					if oldestID == "" || j.CreatedAt.Before(oldestTime) {
-						oldestID = id
-						oldestTime = j.CreatedAt
-					}
-				}
-				delete(s.recentJobs, oldestID)
-			}
-			s.mu.Unlock()
-
-			select {
-			case s.jobBroadcast <- job:
-			default:
-				// channel full — miners will get next job
-			}
+			broadcastJob(true)
 		}
 	}
 }
@@ -481,6 +494,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 				if w.bestShare > seen.BestShare {
 					seen.BestShare = w.bestShare
 				}
+				seen.LastDifficulty = w.difficulty
 			}
 		}
 		s.mu.Unlock()
@@ -646,6 +660,11 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		existing.LastSeenAt = time.Now()
 		existing.LastAddr = w.remoteAddr
 		existing.DeviceName = device.Name
+		// Restore last-known difficulty so the miner doesn't flood the pool with
+		// thousands of low-diff shares before vardiff catches up.
+		if existing.LastDifficulty >= vd.MinDiff && existing.LastDifficulty <= vd.MaxDiff {
+			startDiff = existing.LastDifficulty
+		}
 	} else {
 		if len(s.seenWorkers) >= 500 {
 			// Evict the least-recently-seen offline worker

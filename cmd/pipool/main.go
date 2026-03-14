@@ -2,18 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"strings"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"sync"
 
 	"github.com/dakota/pipool/internal/config"
 	"github.com/dakota/pipool/internal/ctl"
@@ -28,6 +29,72 @@ import (
 )
 
 const version = "1.0.0"
+
+// ─── Live coin price cache (CoinGecko) ────────────────────────────────────────
+
+var (
+	priceMu    sync.RWMutex
+	priceCache = make(map[string]float64) // symbol → USD
+)
+
+// geckoIDs maps pool coin symbols to CoinGecko IDs.
+var geckoIDs = map[string]string{
+	"BTC":  "bitcoin",
+	"LTC":  "litecoin",
+	"DOGE": "dogecoin",
+	"BCH":  "bitcoin-cash",
+	"DGB":  "digibyte",
+}
+
+func coinPrice(symbol string) float64 {
+	priceMu.RLock()
+	defer priceMu.RUnlock()
+	return priceCache[symbol]
+}
+
+// fetchPricesLoop polls CoinGecko every 60 s and updates priceCache.
+func fetchPricesLoop(ctx context.Context) {
+	ids := make([]string, 0, len(geckoIDs))
+	for _, id := range geckoIDs {
+		ids = append(ids, id)
+	}
+	url := "https://api.coingecko.com/api/v3/simple/price?ids=" +
+		strings.Join(ids, ",") + "&vs_currencies=usd"
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	do := func() {
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("[prices] fetch error: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		var result map[string]map[string]float64
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			log.Printf("[prices] decode error: %v", err)
+			return
+		}
+		priceMu.Lock()
+		for sym, geckoID := range geckoIDs {
+			if data, ok := result[geckoID]; ok {
+				priceCache[sym] = data["usd"]
+			}
+		}
+		priceMu.Unlock()
+	}
+
+	do() // fetch immediately on start
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			do()
+		}
+	}
+}
 
 // fmtUptime formats a duration as "2d 3h 14m" or "47m 12s"
 func fmtUptime(d time.Duration) string {
@@ -343,6 +410,11 @@ func main() {
 	}
 	notifier.PoolStarted(activeSymbols)
 
+	// ─── Live coin price fetcher ──────────────────────────────────────────────
+	priceCtx, priceCancel := context.WithCancel(context.Background())
+	defer priceCancel()
+	go fetchPricesLoop(priceCtx)
+
 	// ─── Periodic hashrate report ─────────────────────────────────────────────
 	// Polls every minute; checks live config so dashboard interval changes take effect without restart.
 	go func() {
@@ -533,6 +605,9 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				if cs.SyncPct > 100.0 {
 					cs.SyncPct = 100.0
 				}
+				if mi, err2 := cli.GetMiningInfo(); err2 == nil {
+					cs.Difficulty = mi.Difficulty
+				}
 			} else {
 				// Daemon offline — try ping for latency at least
 				t1 := time.Now()
@@ -615,6 +690,14 @@ collect:
 			if parentSrv, ok := srvMap[coinCfg.MergeParent]; ok {
 				cs.Miners = parentSrv.Stats().ConnectedMiners
 			}
+		}
+		// Price, block reward, and estimated daily earnings
+		cs.BlockReward = coinCfg.BlockReward
+		cs.PriceUSD = coinPrice(sym)
+		if cs.PriceUSD > 0 && cs.Difficulty > 0 && cs.HashrateKHs > 0 {
+			hashPerSec := cs.HashrateKHs * 1000.0
+			expectedBlocksPerDay := (hashPerSec * 86400.0) / (cs.Difficulty * 4294967296.0)
+			cs.EarningsPerDayUSD = expectedBlocksPerDay * coinCfg.BlockReward * cs.PriceUSD
 		}
 		snap.Coins = append(snap.Coins, cs)
 	}

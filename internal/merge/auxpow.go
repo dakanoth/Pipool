@@ -292,9 +292,7 @@ func chainID(symbol string) uint32 {
 		return 0x0062 // 98
 	case "BCH":
 		return 0x0051
-	case "LCC":
-		return 0x0157
-	case "PEP":
+case "PEP":
 		return 0x0101
 	default:
 		return 0x0001

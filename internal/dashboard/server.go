@@ -99,7 +99,10 @@ type CoinStats struct {
 	Headers       int64   `json:"headers"`       // chain tip headers seen (may be ahead of Height)
 	SyncPct       float64 `json:"sync_pct"`      // 0.0–100.0; 100 = fully synced
 	IBD           bool    `json:"ibd"`           // true while in initial block download
-	Difficulty    float64 `json:"difficulty"`
+	Difficulty       float64 `json:"difficulty"`
+	PriceUSD         float64 `json:"price_usd"`          // 0 = unknown
+	BlockReward      float64 `json:"block_reward"`        // in whole coins
+	EarningsPerDayUSD float64 `json:"earnings_day_usd"`   // estimated daily earnings at current hashrate
 	IsMergeAux    bool    `json:"is_merge_aux"`
 	MergeParent   string  `json:"merge_parent,omitempty"`
 }
@@ -810,11 +813,10 @@ footer {
     <span class="section-title">TELEMETRY</span>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="chartCoin" onchange="renderChart()" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.6rem;padding:2px 8px">
-        <option value="ALL">ALL CHAINS</option>
       </select>
       <div style="display:flex;gap:4px">
-        <button onclick="setChartMode('hashrate')" id="btnHashrate" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">HASHRATE</button>
-        <button onclick="setChartMode('diff')" id="btnDiff" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">SHARE DIFF</button>
+        <button onclick="setChartMode('hashrate')" id="btnHashrate" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">HASHRATE</button>
+        <button onclick="setChartMode('diff')" id="btnDiff" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">SHARE DIFF</button>
       </div>
     </div>
   </div>
@@ -840,9 +842,9 @@ footer {
     </div>
     <!-- Legend -->
     <div style="display:flex;gap:16px;align-items:center;margin-bottom:8px;flex-wrap:wrap" id="chartLegend">
-      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:3px;background:var(--chart-line);opacity:.7"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">HASHRATE</span></div>
-      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-net);border-top:2px dashed var(--chart-net)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">NET DIFF</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:var(--chart-line)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">ACCEPTED</span></div>
       <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:var(--chart-rej)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">REJECTED</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-net);border-top:2px dashed var(--chart-net)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">NET DIFF</span></div>
     </div>
     <canvas id="diffChart" style="width:100%;height:200px;display:block"></canvas>
     <div id="noShareData" style="font-family:var(--scan);font-size:.7rem;color:var(--dim2);text-align:center;padding:50px 0;display:none">
@@ -872,7 +874,7 @@ footer {
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
         <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Status</th>
+          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Status</th>
         </tr></thead>
         <tbody id="workersBody">
           <tr><td colspan="8" class="no-workers">No miners connected</td></tr>
@@ -985,7 +987,7 @@ var notifState = {
   node_unreachable: true
 };
 
-var ALGO = {LTC:'SCRYPT',DOGE:'SCRYPT / AUXPOW',BTC:'SHA-256D',BCH:'SHA-256D / AUXPOW',PEP:'SCRYPT-N',DGB:'SHA-256D',DGBS:'SCRYPT',LCC:'SHA-256D / AUXPOW'};
+var ALGO = {LTC:'SCRYPT',DOGE:'SCRYPT / AUXPOW',BTC:'SHA-256D',BCH:'SHA-256D / AUXPOW',PEP:'SCRYPT-N',DGB:'SHA-256D',DGBS:'SCRYPT'};
 
 function fmtHash(khs) {
   if (!khs) return '0 KH/S';
@@ -1161,6 +1163,12 @@ function apply(s) {
           '<div><div class="cs-l">Miners</div><div class="cs-v">'+c.miners+'</div></div>' +
           '<div><div class="cs-l">Blocks</div><div class="cs-v">'+c.blocks+'</div></div>' +
           '<div><div class="cs-l">Height</div><div class="cs-v">'+(c.height||'--')+'</div></div>' +
+          '<div><div class="cs-l">Price</div><div class="cs-v">'+(c.price_usd > 0 ? '$'+c.price_usd.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '--')+'</div></div>' +
+          (function(){
+            var rewardUsd = (c.block_reward > 0 && c.price_usd > 0) ? ' ($'+( c.block_reward * c.price_usd ).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+')' : '';
+            return '<div><div class="cs-l">Reward</div><div class="cs-v">'+(c.block_reward > 0 ? c.block_reward+' '+c.symbol+rewardUsd : '--')+'</div></div>';
+          })() +
+          '<div><div class="cs-l">Est. Day</div><div class="cs-v">'+(c.earnings_day_usd > 0 ? '$'+c.earnings_day_usd.toFixed(4) : '--')+'</div></div>' +
         '</div>' +
       '</div>';
   });
@@ -1208,6 +1216,7 @@ function apply(s) {
         '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
         '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
         '<td>'+diffHtml+'</td>' +
+        '<td><span class="shares-val">'+total.toLocaleString()+'</span></td>' +
         '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
         '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
         '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
@@ -1470,7 +1479,7 @@ function cycleTheme() {
 var shareHistoryGlobal = [];
 var hashrateHistoryGlobal = [];
 var coinNetDiff = {};
-var chartMode = 'hashrate'; // 'hashrate' | 'diff'
+var chartMode = 'diff'; // 'hashrate' | 'diff'
 var bestShareSession = 0;
 
 function setChartMode(m) {
@@ -1488,31 +1497,30 @@ function populateCoinFilter(coins) {
   var existing = {};
   for (var i = 0; i < sel.options.length; i++) existing[sel.options[i].value] = true;
   coins.forEach(function(c) {
+    if (c.is_merge_aux) return; // merge-aux coins share their parent's stratum — no independent share data
     if (!existing[c.symbol]) {
       var opt = document.createElement('option');
       opt.value = c.symbol; opt.textContent = c.symbol;
       sel.appendChild(opt);
+      existing[c.symbol] = true;
     }
     if (c.difficulty && c.daemon_online) coinNetDiff[c.symbol] = c.difficulty;
   });
+  // Default to first option if nothing valid is selected
+  if (!existing[sel.value] && sel.options.length > 0) sel.value = sel.options[0].value;
 }
 
 function updateTelemetryStats(coins) {
   var sel = document.getElementById('chartCoin');
-  var filter = sel ? sel.value : 'ALL';
+  var filter = sel ? sel.value : '';
 
-  // Net diff for selected coin(s)
-  var netDiff = 0;
-  var totalKHs = 0;
+  var netDiff = 0, totalKHs = 0;
   coins.forEach(function(c) {
-    if (!c.daemon_online) return;
-    if (filter === 'ALL' || filter === c.symbol) {
-      if (c.difficulty > netDiff) netDiff = c.difficulty;
-      totalKHs += c.hashrate_khs || 0;
-    }
+    if (!c.daemon_online || c.symbol !== filter) return;
+    netDiff = c.difficulty || 0;
+    totalKHs = c.hashrate_khs || 0;
   });
 
-  // Block odds: expected time = netDiff * 2^32 / hashrate_hash_per_sec
   var netDiffEl = document.getElementById('netDiffDisplay');
   if (netDiffEl) netDiffEl.textContent = netDiff > 0 ? fmtDiffShort(netDiff) : '--';
 
@@ -1520,8 +1528,6 @@ function updateTelemetryStats(coins) {
     var hashPerSec = totalKHs * 1000;
     var expectedSec = (netDiff * 4294967296) / hashPerSec;
     document.getElementById('blockExpected').textContent = fmtSeconds(expectedSec);
-
-    // Probability of finding in next hour
     var pctPerHour = (1 - Math.exp(-3600 / expectedSec)) * 100;
     var pctStr = pctPerHour < 0.001 ? pctPerHour.toExponential(2)+'%' : pctPerHour.toFixed(4)+'%';
     document.getElementById('blockOddsNow').textContent = pctStr + ' / hr';
@@ -1530,7 +1536,6 @@ function updateTelemetryStats(coins) {
     document.getElementById('blockExpected').textContent = '--';
   }
 
-  // Best share
   var bsEl = document.getElementById('bestShareNow');
   if (bsEl && bestShareSession > 0) bsEl.textContent = fmtDiffShort(bestShareSession);
 }
@@ -1711,8 +1716,9 @@ function renderChart() {
     });
 
   } else {
-    // DIFF MODE — scatter dots like before
-    var dsamples = shareHistoryGlobal.filter(function(s){ return filter==='ALL'||s.coin===filter; });
+    // DIFF MODE — per-coin scatter with log Y-axis and time X-axis
+    var dsamples = shareHistoryGlobal.filter(function(s){ return s.coin===filter; });
+    dsamples.sort(function(a,b){ return a.t-b.t; });
     if (dsamples.length === 0) {
       canvas.style.display='none'; noData.style.display='block'; return;
     }
@@ -1724,46 +1730,85 @@ function renderChart() {
     var ctx2=canvas.getContext('2d');
     ctx2.scale(dpr2,dpr2);
     var W2=rect2.width, H2=rect2.height;
-    var PAD2={t:14,r:12,b:28,l:68};
+    var PAD2={t:16,r:12,b:28,l:72};
     var cW2=W2-PAD2.l-PAD2.r, cH2=H2-PAD2.t-PAD2.b;
 
-    var netD2 = coinNetDiff[filter]||(filter==='ALL'?Object.values(coinNetDiff)[0]:0)||0;
-    var maxD = Math.max.apply(null,dsamples.map(function(s){return s.diff;}));
-    if (netD2>maxD) maxD=netD2; maxD*=1.1;
+    // Log Y scale — includes both share diffs and network diff so both are always visible
+    var netD2 = coinNetDiff[filter] || 0;
+    var posDiffs = dsamples.map(function(s){return s.diff;}).filter(function(d){return d>0;});
+    if (netD2 > 0) posDiffs.push(netD2);
+    var rawMin = Math.min.apply(null, posDiffs);
+    var rawMax = Math.max.apply(null, posDiffs);
+    var logMin2 = Math.log10(Math.max(rawMin * 0.5, 1));
+    var logMax2 = Math.log10(rawMax * 3.0); // headroom above net diff
+    var logRange2 = logMax2 - logMin2 || 1;
+    function yDiff(d) {
+      var v = Math.max(d, Math.pow(10, logMin2));
+      return PAD2.t + cH2 * (1 - (Math.log10(v) - logMin2) / logRange2);
+    }
 
+    // Time X axis
+    var tMin2=dsamples[0].t, tMax2=dsamples[dsamples.length-1].t;
+    var tSpan2 = tMax2-tMin2 || 1;
+    function xDiff(t) { return PAD2.l + (t-tMin2)/tSpan2*cW2; }
+
+    // Background
     ctx2.fillStyle=cSurf; ctx2.fillRect(0,0,W2,H2);
-    ctx2.strokeStyle=cBdr; ctx2.lineWidth=0.5;
-    for (var gi2=0;gi2<=4;gi2++){
-      var gy2=PAD2.t+(gi2/4)*cH2;
-      ctx2.beginPath(); ctx2.moveTo(PAD2.l,gy2); ctx2.lineTo(W2-PAD2.r,gy2); ctx2.stroke();
-      ctx2.fillStyle=cDim2; ctx2.font='9px monospace'; ctx2.textAlign='right';
-      ctx2.fillText(fmtDiffShort(maxD*(1-gi2/4)), PAD2.l-4, gy2+3);
-    }
-    if (netD2>0){
-      var ny2=PAD2.t+cH2*(1-netD2/maxD);
-      ctx2.strokeStyle=cNet; ctx2.lineWidth=1.5; ctx2.setLineDash([6,4]);
-      ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny2); ctx2.lineTo(W2-PAD2.r,ny2); ctx2.stroke();
-      ctx2.setLineDash([]); ctx2.fillStyle=cNet; ctx2.font='9px monospace'; ctx2.textAlign='left';
-      ctx2.fillText('NET DIFF', PAD2.l+4, ny2-3);
-    }
-    var nn=dsamples.length;
-    var pts2=dsamples.map(function(s,i){
-      return{x:PAD2.l+(nn===1?cW2/2:(i/(nn-1))*cW2), y:PAD2.t+cH2*(1-Math.min(s.diff,maxD)/maxD), ok:s.ok};
-    });
-    ctx2.strokeStyle=cLine; ctx2.lineWidth=1.2; ctx2.shadowColor=cLine; ctx2.shadowBlur=3;
-    ctx2.beginPath(); pts2.forEach(function(p,i){i===0?ctx2.moveTo(p.x,p.y):ctx2.lineTo(p.x,p.y);}); ctx2.stroke(); ctx2.shadowBlur=0;
-    pts2.forEach(function(p){
-      ctx2.beginPath(); ctx2.arc(p.x,p.y,3,0,Math.PI*2);
-      ctx2.fillStyle=p.ok?cLine:cRej; ctx2.shadowColor=p.ok?cLine:cRej; ctx2.shadowBlur=5; ctx2.fill(); ctx2.shadowBlur=0;
-    });
-    if (nn>=2){
-      var dt0=dsamples[0].t,dtN=dsamples[nn-1].t;
-      ctx2.fillStyle=cDim2; ctx2.font='9px monospace'; ctx2.textAlign='center';
-      [0,0.5,1].forEach(function(f){
-        var t=dt0+(dtN-dt0)*f, d=new Date(t);
-        ctx2.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')+':'+d.getSeconds().toString().padStart(2,'0'), PAD2.l+f*cW2, H2-6);
+
+    // Grid lines at powers of 10 (major at 1×, minor at 2× and 5×)
+    var pLow=Math.floor(logMin2), pHigh=Math.ceil(logMax2);
+    for (var p=pLow; p<=pHigh; p++) {
+      [1,2,5].forEach(function(m) {
+        var v=m*Math.pow(10,p), lv=Math.log10(v);
+        if (lv < logMin2 || lv > logMax2) return;
+        var gy=PAD2.t+cH2*(1-(lv-logMin2)/logRange2);
+        ctx2.strokeStyle = m===1 ? cBdr : 'rgba(0,68,0,0.25)';
+        ctx2.lineWidth = m===1 ? 0.7 : 0.3;
+        ctx2.beginPath(); ctx2.moveTo(PAD2.l,gy); ctx2.lineTo(W2-PAD2.r,gy); ctx2.stroke();
+        if (m===1) {
+          ctx2.fillStyle=cDim2; ctx2.font='9px monospace'; ctx2.textAlign='right';
+          ctx2.fillText(fmtDiffShort(v), PAD2.l-4, gy+3);
+        }
       });
     }
+
+    // Net diff dashed line
+    if (netD2 > 0) {
+      var lv2=Math.log10(netD2);
+      if (lv2 >= logMin2 && lv2 <= logMax2) {
+        var ny2=yDiff(netD2);
+        ctx2.strokeStyle=cNet; ctx2.lineWidth=1.5; ctx2.setLineDash([6,4]);
+        ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny2); ctx2.lineTo(W2-PAD2.r,ny2); ctx2.stroke();
+        ctx2.setLineDash([]);
+        ctx2.fillStyle=cNet; ctx2.font='bold 9px monospace'; ctx2.textAlign='left';
+        ctx2.fillText('NET DIFF  '+fmtDiffShort(netD2), PAD2.l+4, ny2-4);
+      }
+    }
+
+    // Faint connecting line between dots
+    ctx2.strokeStyle='rgba(0,180,60,0.18)'; ctx2.lineWidth=1; ctx2.setLineDash([]);
+    ctx2.beginPath();
+    dsamples.forEach(function(s,i){
+      var x=xDiff(s.t), y=yDiff(s.diff);
+      i===0 ? ctx2.moveTo(x,y) : ctx2.lineTo(x,y);
+    });
+    ctx2.stroke();
+
+    // Dots
+    dsamples.forEach(function(s){
+      var x=xDiff(s.t), y=yDiff(s.diff);
+      ctx2.beginPath(); ctx2.arc(x,y,3,0,Math.PI*2);
+      ctx2.fillStyle=s.ok?cLine:cRej;
+      ctx2.shadowColor=s.ok?cLine:cRej; ctx2.shadowBlur=5;
+      ctx2.fill(); ctx2.shadowBlur=0;
+    });
+
+    // Time labels
+    ctx2.fillStyle=cDim2; ctx2.font='9px monospace'; ctx2.textAlign='center';
+    [0,0.25,0.5,0.75,1].forEach(function(f){
+      var t=tMin2+tSpan2*f, d=new Date(t);
+      ctx2.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'), PAD2.l+f*cW2, H2-6);
+    });
   }
 }
 
