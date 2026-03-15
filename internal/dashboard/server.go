@@ -1202,10 +1202,10 @@ footer {
   <div class="section-body" style="padding:0;overflow-x:auto">
     <table class="workers-table" id="workersTable" style="min-width:900px">
       <thead><tr>
-        <th>Worker</th><th>Coin</th><th>Diff</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Inv%</th><th>Best</th><th>Sess</th><th>Watts</th><th>$/Day</th><th>P&amp;L</th><th>Status</th>
+        <th>Worker</th><th>Coin</th><th>Diff</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Inv%</th><th>Best</th><th>Sess</th><th>Watts</th><th>$/Day</th><th>Status</th>
       </tr></thead>
       <tbody id="workersBody">
-        <tr><td colspan="13" class="no-workers">No miners connected</td></tr>
+        <tr><td colspan="12" class="no-workers">No miners connected</td></tr>
       </tbody>
     </table>
   </div>
@@ -2026,8 +2026,8 @@ function renderWorkersTab(s) {
   var tbody = document.getElementById('workersBody');
   if (workers.length === 0) {
     tbody.innerHTML = workerTab === 'active'
-      ? '<tr><td colspan="13" class="no-workers">NO MINERS CONNECTED</td></tr>'
-      : '<tr><td colspan="13" class="no-workers">NO KNOWN OFFLINE WORKERS</td></tr>';
+      ? '<tr><td colspan="12" class="no-workers">NO MINERS CONNECTED</td></tr>'
+      : '<tr><td colspan="12" class="no-workers">NO KNOWN OFFLINE WORKERS</td></tr>';
     return;
   }
   // Build map of primary coin → merge-mined children
@@ -2069,15 +2069,9 @@ function renderWorkersTab(s) {
     var sessHtml = '<span class="shares-val" title="'+sessCount+' session'+(sessCount>1?'s':'')+'" style="font-size:.65rem">'+sessLabel+sessDur+'</span>';
     var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
     var kwhRate = s.kwh_rate_usd || 0;
-    var costStr = '--', profitStr = '--', profitCls = '';
+    var costStr = '--';
     if (kwhRate > 0 && w.watts_estimate > 0) {
-      var cost = w.cost_per_day_usd || 0;
-      costStr = fmtCurrency(cost);
-      if (w.profit_per_day_usd !== undefined) {
-        var profit = w.profit_per_day_usd;
-        profitCls = profit >= 0 ? 'profit-pos' : 'profit-neg';
-        profitStr = (profit >= 0 ? '+' : '') + fmtCurrency(Math.abs(profit));
-      }
+      costStr = fmtCurrency(w.cost_per_day_usd || 0);
     }
     var tr = document.createElement('tr');
     if (!w.online) tr.className = 'worker-row-offline';
@@ -2095,7 +2089,6 @@ function renderWorkersTab(s) {
       '<td>'+sessHtml+'</td>' +
       '<td><span class="shares-val">'+wattsStr+'</span></td>' +
       '<td><span class="shares-val">'+costStr+'</span></td>' +
-      '<td><span class="'+profitCls+'">'+profitStr+'</span></td>' +
       '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>';
     tbody.appendChild(tr);
   });
