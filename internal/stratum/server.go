@@ -12,7 +12,9 @@ import (
 	"math/big"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/dakota/pipool/internal/config"
 	"github.com/dakota/pipool/internal/merge"
 	"github.com/dakota/pipool/internal/rpc"
+	"github.com/dakota/pipool/internal/zmq"
 	"golang.org/x/crypto/scrypt"
 )
 
@@ -194,6 +197,9 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 
 // Start begins listening for miner connections and polling for new work
 func (s *Server) Start() error {
+	// Restore persisted worker state (LastDifficulty, BestShare) from previous run
+	s.loadWorkerState()
+
 	// Bind on all interfaces so startup succeeds even if the pool's public IP
 	// is not yet assigned (e.g. immediately after a reboot / DHCP renewal).
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", s.coin.Stratum.Port)
@@ -220,6 +226,13 @@ func (s *Server) Start() error {
 					log.Printf("[%s] accept error: %v", s.coin.Symbol, err)
 					continue
 				}
+			}
+
+			// IP allowlist check
+			if len(s.poolCfg.Pool.IPAllowlist) > 0 && !isAllowedIP(conn.RemoteAddr().String(), s.poolCfg.Pool.IPAllowlist) {
+				log.Printf("[%s] connection rejected (not in allowlist): %s", s.coin.Symbol, conn.RemoteAddr())
+				conn.Close()
+				continue
 			}
 
 			// Enforce connection cap for RAM safety
@@ -290,6 +303,35 @@ func (s *Server) pollBlockTemplate() {
 	refreshTicker := time.NewTicker(45 * time.Second)
 	defer refreshTicker.Stop()
 
+	// ZMQ instant block notification — fires immediately when a new block is found.
+	// Falls back to 2-second polling if the endpoint is unconfigured or unreachable.
+	zmqNotify := make(chan struct{}, 1)
+	if ep := s.coin.Node.ZmqPubHashBlock; ep != "" {
+		go func() {
+			for {
+				select {
+				case <-s.stopCh:
+					return
+				default:
+				}
+				err := zmq.Subscribe(ep, "hashblock", func(_ [][]byte) {
+					select {
+					case zmqNotify <- struct{}{}:
+					default: // already a pending notification
+					}
+				})
+				if err != nil {
+					log.Printf("[%s] ZMQ %s disconnected, reconnecting in 5s: %v", s.coin.Symbol, ep, err)
+				}
+				select {
+				case <-time.After(5 * time.Second):
+				case <-s.stopCh:
+					return
+				}
+			}
+		}()
+	}
+
 	daemonWasDown := false
 	retryDelay := 5 * time.Second
 	const maxRetryDelay = 60 * time.Second
@@ -325,6 +367,17 @@ func (s *Server) pollBlockTemplate() {
 		select {
 		case <-s.stopCh:
 			return
+		case <-zmqNotify:
+			// Instant block notification via ZMQ — fetch hash and broadcast immediately
+			if daemonWasDown {
+				continue
+			}
+			hash, err := s.rpcClient.GetBestBlockHash()
+			if err != nil || hash == lastHash {
+				continue
+			}
+			lastHash = hash
+			broadcastJob(true)
 		case <-refreshTicker.C:
 			if lastHash == "" || daemonWasDown {
 				continue // not ready yet
@@ -500,6 +553,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 		s.mu.Unlock()
 		if w.authorized {
 			s.connectedMiners.Add(-1)
+			go s.saveWorkerState() // persist LastDifficulty and BestShare for next startup
 		}
 		log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
 		if s.OnMinerDisconnect != nil && w.authorized {
@@ -1805,4 +1859,131 @@ func reverseByteOrder(hexStr string) string {
 		copy(result[i:], chunk)
 	}
 	return string(result)
+}
+
+// ─── IP Allowlist ─────────────────────────────────────────────────────────────
+
+// isAllowedIP checks whether remoteAddr (host:port) matches any entry in the allowlist.
+// Each entry may be a CIDR range ("192.168.1.0/24") or a plain IP ("192.168.1.28").
+func isAllowedIP(remoteAddr string, allowlist []string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr // no port component
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, entry := range allowlist {
+		if strings.Contains(entry, "/") {
+			_, cidr, err := net.ParseCIDR(entry)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		} else {
+			if net.ParseIP(entry).Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ─── Worker state persistence ─────────────────────────────────────────────────
+
+type workerStateEntry struct {
+	Name           string  `json:"name"`
+	Coin           string  `json:"coin"`
+	LastDifficulty float64 `json:"last_difficulty"`
+	BestShare      float64 `json:"best_share"`
+}
+
+type workerStateFile struct {
+	Version int                         `json:"version"`
+	Saved   time.Time                   `json:"saved"`
+	Workers map[string]workerStateEntry `json:"workers"`
+}
+
+func (s *Server) stateFilePath() string {
+	if s.poolCfg.Pool.StateFile == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s_%s.json", s.poolCfg.Pool.StateFile, s.coin.Symbol)
+}
+
+// saveWorkerState writes LastDifficulty and BestShare for all known workers to disk.
+func (s *Server) saveWorkerState() {
+	path := s.stateFilePath()
+	if path == "" {
+		return
+	}
+	s.mu.RLock()
+	state := workerStateFile{
+		Version: 1,
+		Saved:   time.Now(),
+		Workers: make(map[string]workerStateEntry, len(s.seenWorkers)),
+	}
+	for name, sw := range s.seenWorkers {
+		if sw.LastDifficulty <= 0 && sw.BestShare <= 0 {
+			continue
+		}
+		state.Workers[name] = workerStateEntry{
+			Name:           sw.Name,
+			Coin:           sw.Coin,
+			LastDifficulty: sw.LastDifficulty,
+			BestShare:      sw.BestShare,
+		}
+	}
+	s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("[%s] state save marshal: %v", s.coin.Symbol, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		log.Printf("[%s] state save write %s: %v", s.coin.Symbol, path, err)
+	}
+}
+
+// loadWorkerState reads persisted worker state and pre-populates seenWorkers
+// with LastDifficulty and BestShare so they survive pool restarts.
+func (s *Server) loadWorkerState() {
+	path := s.stateFilePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[%s] state load %s: %v", s.coin.Symbol, path, err)
+		}
+		return
+	}
+	var state workerStateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("[%s] state load parse: %v", s.coin.Symbol, err)
+		return
+	}
+	s.mu.Lock()
+	loaded := 0
+	for name, entry := range state.Workers {
+		if entry.Coin != s.coin.Symbol {
+			continue
+		}
+		if entry.LastDifficulty <= 0 && entry.BestShare <= 0 {
+			continue
+		}
+		s.seenWorkers[name] = &SeenWorker{
+			Name:           entry.Name,
+			Coin:           entry.Coin,
+			LastDifficulty: entry.LastDifficulty,
+			BestShare:      entry.BestShare,
+		}
+		loaded++
+	}
+	s.mu.Unlock()
+	if loaded > 0 {
+		log.Printf("[%s] restored state for %d worker(s) from %s", s.coin.Symbol, loaded, path)
+	}
 }

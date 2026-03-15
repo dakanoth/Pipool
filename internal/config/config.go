@@ -18,12 +18,19 @@ type PoolConfig struct {
 }
 
 type PoolSettings struct {
-	Name           string `json:"name"`
-	Host           string `json:"host"`            // bind address, e.g. "0.0.0.0"
-	CoinbaseTag    string `json:"coinbase_tag"`    // e.g. "/PiPool/" — embedded in every block found
-	MaxConnections int    `json:"max_connections"` // cap RAM usage
-	WorkerTimeout  int    `json:"worker_timeout"`  // seconds before idle disconnect
-	TempLimitC     int    `json:"temp_limit_c"`    // CPU temp throttle threshold
+	Name           string   `json:"name"`
+	Host           string   `json:"host"`            // bind address, e.g. "0.0.0.0"
+	CoinbaseTag    string   `json:"coinbase_tag"`    // e.g. "/PiPool/" — embedded in every block found
+	MaxConnections int      `json:"max_connections"` // cap RAM usage
+	WorkerTimeout  int      `json:"worker_timeout"`  // seconds before idle disconnect
+	TempLimitC     int      `json:"temp_limit_c"`    // CPU temp throttle threshold
+	// IPAllowlist restricts stratum connections to specific IPs or CIDR ranges.
+	// Empty = allow all (default). Example: ["192.168.1.0/24", "10.0.0.5"]
+	IPAllowlist    []string `json:"ip_allowlist"`
+	// StateFile is the path prefix for persisted worker state (LastDifficulty, BestShare).
+	// Actual files are written as <StateFile>_<COIN>.json, e.g. worker_state_LTC.json.
+	// Empty = no persistence.
+	StateFile      string   `json:"state_file"`
 }
 
 type CoinConfig struct {
@@ -113,6 +120,8 @@ func DefaultConfig() *PoolConfig {
 			MaxConnections: 64,
 			WorkerTimeout:  120,
 			TempLimitC:     75,
+			IPAllowlist:    []string{},
+			StateFile:      "/opt/pipool/worker_state",
 		},
 		Coins: map[string]CoinConfig{
 			"LTC": {
