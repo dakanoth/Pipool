@@ -770,12 +770,13 @@ collect:
 	for _, srv := range servers {
 		for _, b := range srv.BlockLog() {
 			snap.BlockLog = append(snap.BlockLog, dashboard.BlockEvent{
-				Coin:    b.Coin,
-				Height:  b.Height,
-				Hash:    b.Hash,
-				Reward:  b.Reward,
-				Worker:  b.Worker,
-				FoundAt: b.FoundAt.Format("Jan 2 15:04:05"),
+				Coin:      b.Coin,
+				Height:    b.Height,
+				Hash:      b.Hash,
+				Reward:    b.Reward,
+				Worker:    b.Worker,
+				FoundAt:   b.FoundAt.Format("Jan 2 15:04:05"),
+				FoundAtMS: b.FoundAt.UnixMilli(),
 			})
 		}
 	}

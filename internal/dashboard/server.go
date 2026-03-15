@@ -123,12 +123,13 @@ type WorkerStat struct {
 }
 
 type BlockEvent struct {
-	Coin    string `json:"coin"`
-	Height  int64  `json:"height"`
-	Hash    string `json:"hash"`
-	Reward  string `json:"reward"`
-	Worker  string `json:"worker"`
-	FoundAt string `json:"found_at"`
+	Coin      string `json:"coin"`
+	Height    int64  `json:"height"`
+	Hash      string `json:"hash"`
+	Reward    string `json:"reward"`
+	Worker    string `json:"worker"`
+	FoundAt   string `json:"found_at"`
+	FoundAtMS int64  `json:"found_at_ms"` // epoch ms for chart positioning
 }
 
 // NotifSettings mirrors DiscordAlerts — lives here to avoid import cycle
@@ -844,7 +845,10 @@ footer {
     <div style="display:flex;gap:16px;align-items:center;margin-bottom:8px;flex-wrap:wrap" id="chartLegend">
       <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:var(--chart-line)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">ACCEPTED</span></div>
       <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:var(--chart-rej)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">REJECTED</span></div>
-      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-net);border-top:2px dashed var(--chart-net)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">NET DIFF</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:#ffdd00"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">AUX BLOCK</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:#ffffff"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">PARENT BLOCK</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;background:var(--chart-net);border-top:2px dashed var(--chart-net)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">PARENT NET DIFF</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:2px;border-top:2px dashed #ffdd00"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">AUX NET DIFF</span></div>
     </div>
     <canvas id="diffChart" style="width:100%;height:200px;display:block"></canvas>
     <div id="noShareData" style="font-family:var(--scan);font-size:.7rem;color:var(--dim2);text-align:center;padding:50px 0;display:none">
@@ -1271,6 +1275,7 @@ function apply(s) {
   // Update telemetry chart data
   if (s.share_history && s.share_history.length > 0) shareHistoryGlobal = s.share_history;
   if (s.hashrate_history && s.hashrate_history.length > 0) hashrateHistoryGlobal = s.hashrate_history;
+  if (s.block_log) blockLogGlobal = s.block_log;
   // Derive best share from workers
   if (s.workers) {
     s.workers.forEach(function(w){ if ((w.best_share||0) > bestShareSession) bestShareSession = w.best_share; });
@@ -1478,7 +1483,9 @@ function cycleTheme() {
 // ─── Telemetry Chart ───────────────────────────────────────────────────────
 var shareHistoryGlobal = [];
 var hashrateHistoryGlobal = [];
+var blockLogGlobal = [];
 var coinNetDiff = {};
+var mergeChildrenMap = {}; // parent symbol -> [aux symbols]
 var chartMode = 'diff'; // 'hashrate' | 'diff'
 var bestShareSession = 0;
 
@@ -1496,6 +1503,18 @@ function populateCoinFilter(coins) {
   if (!sel) return;
   var existing = {};
   for (var i = 0; i < sel.options.length; i++) existing[sel.options[i].value] = true;
+
+  // Rebuild merge children map and net diff cache from latest snapshot
+  mergeChildrenMap = {};
+  coins.forEach(function(c) {
+    if (c.difficulty && c.daemon_online) coinNetDiff[c.symbol] = c.difficulty;
+    if (c.is_merge_aux && c.merge_parent) {
+      if (!mergeChildrenMap[c.merge_parent]) mergeChildrenMap[c.merge_parent] = [];
+      if (mergeChildrenMap[c.merge_parent].indexOf(c.symbol) < 0)
+        mergeChildrenMap[c.merge_parent].push(c.symbol);
+    }
+  });
+
   coins.forEach(function(c) {
     if (c.is_merge_aux) return; // merge-aux coins share their parent's stratum — no independent share data
     if (!existing[c.symbol]) {
@@ -1504,7 +1523,6 @@ function populateCoinFilter(coins) {
       sel.appendChild(opt);
       existing[c.symbol] = true;
     }
-    if (c.difficulty && c.daemon_online) coinNetDiff[c.symbol] = c.difficulty;
   });
   // Default to first option if nothing valid is selected
   if (!existing[sel.value] && sel.options.length > 0) sel.value = sel.options[0].value;
@@ -1733,14 +1751,18 @@ function renderChart() {
     var PAD2={t:16,r:12,b:28,l:72};
     var cW2=W2-PAD2.l-PAD2.r, cH2=H2-PAD2.t-PAD2.b;
 
-    // Log Y scale — includes both share diffs and network diff so both are always visible
-    var netD2 = coinNetDiff[filter] || 0;
+    var AUX_COLORS = {'DOGE':'#ccbb00','BCH':'#00cc88','DGB':'#0088ff','DGBS':'#0055ff','PEP':'#ff44aa'};
+    var auxChildren = mergeChildrenMap[filter] || [];
+    var parentNetD = coinNetDiff[filter] || 0;
+
+    // Log Y scale — include parent and all aux chain diffs so all lines are always visible
     var posDiffs = dsamples.map(function(s){return s.diff;}).filter(function(d){return d>0;});
-    if (netD2 > 0) posDiffs.push(netD2);
+    if (parentNetD > 0) posDiffs.push(parentNetD);
+    auxChildren.forEach(function(ac){ if (coinNetDiff[ac] > 0) posDiffs.push(coinNetDiff[ac]); });
     var rawMin = Math.min.apply(null, posDiffs);
     var rawMax = Math.max.apply(null, posDiffs);
     var logMin2 = Math.log10(Math.max(rawMin * 0.5, 1));
-    var logMax2 = Math.log10(rawMax * 3.0); // headroom above net diff
+    var logMax2 = Math.log10(rawMax * 3.0);
     var logRange2 = logMax2 - logMin2 || 1;
     function yDiff(d) {
       var v = Math.max(d, Math.pow(10, logMin2));
@@ -1772,16 +1794,34 @@ function renderChart() {
       });
     }
 
-    // Net diff dashed line
-    if (netD2 > 0) {
-      var lv2=Math.log10(netD2);
+    // Aux chain net diff dashed lines (drawn before parent so parent is on top)
+    var auxLabelOffsets = {};
+    auxChildren.forEach(function(ac, ai) {
+      var acD = coinNetDiff[ac] || 0;
+      if (acD <= 0) return;
+      var lv = Math.log10(acD);
+      if (lv < logMin2 || lv > logMax2) return;
+      var ay = yDiff(acD);
+      var acColor = AUX_COLORS[ac] || '#aaaaaa';
+      ctx2.strokeStyle = acColor; ctx2.lineWidth = 1; ctx2.setLineDash([4,4]);
+      ctx2.beginPath(); ctx2.moveTo(PAD2.l, ay); ctx2.lineTo(W2-PAD2.r, ay); ctx2.stroke();
+      ctx2.setLineDash([]);
+      // Stagger labels if aux lines are close together
+      var labelX = PAD2.l + 4 + ai * 80;
+      ctx2.fillStyle = acColor; ctx2.font = '8px monospace'; ctx2.textAlign = 'left';
+      ctx2.fillText(ac+' '+fmtDiffShort(acD), labelX, ay-3);
+    });
+
+    // Parent chain net diff dashed line
+    if (parentNetD > 0) {
+      var lv2=Math.log10(parentNetD);
       if (lv2 >= logMin2 && lv2 <= logMax2) {
-        var ny2=yDiff(netD2);
+        var ny2=yDiff(parentNetD);
         ctx2.strokeStyle=cNet; ctx2.lineWidth=1.5; ctx2.setLineDash([6,4]);
         ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny2); ctx2.lineTo(W2-PAD2.r,ny2); ctx2.stroke();
         ctx2.setLineDash([]);
         ctx2.fillStyle=cNet; ctx2.font='bold 9px monospace'; ctx2.textAlign='left';
-        ctx2.fillText('NET DIFF  '+fmtDiffShort(netD2), PAD2.l+4, ny2-4);
+        ctx2.fillText(filter+' NET  '+fmtDiffShort(parentNetD), PAD2.l+4, ny2-4);
       }
     }
 
@@ -1794,13 +1834,50 @@ function renderChart() {
     });
     ctx2.stroke();
 
-    // Dots
+    // Dots — colored by what threshold they cleared
     dsamples.forEach(function(s){
       var x=xDiff(s.t), y=yDiff(s.diff);
-      ctx2.beginPath(); ctx2.arc(x,y,3,0,Math.PI*2);
-      ctx2.fillStyle=s.ok?cLine:cRej;
-      ctx2.shadowColor=s.ok?cLine:cRej; ctx2.shadowBlur=5;
+      var dotColor, dotR=3, dotGlow=5;
+      if (!s.ok) {
+        dotColor = cRej;
+      } else if (parentNetD > 0 && s.diff >= parentNetD) {
+        dotColor = '#ffffff'; dotR=6; dotGlow=16; // parent chain block!
+      } else {
+        var isAuxHit = auxChildren.some(function(ac){ return coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac]; });
+        if (isAuxHit) {
+          // Find which aux coin was hit for color (pick highest threshold cleared)
+          dotColor = '#ffdd00'; dotR=5; dotGlow=12;
+          auxChildren.forEach(function(ac){
+            if (coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac])
+              dotColor = AUX_COLORS[ac] || '#ffdd00';
+          });
+        } else {
+          dotColor = cLine;
+        }
+      }
+      ctx2.beginPath(); ctx2.arc(x,y,dotR,0,Math.PI*2);
+      ctx2.fillStyle=dotColor;
+      ctx2.shadowColor=dotColor; ctx2.shadowBlur=dotGlow;
       ctx2.fill(); ctx2.shadowBlur=0;
+    });
+
+    // Block found vertical markers
+    var relevantCoins = [filter].concat(auxChildren);
+    blockLogGlobal.forEach(function(b) {
+      if (relevantCoins.indexOf(b.coin) < 0) return;
+      if (!b.found_at_ms) return;
+      var bx = xDiff(b.found_at_ms);
+      if (bx < PAD2.l || bx > W2-PAD2.r) return;
+      var bColor = b.coin === filter ? '#ffffff' : (AUX_COLORS[b.coin] || '#ffdd00');
+      ctx2.strokeStyle = bColor; ctx2.lineWidth = 1.5; ctx2.setLineDash([3,3]);
+      ctx2.globalAlpha = 0.7;
+      ctx2.beginPath(); ctx2.moveTo(bx, PAD2.t); ctx2.lineTo(bx, H2-PAD2.b); ctx2.stroke();
+      ctx2.setLineDash([]); ctx2.globalAlpha = 1;
+      ctx2.fillStyle = bColor; ctx2.font = 'bold 8px monospace'; ctx2.textAlign = 'center';
+      ctx2.shadowColor = bColor; ctx2.shadowBlur = 8;
+      ctx2.fillText('▲', bx, H2-PAD2.b-2);
+      ctx2.fillText(b.coin, bx, PAD2.t+8);
+      ctx2.shadowBlur = 0;
     });
 
     // Time labels
