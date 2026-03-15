@@ -808,15 +808,17 @@ body::before {
 /* ── WORKERS ── */
 .workers-table { width:100%; border-collapse:collapse; font-size:.72rem; }
 .workers-table th {
-  font-family:var(--scan); font-size:.56rem; color:var(--dim);
-  text-transform:uppercase; letter-spacing:2px; text-align:left;
-  padding:6px 12px; border-bottom:1px solid var(--bdr); font-weight:400;
+  font-family:var(--scan); font-size:.54rem; color:var(--dim);
+  text-transform:uppercase; letter-spacing:1px; text-align:left;
+  padding:4px 8px; border-bottom:1px solid var(--bdr); font-weight:400;
+  white-space:nowrap;
 }
-.workers-table td { padding:8px 12px; border-bottom:1px solid var(--off); font-family:var(--scan); }
+.workers-table td { padding:4px 8px; border-bottom:1px solid var(--off); font-family:var(--scan); white-space:nowrap; }
 .workers-table tr:last-child td { border-bottom:none; }
 .workers-table tr:hover td { background:rgba(0,255,65,0.03); }
+.workers-table td:first-child { white-space:normal; min-width:120px; max-width:200px; }
 .worker-name { color:var(--hi2); }
-.worker-device { color:var(--dim); font-size:.64rem; }
+.worker-device { color:var(--dim); font-size:.60rem; }
 .coin-pill {
   font-family:var(--scan); font-size:.58rem; padding:1px 7px;
   border:1px solid var(--bdr2); color:var(--hi2); background:var(--off);
@@ -1200,7 +1202,7 @@ footer {
   <div class="section-body" style="padding:0;overflow-x:auto">
     <table class="workers-table" id="workersTable" style="min-width:900px">
       <thead><tr>
-        <th>Worker</th><th>Coin</th><th>Diff</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Watts</th><th>Cost/Day</th><th>Profit/Day</th><th>Status</th>
+        <th>Worker</th><th>Coin</th><th>Diff</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Inv%</th><th>Best</th><th>Sess</th><th>Watts</th><th>$/Day</th><th>P&amp;L</th><th>Status</th>
       </tr></thead>
       <tbody id="workersBody">
         <tr><td colspan="13" class="no-workers">No miners connected</td></tr>
@@ -2053,18 +2055,18 @@ function renderWorkersTab(s) {
     var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
     var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
     var ip = (w.addr||'').replace(/:\d+$/, '');
-    var tempBadge = (w.asic_temp_c && w.asic_temp_c > 0) ? ' <span style="color:'+(w.asic_temp_c>=80?'#f44':w.asic_temp_c>=70?'#fa0':'#4af')+';font-size:.6rem">'+w.asic_temp_c.toFixed(0)+'°C</span>' : '';
+    var tempBadge = (w.asic_temp_c && w.asic_temp_c > 0) ? ' <span style="color:'+(w.asic_temp_c>=80?'#f44':w.asic_temp_c>=70?'#fa0':'#4af')+';font-size:.58rem">'+w.asic_temp_c.toFixed(0)+'°</span>' : '';
     var deviceDisplay = w.user_agent
       ? '<span title="'+w.user_agent+'" style="cursor:help">'+(w.device||'')+'</span>'
       : (w.device||'');
-    var subLine = [deviceDisplay+tempBadge, addrAbbrev, ip].filter(Boolean).join(' · ');
+    var subLine = [deviceDisplay+tempBadge, ip].filter(Boolean).join(' ');
     var coin = w.coin || '?';
     var children = mergeChildren[coin];
     var coinLabel = children && children.length ? coin+'+'+children.join('+') : coin;
     var sessCount = (w.reconnect_count||0) + 1;
-    var sessLabel = sessCount === 1 ? '1 session' : sessCount+' sessions';
-    var sessHtml = '<div class="shares-val" style="font-size:.65rem">'+sessLabel+'</div>';
-    if (w.online && w.session_duration) sessHtml += '<div class="worker-device">'+w.session_duration+'</div>';
+    var sessLabel = sessCount+'×';
+    var sessDur = (w.online && w.session_duration) ? ' '+w.session_duration : '';
+    var sessHtml = '<span class="shares-val" title="'+sessCount+' session'+(sessCount>1?'s':'')+'" style="font-size:.65rem">'+sessLabel+sessDur+'</span>';
     var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
     var kwhRate = s.kwh_rate_usd || 0;
     var costStr = '--', profitStr = '--', profitCls = '';
