@@ -1543,11 +1543,7 @@ function apply(s) {
   if (costCardEl) {
     var kwhChk = s.kwh_rate_usd || 0;
     if (kwhChk > 0 && s.total_cost_per_day_usd > 0) {
-      var profitVal = s.total_profit_per_day_usd;
-      var profColor = profitVal >= 0 ? 'var(--hi2)' : 'var(--red,#f44)';
-      var profStr = profitVal !== undefined
-        ? ' · <span style="color:'+profColor+'">'+(profitVal>=0?'+':'')+fmtCurrency(profitVal)+'/day</span>' : '';
-      costCardEl.innerHTML = fmtCurrency(s.total_cost_per_day_usd)+'/day'+profStr;
+      costCardEl.textContent = fmtCurrency(s.total_cost_per_day_usd)+'/day';
     } else if (kwhChk > 0) {
       costCardEl.textContent = '$0.00/day';
     } else {
