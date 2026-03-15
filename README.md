@@ -30,7 +30,7 @@ By downloading, installing, or running this software you agree to the following:
 | Category | Feature |
 |---|---|
 | **Language** | Go — single binary, minimal RAM, native concurrency |
-| **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt-N), DGB, DGBS, Quai Network |
+| **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt-N), DGB, DGBS, Quai Network ⚠️ *(EXPERIMENTAL — see warning below)* |
 | **Merge Mining** | AuxPoW for LTC+DOGE and BTC+BCH — one sync, two rewards |
 | **Stratum** | Full Stratum V1 — vardiff, per-worker extranonce, clean job broadcast |
 | **ASIC Support** | 65 device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, …) |
@@ -67,11 +67,25 @@ By downloading, installing, or running this software you agree to the following:
 | PEP | 3337 | Scrypt-N (N=2048) | Optional — enable in config |
 | DGB | 3339 | SHA-256d | Optional DigiByte SHA-256d |
 | DGBS | 3342 | Scrypt | Optional DigiByte Scrypt |
-| QUAI (SHA-256d) | 3340 | SHA-256d | Quai Network |
-| QUAI (Scrypt) | 3341 | Scrypt | Quai Network |
+| QUAI (SHA-256d) | 3340 | SHA-256d | ⚠️ **EXPERIMENTAL** — Quai Network (see warning below) |
+| QUAI (Scrypt) | 3341 | Scrypt | ⚠️ **EXPERIMENTAL** — Quai Network (see warning below) |
 
 **You only need to point your miner at 3333 (Scrypt) and/or 3335 (SHA-256d).**
 DOGE and BCH are earned for free via merge mining.
+
+---
+
+## ⚠️ EXPERIMENTAL: Quai Network
+
+> **WARNING: Quai Network support is EXPERIMENTAL and NOT PRODUCTION READY.**
+>
+> - Quai Network uses a non-standard mining protocol and block submission process that differs significantly from Bitcoin-derived coins
+> - **Payouts are NOT guaranteed.** Block submission has not been exhaustively tested against a live Quai node under all conditions
+> - The Quai stratum implementation may have undiscovered bugs that result in rejected blocks, lost work, or miner disconnects
+> - **Do NOT use Quai mining with real money on the line until this warning is removed**
+> - If you choose to test Quai support, do so on testnet or in a controlled environment and report any issues
+>
+> All other coins (LTC, DOGE, BTC, BCH, PEP, DGB, DGBS) are stable and production-ready.
 
 ---
 

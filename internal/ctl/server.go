@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -164,6 +165,8 @@ func renderResponse(cmd string, resp Response) {
 		renderWorkers(resp.Data)
 	case "coins":
 		renderCoins(resp.Data)
+	case "calc":
+		renderCalc(resp.Data)
 	default:
 		if resp.Message != "" {
 			fmt.Println(resp.Message)
@@ -227,6 +230,128 @@ func renderCoins(data interface{}) {
 	w.Flush()
 }
 
+func renderCalc(data interface{}) {
+	b, _ := json.Marshal(data)
+	var results []map[string]interface{}
+	if err := json.Unmarshal(b, &results); err != nil || len(results) == 0 {
+		fmt.Println("No data.")
+		return
+	}
+	const powerball = 292201338.0
+	const megamillions = 302575350.0
+	fmtOdds := func(odds float64) string {
+		switch {
+		case odds < 100:
+			return fmt.Sprintf("1 in %.1f", odds)
+		case odds < 10000:
+			return fmt.Sprintf("1 in %d", int(math.Round(odds)))
+		case odds < 1e6:
+			return fmt.Sprintf("1 in %.1fK", odds/1000)
+		default:
+			return fmt.Sprintf("1 in %.2fM", odds/1e6)
+		}
+	}
+	fmtTime := func(sec float64) string {
+		switch {
+		case sec < 60:
+			return fmt.Sprintf("%.0fs", sec)
+		case sec < 3600:
+			return fmt.Sprintf("%.1f min", sec/60)
+		case sec < 86400:
+			return fmt.Sprintf("%.1f hrs", sec/3600)
+		default:
+			return fmt.Sprintf("%.1f days", sec/86400)
+		}
+	}
+	fmtKHs := func(khs float64) string {
+		switch {
+		case khs >= 1e9:
+			return fmt.Sprintf("%.3f EH/s", khs/1e9)
+		case khs >= 1e6:
+			return fmt.Sprintf("%.3f PH/s", khs/1e6)
+		case khs >= 1e3:
+			return fmt.Sprintf("%.3f TH/s", khs/1e3)
+		case khs >= 1:
+			return fmt.Sprintf("%.3f GH/s", khs)
+		case khs >= 0.001:
+			return fmt.Sprintf("%.3f MH/s", khs*1000)
+		default:
+			return fmt.Sprintf("%.1f KH/s", khs*1e6)
+		}
+	}
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────────────────────────┐")
+	fmt.Println("  │                    SOLO MINING LUCK CALCULATOR                      │")
+	fmt.Println("  └─────────────────────────────────────────────────────────────────────┘")
+	fmt.Println()
+	for _, r := range results {
+		sym, _ := r["symbol"].(string)
+		algo, _ := r["algorithm"].(string)
+		khs, _ := r["hashrate_khs"].(float64)
+		diff, _ := r["network_diff"].(float64)
+		expSec, _ := r["expected_sec"].(float64)
+		oddsHr, _ := r["odds_per_hour"].(float64)
+		pctHr, _ := r["pct_per_hour"].(float64)
+		vsPb, _ := r["vs_powerball"].(float64)
+		fmt.Printf("  %-6s  %s\n", sym, strings.ToUpper(algo))
+		fmt.Printf("  ─────────────────────────────────────\n")
+		fmt.Printf("  Hashrate:       %s\n", fmtKHs(khs))
+		fmt.Printf("  Network Diff:   %.4g\n", diff)
+		fmt.Printf("  Expected Time:  %s\n", fmtTime(expSec))
+		fmt.Printf("  Block Odds/hr:  %s  (%.4f%% chance)\n", fmtOdds(oddsHr), pctHr)
+		// Comparison
+		if vsPb >= 1 {
+			x := vsPb
+			var xs string
+			switch {
+			case x >= 1e6:
+				xs = fmt.Sprintf("%.1fM×", x/1e6)
+			case x >= 1e3:
+				xs = fmt.Sprintf("%dK×", int(math.Round(x/1000)))
+			default:
+				xs = fmt.Sprintf("%d×", int(math.Round(x)))
+			}
+			fmt.Printf("  vs Powerball:   %s BETTER than jackpot (1 in 292M per draw)\n", xs)
+		} else {
+			x := 1 / vsPb
+			var xs string
+			switch {
+			case x >= 1e6:
+				xs = fmt.Sprintf("%.1fM×", x/1e6)
+			case x >= 1e3:
+				xs = fmt.Sprintf("%dK×", int(math.Round(x/1000)))
+			default:
+				xs = fmt.Sprintf("%d×", int(math.Round(x)))
+			}
+			fmt.Printf("  vs Powerball:   %s WORSE than jackpot (1 in 292M per draw)\n", xs)
+		}
+		vsMm := megamillions / oddsHr
+		if vsMm >= 1 {
+			x := vsMm
+			var xs string
+			switch {
+			case x >= 1e6:
+				xs = fmt.Sprintf("%.1fM×", x/1e6)
+			case x >= 1e3:
+				xs = fmt.Sprintf("%dK×", int(math.Round(x/1000)))
+			default:
+				xs = fmt.Sprintf("%d×", int(math.Round(x)))
+			}
+			fmt.Printf("  vs Mega Mill:   %s BETTER than jackpot (1 in 302M per draw)\n", xs)
+		}
+		// Probability breakdown
+		pctDay := (1 - math.Exp(-86400/expSec)) * 100
+		pctWeek := (1 - math.Exp(-7*86400/expSec)) * 100
+		pctMonth := (1 - math.Exp(-30*86400/expSec)) * 100
+		fmt.Printf("\n  Probability of finding at least 1 block:\n")
+		fmt.Printf("    Per hour:   %.4f%%\n", pctHr)
+		fmt.Printf("    Per day:    %.2f%%\n", pctDay)
+		fmt.Printf("    Per week:   %.2f%%\n", pctWeek)
+		fmt.Printf("    Per month:  %.2f%%\n", pctMonth)
+		fmt.Println()
+	}
+}
+
 func printHelp() {
 	fmt.Print(`pipoolctl — PiPool runtime control
 
@@ -246,6 +371,7 @@ Commands:
   loglevel <level>              Set log level: debug | info | warn | error
   discord test                  Send a test Discord notification
   version                       Show PiPool version
+  calc [SYMBOL]                 Solo luck calculator — odds vs Powerball, expected time, probability per hr/day/week/month
 
 Examples:
   pipoolctl status

@@ -1141,18 +1141,14 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	log.Printf("[%s] share accepted from %s diff=%.4g", s.coin.Symbol, w.workerName, w.difficulty)
 
 	if isBlock {
-		s.blocksFound.Add(1)
-		log.Printf("[%s] BLOCK FOUND by %s!", s.coin.Symbol, w.workerName)
+		log.Printf("[%s] BLOCK candidate by %s — assembling for submission", s.coin.Symbol, w.workerName)
 
 		reward := s.coin.BlockReward
 		blockHex, blockHash, headerBytes, coinbaseTxBytes := s.assembleBlockHex(job, w.extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion)
 		if blockHex == "" {
 			log.Printf("[%s] failed to assemble block hex — block cannot be submitted", s.coin.Symbol)
 		} else {
-			go s.submitBlock(blockHex, w.workerName, job.Height)
-
-			// Compute luck: networkDiff / validWork * 100
-			// >100% = found faster than expected (lucky), <100% = found slower (unlucky)
+			// Snapshot luck before resetting work counter (luck is per-block, not per-submit)
 			s.mu.Lock()
 			luck := -1.0
 			validWork := s.validWorkSinceBlock
@@ -1163,31 +1159,50 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 			s.validWorkSinceBlock = 0 // reset for next block
 			s.mu.Unlock()
 
-			log.Printf("[%s] block luck: %.1f%% (network diff=%.2f, work done=%.2f)",
-				s.coin.Symbol, luck, netDiff, validWork)
+			// Capture callbacks/aux info before goroutine — avoid closing over mutable state
+			onBlockFound := s.OnBlockFound
+			onAuxBlockFound := s.OnAuxBlockFound
+			coinSym := s.coin.Symbol
+			height := job.Height
+			workerName := w.workerName
 
-			s.recordBlock(blockHash, job.Height, reward, w.workerName, luck)
-
-			if s.OnBlockFound != nil {
-				s.OnBlockFound(s.coin.Symbol, blockHash, w.workerName, reward, luck)
-			}
-
-			// Notify merge mining coordinator so it can submit aux chain blocks
-			if s.OnAuxBlockFound != nil {
-				// Decode merkle branch from hex strings to [][]byte
+			var auxInfo *AuxBlockInfo
+			if onAuxBlockFound != nil {
 				merkleBranch := make([][]byte, len(job.MerkleBranches))
 				for i, br := range job.MerkleBranches {
 					b, _ := hex.DecodeString(br)
 					merkleBranch[i] = b
 				}
-				s.OnAuxBlockFound(AuxBlockInfo{
+				auxInfo = &AuxBlockInfo{
 					CoinbaseTx:    coinbaseTxBytes,
 					MerkleBranch:  merkleBranch,
 					HeaderBytes:   headerBytes,
 					AuxSortedSyms: job.AuxSortedSyms,
 					AuxWorkSnap:   job.AuxWorks,
-				})
+				}
 			}
+
+			go func() {
+				result, err := s.rpcClient.SubmitBlock(blockHex)
+				if err != nil {
+					log.Printf("[%s] submitblock error: %v", coinSym, err)
+					return
+				}
+				if result != "" {
+					log.Printf("[%s] block rejected by node: %s (submitted by %s)", coinSym, result, workerName)
+					return
+				}
+				// Node accepted the block — now record it
+				log.Printf("[%s] block #%d ACCEPTED by node! found by %s (luck %.1f%%)", coinSym, height, workerName, luck)
+				s.blocksFound.Add(1)
+				s.recordBlock(blockHash, height, reward, workerName, luck)
+				if onBlockFound != nil {
+					onBlockFound(coinSym, blockHash, workerName, reward, luck)
+				}
+				if onAuxBlockFound != nil && auxInfo != nil {
+					onAuxBlockFound(*auxInfo)
+				}
+			}()
 		}
 	}
 
@@ -1433,19 +1448,6 @@ func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, eff
 	blockHash = hex.EncodeToString(reverseBytes(h[:]))
 	blockHex = hex.EncodeToString(block.Bytes())
 	return blockHex, blockHash, header, coinbaseBytes
-}
-
-func (s *Server) submitBlock(blockHex, workerName string, height int64) {
-	result, err := s.rpcClient.SubmitBlock(blockHex)
-	if err != nil {
-		log.Printf("[%s] submitblock error: %v", s.coin.Symbol, err)
-		return
-	}
-	if result != "" {
-		log.Printf("[%s] block rejected by node: %s (found by %s)", s.coin.Symbol, result, workerName)
-		return
-	}
-	log.Printf("[%s] block #%d accepted! found by %s", s.coin.Symbol, height, workerName)
 }
 
 // ─── PoW math helpers ─────────────────────────────────────────────────────────
@@ -1873,7 +1875,11 @@ func (s *Server) AllWorkers() []WorkerInfo {
 	}
 
 	// Compute 5-minute rolling hashrate per worker from recent share samples.
-	// Formula: sum(diffs) * 2^32 / 300s / 1000 → KH/s
+	// diff1 constant: sha256d=2^32, scrypt/scryptn=2^16 (LTC diff-1 is 65536x easier)
+	diff1 := 4294967296.0
+	if s.coin.Algorithm == "scrypt" || s.coin.Algorithm == "scryptn" {
+		diff1 = 65536.0
+	}
 	const windowMs = 5 * 60 * 1000
 	nowMs := time.Now().UnixMilli()
 	workerDiffSum := make(map[string]float64)
@@ -1885,7 +1891,7 @@ func (s *Server) AllWorkers() []WorkerInfo {
 
 	out := make([]WorkerInfo, 0, len(s.seenWorkers))
 	for name, seen := range s.seenWorkers {
-		khs := workerDiffSum[name] * 4294967296.0 / 300.0 / 1000.0
+		khs := workerDiffSum[name] * diff1 / 300.0 / 1000.0
 		wi := WorkerInfo{
 			Name:           name,
 			DeviceName:     seen.DeviceName,

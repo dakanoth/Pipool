@@ -473,6 +473,24 @@ const dashboardHTML = `<!DOCTYPE html>
   --glow:  0 0 10px rgba(170,255,0,0.7); --glow2: 0 0 24px rgba(170,255,0,0.25);
   --chart-line: #aaff00; --chart-net: #ff1155; --chart-rej: #ff6600;
 }
+
+/* ── SLATE (modern dark — easy on the eyes, blue/cyan accents) ── */
+[data-theme="slate"] {
+  --bg:    #0f1117; --surf:  #1a1d27; --surf2: #22263a;
+  --bdr:   #2a2f45; --bdr2:  #4a80ff;
+  --hi:    #e0e6ff; --hi2:   #7ab4ff;
+  --dim:   #8892aa; --dim2:  #4a5068; --off:   #0c0e16;
+  --red:   #ff5566; --amber: #ffb347;
+  --scan:  'Inter', 'Segoe UI', system-ui, sans-serif; --vt: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --glow:  0 0 8px rgba(74,128,255,0.45); --glow2: 0 0 20px rgba(74,128,255,0.2);
+  --chart-line: #7ab4ff; --chart-net: #ff5566; --chart-rej: #ffb347;
+}
+[data-theme="slate"] .logo-text { letter-spacing: 4px; font-size: 1.4rem; }
+[data-theme="slate"] .section,
+[data-theme="slate"] .coin-card,
+[data-theme="slate"] .card { border-radius: 6px; }
+[data-theme="slate"] .section-head { border-radius: 6px 6px 0 0; }
+[data-theme="slate"] .section-body { border-radius: 0 0 6px 6px; }
 * { margin:0; padding:0; box-sizing:border-box; }
 html { scrollbar-width:thin; scrollbar-color:var(--bdr2) var(--bg); }
 
@@ -955,6 +973,11 @@ footer {
     <div class="card-val" style="font-size:1.3rem" id="uptime">--</div>
     <div class="card-label">Uptime</div>
   </div>
+  <div class="card">
+    <div class="card-val" id="totalWattsCard">--</div>
+    <div class="card-label">Total Power</div>
+    <div class="card-sub" id="totalCostCard" style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-top:2px"></div>
+  </div>
 </div>
 
 <div class="section" style="margin-bottom:16px">
@@ -1057,6 +1080,10 @@ footer {
     <div class="section-head">
       <span class="section-title">WORKERS</span>
       <span id="workerCount" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">0</span>
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button id="tabBtnActive" onclick="setWorkerTab('active')" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">ACTIVE</button>
+        <button id="tabBtnKnown" onclick="setWorkerTab('known')" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">KNOWN WORKERS</button>
+      </span>
     </div>
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
@@ -1200,6 +1227,12 @@ footer {
         <div class="cfg-row">
           <div class="cfg-label">ELECTRICITY RATE ($/kWh)</div>
           <input class="cfg-input" id="cfgKwhRate" type="number" min="0" step="0.001" placeholder="0.12">
+        </div>
+        <div class="cfg-row">
+          <div class="cfg-label">DISPLAY CURRENCY</div>
+          <input class="cfg-input" id="cfgCurrencySymbol" style="width:70px" placeholder="USD" maxlength="8">
+          <span style="color:var(--dim2);font-family:var(--scan);font-size:.58rem;white-space:nowrap">1 USD =</span>
+          <input class="cfg-input" id="cfgCurrencyRate" type="number" style="width:90px" step="0.0001" placeholder="1.0">
         </div>
       </div>
 
@@ -1356,7 +1389,10 @@ function applyNotifs(n) {
   renderNotifState();
 }
 
+var lastState = {};
+
 function apply(s) {
+  lastState = s;
   document.getElementById('liveStatus').textContent = 'ONLINE';
   document.getElementById('lastUpdate').textContent = new Date(s.timestamp).toLocaleTimeString();
   if (s.coinbase_tag) {
@@ -1373,6 +1409,27 @@ function apply(s) {
   document.getElementById('throttleStatus').textContent = s.throttling ? '! THROTTLING' : '';
 
   document.getElementById('totalMiners').textContent = (s.workers||[]).filter(function(w){return w.online;}).length;
+
+  // Total power / cost card
+  var totalWatts = 0;
+  (s.workers||[]).forEach(function(w) { if (w.online && w.watts_estimate > 0) totalWatts += w.watts_estimate; });
+  var wattsCardEl = document.getElementById('totalWattsCard');
+  if (wattsCardEl) wattsCardEl.textContent = totalWatts > 0 ? totalWatts.toFixed(0)+'W' : '--';
+  var costCardEl = document.getElementById('totalCostCard');
+  if (costCardEl) {
+    var kwhChk = s.kwh_rate_usd || 0;
+    if (kwhChk > 0 && s.total_cost_per_day_usd > 0) {
+      var profitVal = s.total_profit_per_day_usd;
+      var profColor = profitVal >= 0 ? 'var(--hi2)' : 'var(--red,#f44)';
+      var profStr = profitVal !== undefined
+        ? ' · <span style="color:'+profColor+'">'+(profitVal>=0?'+':'')+fmtCurrency(profitVal)+'/day</span>' : '';
+      costCardEl.innerHTML = fmtCurrency(s.total_cost_per_day_usd)+'/day'+profStr;
+    } else if (kwhChk > 0) {
+      costCardEl.textContent = '$0.00/day';
+    } else {
+      costCardEl.textContent = 'set kWh rate in config';
+    }
+  }
 
   var cpu = s.cpu_usage_pct||0, ram = s.ram_used_gb||0, temp = s.cpu_temp_c||0;
   document.getElementById('cpuPct').textContent = cpu.toFixed(1)+'%';
@@ -1505,91 +1562,7 @@ function apply(s) {
       '</div>';
   });
 
-  var workers = s.workers||[];
-  var online = workers.filter(function(w){return w.online;}).length;
-  document.getElementById('workerCount').textContent = online+' ONLINE / '+workers.length+' SEEN';
-  var tbody = document.getElementById('workersBody');
-  if (workers.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="14" class="no-workers">NO MINERS CONNECTED</td></tr>';
-  } else {
-    // Build map of primary coin → merge-mined children (e.g. {LTC:['DOGE'], BTC:['BCH']})
-    var mergeChildren = {};
-    (s.coins||[]).forEach(function(c) {
-      if (c.is_merge_aux && c.merge_parent) {
-        if (!mergeChildren[c.merge_parent]) mergeChildren[c.merge_parent] = [];
-        mergeChildren[c.merge_parent].push(c.symbol);
-      }
-    });
-    var sorted = workers.slice().sort(function(a,b){
-      if (a.online && !b.online) return -1;
-      if (!a.online && b.online) return 1;
-      return 0;
-    });
-    tbody.innerHTML = '';
-    sorted.forEach(function(w) {
-      var total = (w.shares_accepted||0)+(w.shares_rejected||0)+(w.shares_stale||0);
-      var stalePct = total>0 ? ((w.shares_stale||0)/total*100).toFixed(2)+'%' : '0.00%';
-      var invPct   = total>0 ? ((w.shares_rejected||0)/total*100).toFixed(2)+'%' : '0.00%';
-      var staleHigh = parseFloat(stalePct) >= 3;
-      var invHigh   = parseFloat(invPct)   >= 1;
-      var statusCls = w.online ? 'worker-status-on' : 'worker-status-off';
-      var statusTxt = w.online ? 'ONLINE' : (w.last_seen_at||'OFFLINE');
-      var diffHtml = w.online ? '<span class="shares-val">'+fmtDiffShort(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
-      var khs = w.hashrate_khs||0;
-      var hrHtml = w.online && khs>0 ? '<span class="shares-val">'+fmtHash(khs)+'</span>' : '<span class="worker-device">--</span>';
-      var bestHtml = (w.best_share&&w.best_share>0) ? '<span class="shares-val">'+fmtDiffShort(w.best_share)+'</span>' : '<span class="worker-device">--</span>';
-      // Split "address.workername" → show only workername prominently; abbreviate address + show IP below
-      var nameParts = (w.name||'ANON').split('.');
-      var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
-      var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
-      var ip = (w.addr||'').replace(/:\d+$/, '');
-      var tempBadge = (w.asic_temp_c && w.asic_temp_c > 0) ? ' <span style="color:'+(w.asic_temp_c>=80?'#f44':w.asic_temp_c>=70?'#fa0':'#4af')+';font-size:.6rem">'+w.asic_temp_c.toFixed(0)+'°C</span>' : '';
-      var deviceDisplay = w.user_agent
-        ? '<span title="'+w.user_agent+'" style="cursor:help">'+(w.device||'')+'</span>'
-        : (w.device||'');
-      var subLine = [deviceDisplay+tempBadge, addrAbbrev, ip].filter(Boolean).join(' · ');
-      // Show merge children alongside primary coin (e.g. "LTC+DOGE", "BTC+BCH")
-      var children = mergeChildren[w.coin];
-      var coinLabel = children && children.length ? w.coin+'+'+children.join('+') : w.coin;
-      // Sessions cell: "N sessions" + session duration for online workers
-      var sessCount = (w.reconnect_count||0) + 1;
-      var sessLabel = sessCount === 1 ? '1 session' : sessCount+' sessions';
-      var sessHtml = '<div class="shares-val" style="font-size:.65rem">'+sessLabel+'</div>';
-      if (w.online && w.session_duration) sessHtml += '<div class="worker-device">'+w.session_duration+'</div>';
-      var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
-      var kwhRate = s.kwh_rate_usd || 0;
-      var costStr = '--', profitStr = '--', profitCls = '';
-      if (kwhRate > 0 && w.watts_estimate > 0) {
-        var cost = w.cost_per_day_usd || 0;
-        costStr = '$'+cost.toFixed(3);
-        if (w.profit_per_day_usd !== undefined) {
-          var profit = w.profit_per_day_usd;
-          profitCls = profit >= 0 ? 'profit-pos' : 'profit-neg';
-          profitStr = (profit >= 0 ? '+' : '')+' $'+Math.abs(profit).toFixed(3);
-        }
-      }
-      var tr = document.createElement('tr');
-      if (!w.online) tr.className = 'worker-row-offline';
-      tr.style.cursor = 'pointer';
-      tr.onclick = (function(ww){ return function(){ openWorkerModal(ww.coin, ww.name); }; })(w);
-      tr.innerHTML =
-        '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
-        '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
-        '<td>'+diffHtml+'</td>' +
-        '<td>'+hrHtml+'</td>' +
-        '<td><span class="shares-val">'+total.toLocaleString()+'</span></td>' +
-        '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
-        '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
-        '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
-        '<td>'+bestHtml+'</td>' +
-        '<td>'+sessHtml+'</td>' +
-        '<td><span class="shares-val">'+wattsStr+'</span></td>' +
-        '<td><span class="shares-val">'+costStr+'</span></td>' +
-        '<td><span class="'+profitCls+'">'+profitStr+'</span></td>' +
-        '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>';
-      tbody.appendChild(tr);
-    });
-  }
+  renderWorkersTab(s);
 
   var blocks = s.block_log||[];
   var logEl = document.getElementById('blockLog');
@@ -1856,8 +1829,8 @@ document.addEventListener('click', function(e) {
   }
 });
 
-var THEMES = ['fallout','marathon-classic','marathon-2025'];
-var THEME_LABELS = {fallout:'FALLOUT','marathon-classic':'M-CLASSIC','marathon-2025':'M-2025'};
+var THEMES = ['fallout','marathon-classic','marathon-2025','slate'];
+var THEME_LABELS = {fallout:'FALLOUT','marathon-classic':'M-CLASSIC','marathon-2025':'M-2025',slate:'SLATE'};
 var currentTheme = 'fallout';
 
 function applyTheme(t) {
@@ -1878,6 +1851,15 @@ function cycleTheme() {
     var saved = localStorage.getItem('pipool_theme');
     if (saved && THEMES.indexOf(saved) >= 0) applyTheme(saved);
   } catch(e) {}
+  try {
+    var c = JSON.parse(localStorage.getItem('pipool_currency') || 'null');
+    if (c && c.rate > 0) { currencyRate = c.rate; currencySymbol = c.symbol || 'USD'; }
+  } catch(e) {}
+  // Sync tab button visual state
+  var bA = document.getElementById('tabBtnActive');
+  var bK = document.getElementById('tabBtnKnown');
+  if (bA) { bA.style.borderColor = 'var(--bdr2)'; bA.style.color = 'var(--hi2)'; }
+  if (bK) { bK.style.borderColor = 'var(--bdr)';  bK.style.color = 'var(--dim)'; }
 })();
 
 // ─── Telemetry Chart ───────────────────────────────────────────────────────
@@ -1887,7 +1869,114 @@ var blockLogGlobal = [];
 var coinNetDiff = {};
 var mergeChildrenMap = {}; // parent symbol -> [aux symbols]
 var chartMode = 'diff'; // 'hashrate' | 'diff'
+var workerTab = 'active'; // 'active' | 'known'
 var bestShareSession = 0;
+var currencyRate = 1.0;
+var currencySymbol = 'USD';
+function fmtCurrency(usd) {
+  var v = usd * currencyRate;
+  var sym = currencySymbol === 'USD' ? '$' : currencySymbol + ' ';
+  if (Math.abs(v) < 0.001) return sym + v.toExponential(2);
+  if (Math.abs(v) < 10) return sym + v.toFixed(3);
+  return sym + v.toFixed(2);
+}
+
+function setWorkerTab(t) {
+  workerTab = t;
+  var bA = document.getElementById('tabBtnActive');
+  var bK = document.getElementById('tabBtnKnown');
+  if (bA) { bA.style.borderColor = t==='active' ? 'var(--bdr2)' : 'var(--bdr)'; bA.style.color = t==='active' ? 'var(--hi2)' : 'var(--dim)'; }
+  if (bK) { bK.style.borderColor = t==='known'  ? 'var(--bdr2)' : 'var(--bdr)'; bK.style.color = t==='known'  ? 'var(--hi2)' : 'var(--dim)'; }
+  renderWorkersTab(lastState);
+}
+
+function renderWorkersTab(s) {
+  var allWorkers = s.workers||[];
+  var online = allWorkers.filter(function(w){return w.online;}).length;
+  document.getElementById('workerCount').textContent = online+' ONLINE / '+allWorkers.length+' SEEN';
+
+  var workers = workerTab === 'active'
+    ? allWorkers.filter(function(w){return w.online;})
+    : allWorkers.filter(function(w){return !w.online;});
+
+  var tbody = document.getElementById('workersBody');
+  if (workers.length === 0) {
+    tbody.innerHTML = workerTab === 'active'
+      ? '<tr><td colspan="14" class="no-workers">NO MINERS CONNECTED</td></tr>'
+      : '<tr><td colspan="14" class="no-workers">NO KNOWN OFFLINE WORKERS</td></tr>';
+    return;
+  }
+  // Build map of primary coin → merge-mined children
+  var mergeChildren = {};
+  (s.coins||[]).forEach(function(c) {
+    if (c.is_merge_aux && c.merge_parent) {
+      if (!mergeChildren[c.merge_parent]) mergeChildren[c.merge_parent] = [];
+      mergeChildren[c.merge_parent].push(c.symbol);
+    }
+  });
+  tbody.innerHTML = '';
+  workers.forEach(function(w) {
+    var total = (w.shares_accepted||0)+(w.shares_rejected||0)+(w.shares_stale||0);
+    var stalePct = total>0 ? ((w.shares_stale||0)/total*100).toFixed(2)+'%' : '0.00%';
+    var invPct   = total>0 ? ((w.shares_rejected||0)/total*100).toFixed(2)+'%' : '0.00%';
+    var staleHigh = parseFloat(stalePct) >= 3;
+    var invHigh   = parseFloat(invPct)   >= 1;
+    var statusCls = w.online ? 'worker-status-on' : 'worker-status-off';
+    var statusTxt = w.online ? 'ONLINE' : (w.last_seen_at||'OFFLINE');
+    var diffHtml = w.online ? '<span class="shares-val">'+fmtDiffShort(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
+    var khs = w.hashrate_khs||0;
+    var hrHtml = w.online && khs>0 ? '<span class="shares-val">'+fmtHash(khs)+'</span>' : '<span class="worker-device">--</span>';
+    var bestHtml = (w.best_share&&w.best_share>0) ? '<span class="shares-val">'+fmtDiffShort(w.best_share)+'</span>' : '<span class="worker-device">--</span>';
+    var nameParts = (w.name||'ANON').split('.');
+    var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
+    var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
+    var ip = (w.addr||'').replace(/:\d+$/, '');
+    var tempBadge = (w.asic_temp_c && w.asic_temp_c > 0) ? ' <span style="color:'+(w.asic_temp_c>=80?'#f44':w.asic_temp_c>=70?'#fa0':'#4af')+';font-size:.6rem">'+w.asic_temp_c.toFixed(0)+'°C</span>' : '';
+    var deviceDisplay = w.user_agent
+      ? '<span title="'+w.user_agent+'" style="cursor:help">'+(w.device||'')+'</span>'
+      : (w.device||'');
+    var subLine = [deviceDisplay+tempBadge, addrAbbrev, ip].filter(Boolean).join(' · ');
+    var coin = w.coin || '?';
+    var children = mergeChildren[coin];
+    var coinLabel = children && children.length ? coin+'+'+children.join('+') : coin;
+    var sessCount = (w.reconnect_count||0) + 1;
+    var sessLabel = sessCount === 1 ? '1 session' : sessCount+' sessions';
+    var sessHtml = '<div class="shares-val" style="font-size:.65rem">'+sessLabel+'</div>';
+    if (w.online && w.session_duration) sessHtml += '<div class="worker-device">'+w.session_duration+'</div>';
+    var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
+    var kwhRate = s.kwh_rate_usd || 0;
+    var costStr = '--', profitStr = '--', profitCls = '';
+    if (kwhRate > 0 && w.watts_estimate > 0) {
+      var cost = w.cost_per_day_usd || 0;
+      costStr = fmtCurrency(cost);
+      if (w.profit_per_day_usd !== undefined) {
+        var profit = w.profit_per_day_usd;
+        profitCls = profit >= 0 ? 'profit-pos' : 'profit-neg';
+        profitStr = (profit >= 0 ? '+' : '') + fmtCurrency(Math.abs(profit));
+      }
+    }
+    var tr = document.createElement('tr');
+    if (!w.online) tr.className = 'worker-row-offline';
+    tr.style.cursor = 'pointer';
+    tr.onclick = (function(ww){ return function(){ openWorkerModal(ww.coin, ww.name); }; })(w);
+    tr.innerHTML =
+      '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
+      '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
+      '<td>'+diffHtml+'</td>' +
+      '<td>'+hrHtml+'</td>' +
+      '<td><span class="shares-val">'+total.toLocaleString()+'</span></td>' +
+      '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
+      '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
+      '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
+      '<td>'+bestHtml+'</td>' +
+      '<td>'+sessHtml+'</td>' +
+      '<td><span class="shares-val">'+wattsStr+'</span></td>' +
+      '<td><span class="shares-val">'+costStr+'</span></td>' +
+      '<td><span class="'+profitCls+'">'+profitStr+'</span></td>' +
+      '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>';
+    tbody.appendChild(tr);
+  });
+}
 
 function setChartMode(m) {
   chartMode = m;
@@ -1947,8 +2036,26 @@ function updateTelemetryStats(coins) {
     var expectedSec = (netDiff * 4294967296) / hashPerSec;
     document.getElementById('blockExpected').textContent = fmtSeconds(expectedSec);
     var pctPerHour = (1 - Math.exp(-3600 / expectedSec)) * 100;
-    var pctStr = pctPerHour < 0.001 ? pctPerHour.toExponential(2)+'%' : pctPerHour.toFixed(4)+'%';
-    document.getElementById('blockOddsNow').textContent = pctStr + ' / hr';
+    var oddsPerHr = 100 / pctPerHour;
+    var oddsStr = oddsPerHr < 100
+      ? '1 in ' + oddsPerHr.toFixed(1) + ' /hr'
+      : oddsPerHr < 10000
+        ? '1 in ' + Math.round(oddsPerHr).toLocaleString() + ' /hr'
+        : oddsPerHr < 1e6
+          ? '1 in ' + (oddsPerHr/1000).toFixed(1) + 'K /hr'
+          : '1 in ' + (oddsPerHr/1e6).toFixed(2) + 'M /hr';
+    var POWERBALL = 292201338;
+    var ratio = POWERBALL / oddsPerHr;
+    var compStr;
+    if (ratio >= 1) {
+      var rx = ratio >= 1e6 ? (ratio/1e6).toFixed(1)+'M×' : ratio >= 1e3 ? Math.round(ratio/1000)+'K×' : Math.round(ratio)+'×';
+      compStr = rx + ' better than Powerball jackpot (1 in 292M)';
+    } else {
+      var rx2 = 1/ratio >= 1e6 ? (1/ratio/1e6).toFixed(1)+'M×' : 1/ratio >= 1e3 ? Math.round(1/ratio/1000)+'K×' : Math.round(1/ratio)+'×';
+      compStr = rx2 + ' worse than Powerball jackpot (1 in 292M)';
+    }
+    document.getElementById('blockOddsNow').innerHTML =
+      oddsStr + '<div style="font-family:var(--scan);font-size:.5rem;color:var(--dim2);margin-top:3px;letter-spacing:.5px">'+compStr+'</div>';
   } else {
     document.getElementById('blockOddsNow').textContent = '--';
     document.getElementById('blockExpected').textContent = '--';
@@ -1964,13 +2071,17 @@ function updateTelemetryStats(coins) {
       if (auxNetD <= 0 || hashPerSec2 <= 0) return '';
       var expSec = (auxNetD * 4294967296) / hashPerSec2;
       var pct = (1 - Math.exp(-3600 / expSec)) * 100;
-      var pctStr = pct < 0.001 ? pct.toExponential(2)+'%' : pct.toFixed(4)+'%';
+      var auxOdds = 100 / pct;
+      var pctStr = auxOdds < 100 ? '1 in '+auxOdds.toFixed(1)+' /hr'
+        : auxOdds < 10000 ? '1 in '+Math.round(auxOdds).toLocaleString()+' /hr'
+        : auxOdds < 1e6 ? '1 in '+(auxOdds/1000).toFixed(1)+'K /hr'
+        : '1 in '+(auxOdds/1e6).toFixed(2)+'M /hr';
       var col = (window.AUX_COLORS && AUX_COLORS[ac]) ? AUX_COLORS[ac] : '#aaaaaa';
       return '<div style="display:flex;gap:10px;align-items:center;padding:6px 12px;background:var(--surf2);border:1px solid var(--bdr);margin-bottom:4px;flex-wrap:wrap">' +
         '<span style="font-family:var(--scan);font-size:.56rem;color:'+col+';letter-spacing:2px;min-width:36px">'+ac+'</span>' +
         '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">EXPECTED</span>' +
         '<span style="font-family:var(--vt);font-size:.9rem;color:var(--hi);letter-spacing:1px;margin-right:8px">'+fmtSeconds(expSec)+'</span>' +
-        '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">ODDS/HR</span>' +
+        '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">ODDS</span>' +
         '<span style="font-family:var(--vt);font-size:.9rem;color:var(--hi);letter-spacing:1px;margin-right:8px">'+pctStr+'</span>' +
         '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">NET DIFF</span>' +
         '<span style="font-family:var(--vt);font-size:.9rem;color:var(--dim);letter-spacing:1px">'+fmtDiffShort(auxNetD)+'</span>' +
@@ -2353,6 +2464,8 @@ function applyCfg(c) {
   el = document.getElementById('cfgAutoKickPct');    if(el) el.value = c.auto_kick_pct || 0;
   el = document.getElementById('cfgAutoKickMin');    if(el) el.value = c.auto_kick_min_shares || 50;
   el = document.getElementById('cfgKwhRate');        if(el) el.value = c.kwh_rate_usd || '';
+  el = document.getElementById('cfgCurrencySymbol'); if(el) el.value = currencySymbol !== 'USD' ? currencySymbol : '';
+  el = document.getElementById('cfgCurrencyRate');   if(el) el.value = currencyRate !== 1.0 ? currencyRate : '';
 
   // Wallets
   var wDiv = document.getElementById('cfgWallets');
@@ -2451,6 +2564,17 @@ function saveCfg() {
     worker_fixed_diff:  fd,
     kwh_rate_usd:       parseFloat(document.getElementById('cfgKwhRate').value) || 0
   };
+
+  // Currency preference is client-side only — save to localStorage
+  var symEl = document.getElementById('cfgCurrencySymbol');
+  var rateEl = document.getElementById('cfgCurrencyRate');
+  if (symEl && rateEl) {
+    var sym = symEl.value.trim().toUpperCase() || 'USD';
+    var rate = parseFloat(rateEl.value) || 1.0;
+    currencySymbol = sym;
+    currencyRate = rate;
+    try { localStorage.setItem('pipool_currency', JSON.stringify({symbol:sym, rate:rate})); } catch(e) {}
+  }
 
   fetch('/api/config', {
     method:'POST',

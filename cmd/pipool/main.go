@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -918,13 +919,15 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				}
 				if mi, err2 := cli.GetMiningInfo(); err2 == nil {
 					cs.Difficulty = mi.Difficulty
-				}
-				// DGB/DGBS multi-algo: getmininginfo returns any algo's diff.
-				// Prefer LastNetworkDiff from the block template, which is algo-specific.
-				if sym == "DGB" || sym == "DGBS" {
-					if srv, ok := srvMap[sym]; ok {
-						if nd := srv.Stats().LastNetworkDiff; nd > 0 {
-							cs.Difficulty = nd
+					// DGB multi-algo: getmininginfo.difficulty reflects the last-mined algo (any of 5).
+					// Use the per-algo difficulty from the difficulties map for the correct value.
+					if sym == "DGB" {
+						if d, ok := mi.Difficulties["sha256d"]; ok && d > 0 {
+							cs.Difficulty = d
+						}
+					} else if sym == "DGBS" {
+						if d, ok := mi.Difficulties["scrypt"]; ok && d > 0 {
+							cs.Difficulty = d
 						}
 					}
 				}
@@ -1662,6 +1665,68 @@ func registerCtlHandlers(
 			return ctl.Response{OK: true, Message: fmt.Sprintf("fixed diff removed for %s — reverting to vardiff", workerName)}
 		}
 		return ctl.Response{OK: true, Message: fmt.Sprintf("worker %s pinned to difficulty %.4f (takes effect on next share)", workerName, diff)}
+	})
+
+	// calc [SYMBOL] — solo mining luck calculator
+	ctlSrv.Register("calc", func(args []string) ctl.Response {
+		const powerball = 292201338.0
+		const megamillions = 302575350.0
+		type calcResult struct {
+			Symbol      string  `json:"symbol"`
+			Algorithm   string  `json:"algorithm"`
+			HashrateKHs float64 `json:"hashrate_khs"`
+			NetworkDiff float64 `json:"network_diff"`
+			ExpectedSec float64 `json:"expected_sec"`
+			OddsPerHour float64 `json:"odds_per_hour"` // 1-in-X per hour
+			PctPerHour  float64 `json:"pct_per_hour"`
+			VsPowerball float64 `json:"vs_powerball"` // >1 means X times better than Powerball
+		}
+		var results []calcResult
+		filter := ""
+		if len(args) > 0 {
+			filter = strings.ToUpper(args[0])
+		}
+		for _, srv := range servers {
+			stats := srv.Stats()
+			if filter != "" && stats.Symbol != filter {
+				continue
+			}
+			if stats.LastNetworkDiff <= 0 {
+				continue
+			}
+			// Sum hashrate from all online workers
+			var totalKHs float64
+			for _, w := range srv.AllWorkers() {
+				if w.Online {
+					totalKHs += w.HashrateKHs
+				}
+			}
+			if totalKHs <= 0 {
+				continue
+			}
+			hashPerSec := totalKHs * 1000
+			diff1 := 4294967296.0
+			if stats.Algorithm == "scrypt" || stats.Algorithm == "scryptn" {
+				diff1 = 65536.0
+			}
+			expectedSec := (stats.LastNetworkDiff * diff1) / hashPerSec
+			pctPerHour := (1 - math.Exp(-3600/expectedSec)) * 100
+			oddsPerHour := 100 / pctPerHour
+			results = append(results, calcResult{
+				Symbol:      stats.Symbol,
+				Algorithm:   stats.Algorithm,
+				HashrateKHs: totalKHs,
+				NetworkDiff: stats.LastNetworkDiff,
+				ExpectedSec: expectedSec,
+				OddsPerHour: oddsPerHour,
+				PctPerHour:  pctPerHour,
+				VsPowerball: powerball / oddsPerHour,
+			})
+		}
+		if len(results) == 0 {
+			return ctl.Response{OK: true, Message: "No active coins with known network difficulty. Are any miners connected?"}
+		}
+		return ctl.Response{OK: true, Data: results}
 	})
 }
 
