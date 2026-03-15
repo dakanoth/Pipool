@@ -31,19 +31,49 @@ type PoolSettings struct {
 	// Actual files are written as <StateFile>_<COIN>.json, e.g. worker_state_LTC.json.
 	// Empty = no persistence.
 	StateFile      string   `json:"state_file"`
+	// WorkerFixedDiff pins specific workers to a fixed vardiff instead of auto-adjusting.
+	// Key is the full worker name (e.g. "wallet.workerName"). Value is the target difficulty.
+	// 0 or absent = normal vardiff.
+	WorkerFixedDiff map[string]float64 `json:"worker_fixed_diff,omitempty"`
+	// AutoKickRejectPct disconnects a worker if their invalid share rate exceeds this
+	// percentage after AutoKickMinShares have been submitted. 0 = disabled.
+	AutoKickRejectPct  int `json:"auto_kick_reject_pct"`
+	// AutoKickMinShares is the minimum share count before auto-kick is evaluated.
+	AutoKickMinShares  int `json:"auto_kick_min_shares"`
+	// LastShareAlertMin fires a Discord alert if a connected worker goes this many minutes
+	// without submitting a share. 0 = disabled.
+	LastShareAlertMin  int `json:"last_share_alert_min"`
+	// KwhRateUSD is the electricity cost in USD per kWh. 0 = disabled.
+	KwhRateUSD         float64            `json:"kwh_rate_usd"`
+	// WorkerFixedWatts overrides the wattage estimate for specific workers by name.
+	WorkerFixedWatts   map[string]float64 `json:"worker_fixed_watts,omitempty"`
+	// WorkerGroups groups workers by name for aggregate stats display. Group name → list of worker names.
+	WorkerGroups       map[string][]string `json:"worker_groups,omitempty"`
+}
+
+// UpstreamConf configures a fallback upstream stratum pool for proxy mode.
+// When the local node goes offline, PiPool transparently forwards miner
+// connections to this upstream pool instead of serving no work.
+type UpstreamConf struct {
+	Enabled  bool   `json:"enabled"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
+	Password string `json:"password"`
 }
 
 type CoinConfig struct {
-	Enabled     bool        `json:"enabled"`
-	Symbol      string      `json:"symbol"`
-	Algorithm   string      `json:"algorithm"`    // "scrypt", "sha256d", "scryptn"
-	MergeParent string      `json:"merge_parent"` // e.g. "LTC" for DOGE; "" if primary
-	DataDir     string      `json:"datadir"`      // blockchain storage path, e.g. /mnt/external/litecoin
-	Stratum     StratumConf `json:"stratum"`
-	Node        NodeConf    `json:"node"`
-	Wallet      string      `json:"wallet"`
-	BlockReward float64     `json:"block_reward"`
-	TxFeeTarget float64     `json:"tx_fee_target"`
+	Enabled      bool          `json:"enabled"`
+	Symbol       string        `json:"symbol"`
+	Algorithm    string        `json:"algorithm"`    // "scrypt", "sha256d", "scryptn"
+	MergeParent  string        `json:"merge_parent"` // e.g. "LTC" for DOGE; "" if primary
+	DataDir      string        `json:"datadir"`      // blockchain storage path, e.g. /mnt/external/litecoin
+	Stratum      StratumConf   `json:"stratum"`
+	Node         NodeConf      `json:"node"`
+	Wallet       string        `json:"wallet"`
+	BlockReward  float64       `json:"block_reward"`
+	TxFeeTarget  float64       `json:"tx_fee_target"`
+	UpstreamPool UpstreamConf  `json:"upstream_pool"`
 }
 
 type StratumConf struct {
@@ -117,14 +147,18 @@ type LoggingConfig struct {
 func DefaultConfig() *PoolConfig {
 	return &PoolConfig{
 		Pool: PoolSettings{
-			Name:           "PiPool",
-			Host:           "0.0.0.0",
-			CoinbaseTag:    "/PiPool/",
-			MaxConnections: 64,
-			WorkerTimeout:  120,
-			TempLimitC:     75,
-			IPAllowlist:    []string{},
-			StateFile:      "/opt/pipool/worker_state",
+			Name:              "PiPool",
+			Host:              "0.0.0.0",
+			CoinbaseTag:       "/PiPool/",
+			MaxConnections:    64,
+			WorkerTimeout:     120,
+			TempLimitC:        75,
+			IPAllowlist:       []string{},
+			StateFile:         "/opt/pipool/worker_state",
+			AutoKickRejectPct: 0, // disabled by default
+			AutoKickMinShares: 50,
+			LastShareAlertMin: 0, // disabled by default
+			KwhRateUSD:        0, // disabled by default
 		},
 		Coins: map[string]CoinConfig{
 			"LTC": {
@@ -145,6 +179,13 @@ func DefaultConfig() *PoolConfig {
 				},
 				Wallet:      "YOUR_LTC_WALLET",
 				BlockReward: 6.25,
+				UpstreamPool: UpstreamConf{
+					Enabled:  false,
+					Host:     "stratum.litecoinpool.org",
+					Port:     3333,
+					User:     "YOUR_LTC_WALLET",
+					Password: "x",
+				},
 			},
 			"DOGE": {
 				Enabled:     true,

@@ -47,6 +47,10 @@ type StatsSnapshot struct {
 	ChainDiags   []ChainDiag    `json:"chain_diags"`
 	PoolName     string             `json:"pool_name"`
 	Endpoints    []StratumEndpoint  `json:"endpoints"`
+	Groups       []GroupStat        `json:"groups"`
+	TotalCostPerDayUSD   float64    `json:"total_cost_per_day_usd"`
+	TotalProfitPerDayUSD float64    `json:"total_profit_per_day_usd"`
+	KwhRateUSD           float64    `json:"kwh_rate_usd"`
 }
 
 // StratumEndpoint holds connection info for a single stratum port
@@ -103,8 +107,35 @@ type CoinStats struct {
 	PriceUSD         float64 `json:"price_usd"`          // 0 = unknown
 	BlockReward      float64 `json:"block_reward"`        // in whole coins
 	EarningsPerDayUSD float64 `json:"earnings_day_usd"`   // estimated daily earnings at current hashrate
-	IsMergeAux    bool    `json:"is_merge_aux"`
-	MergeParent   string  `json:"merge_parent,omitempty"`
+	IsMergeAux       bool    `json:"is_merge_aux"`
+	MergeParent      string  `json:"merge_parent,omitempty"`
+	SessionEffortPct float64 `json:"session_effort_pct"` // validWork/networkDiff*100; 0=unknown
+	ExpectedBlockSec float64 `json:"expected_block_sec"` // estimated seconds to find a block at current hashrate; 0=unknown
+	BalanceConfirmed float64 `json:"balance_confirmed"`  // spendable balance
+	BalanceImmature  float64 `json:"balance_immature"`   // maturing coinbase
+	DiffHistogram    []HistoBucket `json:"diff_histogram"` // share difficulty distribution
+	DiffAdjust       *DiffAdjustment `json:"diff_adjust,omitempty"` // difficulty retarget info (BTC/LTC only)
+}
+
+// DiffAdjustment holds difficulty retarget info for coins with fixed epochs (BTC, LTC)
+type DiffAdjustment struct {
+	EpochSize       int     `json:"epoch_size"`        // 2016
+	BlocksInEpoch   int64   `json:"blocks_in_epoch"`   // how many blocks done so far
+	BlocksRemaining int64   `json:"blocks_remaining"`  // blocks until next retarget
+	ProjectedPct    float64 `json:"projected_pct"`     // e.g. +5.3 means 5.3% harder
+	EstimatedDate   string  `json:"estimated_date"`    // human-readable ETA
+	TargetBlockSec  int     `json:"target_block_sec"`  // 600 BTC, 150 LTC
+}
+
+// GroupStat holds aggregate stats for a named worker group
+type GroupStat struct {
+	Name            string  `json:"name"`
+	WorkerCount     int     `json:"worker_count"`
+	OnlineCount     int     `json:"online_count"`
+	HashrateKHs     float64 `json:"hashrate_khs"`
+	SharesAccepted  uint64  `json:"shares_accepted"`
+	CostPerDayUSD   float64 `json:"cost_per_day_usd"`
+	ProfitPerDayUSD float64 `json:"profit_per_day_usd"`
 }
 
 type WorkerStat struct {
@@ -112,6 +143,7 @@ type WorkerStat struct {
 	Coin            string  `json:"coin"`
 	Device          string  `json:"device"`
 	Difficulty      float64 `json:"difficulty"`
+	HashrateKHs     float64 `json:"hashrate_khs"`      // 5-minute rolling estimate
 	SharesAccepted  uint64  `json:"shares_accepted"`
 	SharesRejected  uint64  `json:"shares_rejected"`
 	SharesStale     uint64  `json:"shares_stale"`
@@ -122,16 +154,28 @@ type WorkerStat struct {
 	Online          bool    `json:"online"`
 	ReconnectCount  int     `json:"reconnect_count"`   // 0 = first session
 	SessionDuration string  `json:"session_duration"`  // empty if offline
+	UserAgent       string  `json:"user_agent"`        // raw miner user-agent string
+	WattsEstimate   float64 `json:"watts_estimate"`
+	CostPerDayUSD   float64 `json:"cost_per_day_usd"`
+	ProfitPerDayUSD float64 `json:"profit_per_day_usd"`
 }
 
 type BlockEvent struct {
-	Coin      string `json:"coin"`
-	Height    int64  `json:"height"`
-	Hash      string `json:"hash"`
-	Reward    string `json:"reward"`
-	Worker    string `json:"worker"`
-	FoundAt   string `json:"found_at"`
-	FoundAtMS int64  `json:"found_at_ms"` // epoch ms for chart positioning
+	Coin      string  `json:"coin"`
+	Height    int64   `json:"height"`
+	Hash      string  `json:"hash"`
+	Reward    string  `json:"reward"`
+	Worker    string  `json:"worker"`
+	FoundAt   string  `json:"found_at"`
+	FoundAtMS int64   `json:"found_at_ms"` // epoch ms for chart positioning
+	Luck      float64 `json:"luck"`        // luck %; -1 = N/A (aux chain)
+}
+
+// HistoBucket is one bin of the share difficulty histogram
+type HistoBucket struct {
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Count int     `json:"count"`
 }
 
 // NotifSettings mirrors DiscordAlerts — lives here to avoid import cycle
@@ -146,6 +190,20 @@ type NotifSettings struct {
 	NodeUnreachable     bool `json:"node_unreachable"`
 }
 
+// ConfigEditorData holds the pool configuration fields editable from the dashboard.
+type ConfigEditorData struct {
+	TempLimitC      int                `json:"temp_limit_c"`
+	WorkerTimeoutS  int                `json:"worker_timeout_s"`
+	DiscordWebhook  string             `json:"discord_webhook"`
+	Wallets         map[string]string  `json:"wallets"`           // symbol → address
+	VardiffMin      map[string]float64 `json:"vardiff_min"`        // symbol → min_diff
+	VardiffMax      map[string]float64 `json:"vardiff_max"`        // symbol → max_diff
+	AutoKickPct     int                `json:"auto_kick_pct"`      // 0 = disabled
+	AutoKickMin     int                `json:"auto_kick_min_shares"`
+	WorkerFixedDiff map[string]float64 `json:"worker_fixed_diff"`  // worker → diff (0 = remove)
+	KwhRateUSD      float64            `json:"kwh_rate_usd"`
+}
+
 // StatsFn returns the current pool snapshot
 type StatsFn func() StatsSnapshot
 
@@ -158,6 +216,8 @@ type Server struct {
 	setNotifs       func(NotifSettings)
 	getCoinbaseTag  func() string
 	setCoinbaseTag  func(string)
+	getConfig       func() ConfigEditorData
+	setConfig       func(ConfigEditorData)
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -166,7 +226,8 @@ type Server struct {
 // New creates a new dashboard server
 func New(port int, pushInterval time.Duration, stats StatsFn,
 	getNotifs func() NotifSettings, setNotifs func(NotifSettings),
-	getCoinbaseTag func() string, setCoinbaseTag func(string)) *Server {
+	getCoinbaseTag func() string, setCoinbaseTag func(string),
+	getConfig func() ConfigEditorData, setConfig func(ConfigEditorData)) *Server {
 	return &Server{
 		port:           port,
 		pushInterval:   pushInterval,
@@ -175,6 +236,8 @@ func New(port int, pushInterval time.Duration, stats StatsFn,
 		setNotifs:      setNotifs,
 		getCoinbaseTag: getCoinbaseTag,
 		setCoinbaseTag: setCoinbaseTag,
+		getConfig:      getConfig,
+		setConfig:      setConfig,
 		clients:        make(map[chan string]struct{}),
 	}
 }
@@ -187,6 +250,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/events", s.handleSSE)
 	mux.HandleFunc("/api/discord", s.handleDiscord)
 	mux.HandleFunc("/api/tag", s.handleTag)
+	mux.HandleFunc("/api/config", s.handleConfig)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("[dashboard] http://0.0.0.0%s", addr)
@@ -244,6 +308,26 @@ func (s *Server) handleTag(w http.ResponseWriter, r *http.Request) {
 		s.setCoinbaseTag(tag)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"tag": tag})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(s.getConfig())
+	case http.MethodPost:
+		var cd ConfigEditorData
+		if err := json.NewDecoder(r.Body).Decode(&cd); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.setConfig(cd)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -559,6 +643,11 @@ body::before {
 .sync-fill.done { background:var(--hi); box-shadow:0 0 8px rgba(0,255,65,0.7); }
 .sync-blocks { font-family:var(--scan); font-size:.52rem; color:var(--dim2); margin-top:3px; }
 
+/* ── SHARE HISTOGRAM ── */
+.histo { display:flex; align-items:flex-end; gap:2px; height:32px; margin-top:6px; }
+.histo-bar { flex:1; background:var(--hi2); opacity:.5; min-width:3px; transition:height .3s; }
+.histo-bar:hover { opacity:1; cursor:default; }
+
 /* ── WORKERS ── */
 .workers-table { width:100%; border-collapse:collapse; font-size:.72rem; }
 .workers-table th {
@@ -585,6 +674,21 @@ body::before {
 .worker-status-off { font-family:var(--scan); font-size:.6rem; color:var(--dim2); letter-spacing:1px; }
 .worker-row-offline td { opacity:.5; }
 .shares-rej { font-family:var(--scan); color:var(--red); font-size:.7rem; }
+
+.profit-pos { color: var(--hi); }
+.profit-neg { color: var(--red); }
+
+/* ── EPOCH BAR ── */
+.epoch-bar { background:var(--surf2); border:1px solid var(--bdr); height:4px; margin-top:4px; }
+.epoch-fill { height:100%; background:var(--hi2); transition:width .5s; }
+
+/* ── GROUPS ── */
+.group-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:10px; }
+.group-card { background:var(--surf2); border:1px solid var(--bdr); padding:14px; }
+.group-name { font-family:var(--scan); font-size:.78rem; color:var(--hi); letter-spacing:3px; margin-bottom:8px; }
+.group-stat { display:flex; justify-content:space-between; margin-bottom:4px; }
+.group-stat-l { font-family:var(--scan); font-size:.58rem; color:var(--dim2); }
+.group-stat-v { font-family:var(--scan); font-size:.62rem; color:var(--hi2); }
 
 /* ── BLOCK LOG ── */
 .block-log { font-family:var(--scan); }
@@ -690,9 +794,45 @@ body::before {
 .notif-unit { font-family:var(--scan); font-size:.6rem; color:var(--dim2); }
 .notif-save-status { font-family:var(--scan); font-size:.62rem; color:var(--dim2); margin-left:auto; }
 
+/* ── CONFIG EDITOR ── */
+.cfg-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px; }
+.cfg-group { background:var(--surf2); border:1px solid var(--bdr); padding:14px; }
+.cfg-group-title { font-family:var(--scan); font-size:.6rem; color:var(--dim2); letter-spacing:2px; margin-bottom:10px; }
+.cfg-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.cfg-row:last-child { margin-bottom:0; }
+.cfg-label { font-family:var(--scan); font-size:.6rem; color:var(--hi2); flex:1; }
+.cfg-input {
+  background:var(--off); border:1px solid var(--bdr2); color:var(--hi);
+  font-family:var(--scan); font-size:.68rem;
+  padding:4px 8px; width:160px; text-align:left;
+}
+.cfg-input:focus { outline:none; border-color:var(--hi); box-shadow: var(--glow); }
+.cfg-input.wide { width:100%; box-sizing:border-box; }
+.cfg-save-btn {
+  display:inline-block; margin-top:12px;
+  background:none; border:1px solid var(--hi2); color:var(--hi); cursor:pointer;
+  font-family:var(--scan); font-size:.68rem; letter-spacing:2px;
+  padding:6px 20px; transition: border-color .15s, box-shadow .15s;
+}
+.cfg-save-btn:hover { border-color:var(--hi); box-shadow: var(--glow); }
+.cfg-save-status { font-family:var(--scan); font-size:.58rem; color:var(--dim2); margin-left:12px; }
+.cfg-fd-table { width:100%; border-collapse:collapse; margin-top:6px; }
+.cfg-fd-table td { padding:3px 0; font-family:var(--scan); font-size:.6rem; vertical-align:middle; }
+.cfg-fd-input { background:var(--off); border:1px solid var(--bdr2); color:var(--hi); font-family:var(--scan); font-size:.6rem; padding:2px 6px; width:90px; }
+.cfg-fd-add { background:none; border:1px solid var(--bdr2); color:var(--dim); font-family:var(--scan); font-size:.58rem; padding:2px 10px; cursor:pointer; margin-top:6px; }
+.cfg-fd-add:hover { border-color:var(--hi2); color:var(--hi2); }
+.cfg-fd-del { background:none; border:none; color:var(--red); font-family:var(--vt); font-size:.9rem; cursor:pointer; padding:0 4px; line-height:1; }
+
 /* ── LAYOUT ── */
 .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:16px; }
 @media(max-width:900px){ .row2 { grid-template-columns:1fr; } }
+/* Mobile responsive — worker table scrolls horizontally; coins stack to single column */
+@media(max-width:600px){
+  .coins-grid { grid-template-columns:1fr !important; }
+  .stats-grid  { grid-template-columns:1fr 1fr !important; }
+  .section-body { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .workers-table { min-width:820px; }
+}
 
 footer {
   text-align:center; padding:16px;
@@ -882,10 +1022,10 @@ footer {
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
         <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Status</th>
+          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Hashrate</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Watts</th><th>Cost/Day</th><th>Profit/Day</th><th>Status</th>
         </tr></thead>
         <tbody id="workersBody">
-          <tr><td colspan="10" class="no-workers">No miners connected</td></tr>
+          <tr><td colspan="14" class="no-workers">No miners connected</td></tr>
         </tbody>
       </table>
     </div>
@@ -898,6 +1038,16 @@ footer {
     <div class="section-body" id="blockLog">
       <div class="no-blocks">No blocks found this session.<br>Keep hashing.</div>
     </div>
+  </div>
+</div>
+
+<div class="section" id="sectionGroups" style="display:none;margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">GROUPS</span>
+    <span id="groupCount" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)"></span>
+  </div>
+  <div class="section-body">
+    <div class="group-grid" id="groupGrid"></div>
   </div>
 </div>
 
@@ -980,6 +1130,79 @@ footer {
   </div>
 </div>
 
+<div class="section" id="sectionConfig">
+  <div class="section-head">
+    <span class="section-title">POOL SETTINGS</span>
+    <span id="cfgSaveStatus" class="cfg-save-status">CONFIG EDITOR</span>
+  </div>
+  <div class="section-body">
+    <div class="cfg-grid" id="cfgGrid">
+
+      <div class="cfg-group">
+        <div class="cfg-group-title">WALLETS</div>
+        <div id="cfgWallets"></div>
+      </div>
+
+      <div class="cfg-group">
+        <div class="cfg-group-title">VARDIFF</div>
+        <div id="cfgVardiff"></div>
+      </div>
+
+      <div class="cfg-group">
+        <div class="cfg-group-title">SYSTEM</div>
+        <div class="cfg-row">
+          <div class="cfg-label">TEMP LIMIT (°C)</div>
+          <input class="cfg-input" id="cfgTempLimit" type="number" min="50" max="90">
+        </div>
+        <div class="cfg-row">
+          <div class="cfg-label">WORKER TIMEOUT (s)</div>
+          <input class="cfg-input" id="cfgWorkerTimeout" type="number" min="30" max="600">
+        </div>
+        <div class="cfg-row">
+          <div class="cfg-label">ELECTRICITY RATE ($/kWh)</div>
+          <input class="cfg-input" id="cfgKwhRate" type="number" min="0" step="0.001" placeholder="0.12">
+        </div>
+      </div>
+
+      <div class="cfg-group">
+        <div class="cfg-group-title">AUTO-KICK</div>
+        <div class="cfg-row">
+          <div class="cfg-label">REJECT THRESHOLD (%)</div>
+          <input class="cfg-input" id="cfgAutoKickPct" type="number" min="0" max="100" placeholder="0=off">
+        </div>
+        <div class="cfg-row">
+          <div class="cfg-label">MIN SHARES BEFORE KICK</div>
+          <input class="cfg-input" id="cfgAutoKickMin" type="number" min="1" max="10000">
+        </div>
+      </div>
+
+      <div class="cfg-group" style="grid-column:1/-1">
+        <div class="cfg-group-title">DISCORD WEBHOOK</div>
+        <div class="cfg-row">
+          <input class="cfg-input wide" id="cfgWebhook" type="text" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+      </div>
+
+      <div class="cfg-group" style="grid-column:1/-1">
+        <div class="cfg-group-title">FIXED WORKER DIFFICULTY</div>
+        <table class="cfg-fd-table" id="cfgFdTable">
+          <thead><tr>
+            <td style="color:var(--dim2);font-size:.55rem;letter-spacing:1px">WORKER NAME</td>
+            <td style="color:var(--dim2);font-size:.55rem;letter-spacing:1px">DIFFICULTY</td>
+            <td></td>
+          </tr></thead>
+          <tbody id="cfgFdRows"></tbody>
+        </table>
+        <button class="cfg-fd-add" onclick="cfgFdAddRow('','')">+ ADD WORKER</button>
+      </div>
+
+    </div>
+    <div style="margin-top:14px">
+      <button class="cfg-save-btn" onclick="saveCfg()">SAVE SETTINGS</button>
+    </div>
+  </div>
+</div>
+
 <footer>PIPOOL &bull; RASPBERRY PI 5 SOLO MINING TERMINAL &bull; <span id="footerTime"></span></footer>
 </div>
 
@@ -1010,6 +1233,14 @@ function fmtDiff(d) {
   if (d >= 1e6) return (d/1e6).toFixed(2)+'M';
   if (d >= 1e3) return (d/1e3).toFixed(2)+'K';
   return d.toFixed(4);
+}
+
+function fmtDuration(sec) {
+  if (!sec || sec <= 0) return '--';
+  if (sec < 60) return Math.round(sec)+'s';
+  if (sec < 3600) return Math.floor(sec/60)+'m '+Math.round(sec%60)+'s';
+  if (sec < 86400) return Math.floor(sec/3600)+'h '+Math.floor((sec%3600)/60)+'m';
+  return (sec/86400).toFixed(1)+' days';
 }
 
 function renderNotifState() {
@@ -1177,7 +1408,60 @@ function apply(s) {
             return '<div><div class="cs-l">Reward</div><div class="cs-v">'+(c.block_reward > 0 ? c.block_reward+' '+c.symbol+rewardUsd : '--')+'</div></div>';
           })() +
           '<div><div class="cs-l">Est. Day</div><div class="cs-v">'+(c.earnings_day_usd > 0 ? '$'+c.earnings_day_usd.toFixed(4) : '--')+'</div></div>' +
+          (function(){
+            if (!c.session_effort_pct || c.session_effort_pct <= 0) return '';
+            var eff = c.session_effort_pct;
+            var effColor = eff < 80 ? 'var(--hi2)' : (eff < 150 ? '#ffcc00' : '#ff6600');
+            return '<div><div class="cs-l">Session Effort</div><div class="cs-v" style="color:'+effColor+'">'+eff.toFixed(1)+'%</div></div>';
+          })() +
+          (function(){
+            if (!c.expected_block_sec || c.expected_block_sec <= 0) return '';
+            return '<div><div class="cs-l">Exp. Block</div><div class="cs-v" style="color:var(--dim)">'+fmtDuration(c.expected_block_sec)+'</div></div>';
+          })() +
         '</div>' +
+        (function(){
+          var balLine = '';
+          if ((c.balance_confirmed||0) > 0 || (c.balance_immature||0) > 0) {
+            balLine = '<div class="cs-row" style="margin-top:6px;display:flex;gap:6px;align-items:center"><div class="cs-l">WALLET</div><div class="cs-v">'+(c.balance_confirmed||0).toFixed(4)+' confirmed';
+            if ((c.balance_immature||0) > 0) {
+              balLine += ' \u00b7 <span style="color:var(--amber)">'+(c.balance_immature||0).toFixed(4)+' maturing</span>';
+            }
+            balLine += '</div></div>';
+          }
+          return balLine;
+        })() +
+        (function(){
+          var histoHtml = '';
+          if (c.diff_histogram && c.diff_histogram.length) {
+            var maxCount = Math.max.apply(null, c.diff_histogram.map(function(b){return b.count;}));
+            if (maxCount > 0) {
+              histoHtml = '<div class="cs-row" style="margin-top:6px;display:flex;gap:6px;align-items:flex-start"><div class="cs-l">SHARES</div><div class="cs-v" style="flex:1"><div class="histo" title="Share difficulty distribution">';
+              c.diff_histogram.forEach(function(b) {
+                var h = maxCount > 0 ? Math.round(b.count/maxCount*100) : 0;
+                var label = fmtDiffShort(b.min)+'-'+fmtDiffShort(b.max)+': '+b.count;
+                histoHtml += '<div class="histo-bar" style="height:'+Math.max(h,b.count>0?4:0)+'%" title="'+label+'"></div>';
+              });
+              histoHtml += '</div></div></div>';
+            }
+          }
+          return histoHtml;
+        })() +
+        (function(){
+          var adjHtml = '';
+          if (c.diff_adjust) {
+            var da = c.diff_adjust;
+            var pct = da.projected_pct;
+            var pctStr = (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
+            var pctColor = pct > 2 ? 'var(--red)' : pct < -2 ? 'var(--hi)' : 'var(--dim)';
+            var progress = da.epoch_size > 0 ? Math.round(da.blocks_in_epoch / da.epoch_size * 100) : 0;
+            adjHtml = '<div class="cs-row" style="display:flex;gap:6px;margin-top:4px"><div class="cs-l">RETARGET</div><div class="cs-v">'+
+              da.blocks_remaining+' blocks · <span style="color:'+pctColor+'">'+pctStr+'</span>'+
+              (da.estimated_date ? ' · '+da.estimated_date : '')+
+              '</div></div>'+
+              '<div class="epoch-bar"><div class="epoch-fill" style="width:'+progress+'%"></div></div>';
+          }
+          return adjHtml;
+        })() +
       '</div>';
   });
 
@@ -1186,7 +1470,7 @@ function apply(s) {
   document.getElementById('workerCount').textContent = online+' ONLINE / '+workers.length+' SEEN';
   var tbody = document.getElementById('workersBody');
   if (workers.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="no-workers">NO MINERS CONNECTED</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="no-workers">NO MINERS CONNECTED</td></tr>';
   } else {
     // Build map of primary coin → merge-mined children (e.g. {LTC:['DOGE'], BTC:['BCH']})
     var mergeChildren = {};
@@ -1210,13 +1494,18 @@ function apply(s) {
       var statusCls = w.online ? 'worker-status-on' : 'worker-status-off';
       var statusTxt = w.online ? 'ONLINE' : (w.last_seen_at||'OFFLINE');
       var diffHtml = w.online ? '<span class="shares-val">'+fmtDiffShort(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
+      var khs = w.hashrate_khs||0;
+      var hrHtml = w.online && khs>0 ? '<span class="shares-val">'+fmtHash(khs)+'</span>' : '<span class="worker-device">--</span>';
       var bestHtml = (w.best_share&&w.best_share>0) ? '<span class="shares-val">'+fmtDiffShort(w.best_share)+'</span>' : '<span class="worker-device">--</span>';
       // Split "address.workername" → show only workername prominently; abbreviate address + show IP below
       var nameParts = (w.name||'ANON').split('.');
       var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
       var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
       var ip = (w.addr||'').replace(/:\d+$/, '');
-      var subLine = [w.device||'', addrAbbrev, ip].filter(Boolean).join(' · ');
+      var deviceDisplay = w.user_agent
+        ? '<span title="'+w.user_agent+'" style="cursor:help">'+(w.device||'')+'</span>'
+        : (w.device||'');
+      var subLine = [deviceDisplay, addrAbbrev, ip].filter(Boolean).join(' · ');
       // Show merge children alongside primary coin (e.g. "LTC+DOGE", "BTC+BCH")
       var children = mergeChildren[w.coin];
       var coinLabel = children && children.length ? w.coin+'+'+children.join('+') : w.coin;
@@ -1225,16 +1514,32 @@ function apply(s) {
       var sessLabel = sessCount === 1 ? '1 session' : sessCount+' sessions';
       var sessHtml = '<div class="shares-val" style="font-size:.65rem">'+sessLabel+'</div>';
       if (w.online && w.session_duration) sessHtml += '<div class="worker-device">'+w.session_duration+'</div>';
+      var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
+      var kwhRate = s.kwh_rate_usd || 0;
+      var costStr = '--', profitStr = '--', profitCls = '';
+      if (kwhRate > 0 && w.watts_estimate > 0) {
+        var cost = w.cost_per_day_usd || 0;
+        costStr = '$'+cost.toFixed(3);
+        if (w.profit_per_day_usd !== undefined) {
+          var profit = w.profit_per_day_usd;
+          profitCls = profit >= 0 ? 'profit-pos' : 'profit-neg';
+          profitStr = (profit >= 0 ? '+' : '')+' $'+Math.abs(profit).toFixed(3);
+        }
+      }
       return '<tr class="'+(w.online?'':'worker-row-offline')+'">' +
         '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
         '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
         '<td>'+diffHtml+'</td>' +
+        '<td>'+hrHtml+'</td>' +
         '<td><span class="shares-val">'+total.toLocaleString()+'</span></td>' +
         '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
         '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
         '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
         '<td>'+bestHtml+'</td>' +
         '<td>'+sessHtml+'</td>' +
+        '<td><span class="shares-val">'+wattsStr+'</span></td>' +
+        '<td><span class="shares-val">'+costStr+'</span></td>' +
+        '<td><span class="'+profitCls+'">'+profitStr+'</span></td>' +
         '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>' +
         '</tr>';
     }).join('');
@@ -1246,9 +1551,14 @@ function apply(s) {
     logEl.innerHTML = '<div class="no-blocks">NO BLOCKS FOUND THIS SESSION.<br>KEEP HASHING.</div>';
   } else {
     logEl.innerHTML = '<div class="block-log">'+blocks.map(function(b){
+      var luckStr = '';
+      if (b.luck !== undefined && b.luck >= 0) {
+        var luckColor = b.luck >= 100 ? 'var(--hi)' : (b.luck >= 50 ? 'var(--hi2)' : '#ff6600');
+        luckStr = ' · <span style="color:'+luckColor+'">LUCK '+b.luck.toFixed(1)+'%</span>';
+      }
       return '<div class="block-entry">' +
         '<div class="block-trophy">***</div>' +
-        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+b.hash+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+'</div></div>' +
+        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+b.hash+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+luckStr+'</div></div>' +
         '<div class="block-meta"><div class="block-reward">'+b.reward+'</div><div class="block-time">'+b.found_at+'</div></div>' +
         '</div>';
     }).join('')+'</div>';
@@ -1296,6 +1606,40 @@ function apply(s) {
   if (s.notifs) applyNotifs(s.notifs);
   if (s.chain_diags) renderDiag(s.chain_diags);
   renderConnect(s);
+
+  // Worker groups
+  var groups = s.groups || [];
+  var gg = document.getElementById('groupGrid');
+  var gc = document.getElementById('groupCount');
+  var sec = document.getElementById('sectionGroups');
+  if (gg && groups.length > 0) {
+    if (sec) sec.style.display = '';
+    if (gc) gc.textContent = groups.length + ' GROUPS';
+    gg.innerHTML = '';
+    groups.forEach(function(g) {
+      var profitStr = '';
+      var kwhRate = s.kwh_rate_usd || 0;
+      if (kwhRate > 0) {
+        var p = g.profit_per_day_usd;
+        var pClass = p >= 0 ? 'profit-pos' : 'profit-neg';
+        profitStr = '<div class="group-stat"><div class="group-stat-l">PROFIT/DAY</div>'+
+          '<div class="group-stat-v '+pClass+'">'+(p>=0?'+':'')+
+          '$'+Math.abs(p).toFixed(2)+'</div></div>';
+      }
+      gg.innerHTML += '<div class="group-card">'+
+        '<div class="group-name">'+g.name+'</div>'+
+        '<div class="group-stat"><div class="group-stat-l">MINERS</div>'+
+        '<div class="group-stat-v">'+g.online_count+' / '+g.worker_count+' ONLINE</div></div>'+
+        '<div class="group-stat"><div class="group-stat-l">HASHRATE</div>'+
+        '<div class="group-stat-v">'+fmtHash(g.hashrate_khs)+'</div></div>'+
+        '<div class="group-stat"><div class="group-stat-l">SHARES</div>'+
+        '<div class="group-stat-v">'+g.shares_accepted+'</div></div>'+
+        profitStr+
+        '</div>';
+    });
+  } else if (sec) {
+    sec.style.display = 'none';
+  }
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
 }
@@ -1947,6 +2291,134 @@ evtSrc.onerror = function() { document.getElementById('liveStatus').textContent 
 
 fetch('/api/stats').then(function(r){return r.json();}).then(apply).catch(function(){});
 fetch('/api/discord').then(function(r){return r.json();}).then(applyNotifs).catch(function(){});
+fetch('/api/config').then(function(r){return r.json();}).then(applyCfg).catch(function(){});
+
+// ── Config editor ──────────────────────────────────────────────────────────
+
+var cfgState = {};
+
+function applyCfg(c) {
+  if (!c) return;
+  cfgState = c;
+  var el;
+  el = document.getElementById('cfgTempLimit');      if(el) el.value = c.temp_limit_c || 75;
+  el = document.getElementById('cfgWorkerTimeout');  if(el) el.value = c.worker_timeout_s || 120;
+  el = document.getElementById('cfgWebhook');        if(el) el.value = c.discord_webhook || '';
+  el = document.getElementById('cfgAutoKickPct');    if(el) el.value = c.auto_kick_pct || 0;
+  el = document.getElementById('cfgAutoKickMin');    if(el) el.value = c.auto_kick_min_shares || 50;
+  el = document.getElementById('cfgKwhRate');        if(el) el.value = c.kwh_rate_usd || '';
+
+  // Wallets
+  var wDiv = document.getElementById('cfgWallets');
+  if (wDiv) {
+    wDiv.innerHTML = '';
+    var wallets = c.wallets || {};
+    Object.keys(wallets).sort().forEach(function(sym) {
+      var row = document.createElement('div');
+      row.className = 'cfg-row';
+      row.innerHTML = '<div class="cfg-label">'+sym+'</div>'+
+        '<input class="cfg-input wide" id="cfgWallet_'+sym+'" type="text" value="'+wallets[sym]+'">';
+      wDiv.appendChild(row);
+    });
+  }
+
+  // Vardiff
+  var vDiv = document.getElementById('cfgVardiff');
+  if (vDiv) {
+    vDiv.innerHTML = '';
+    var vmins = c.vardiff_min || {}, vmaxs = c.vardiff_max || {};
+    var coins = Array.from(new Set(Object.keys(vmins).concat(Object.keys(vmaxs)))).sort();
+    coins.forEach(function(sym) {
+      var row = document.createElement('div');
+      row.className = 'cfg-row';
+      row.style.marginBottom = '4px';
+      row.innerHTML = '<div class="cfg-label" style="min-width:50px">'+sym+' MIN</div>'+
+        '<input class="cfg-input" id="cfgVmin_'+sym+'" type="number" step="any" value="'+(vmins[sym]||0)+'" style="width:90px">'+
+        '<div class="cfg-label" style="min-width:10px;text-align:center">MAX</div>'+
+        '<input class="cfg-input" id="cfgVmax_'+sym+'" type="number" step="any" value="'+(vmaxs[sym]||0)+'" style="width:90px">';
+      vDiv.appendChild(row);
+    });
+  }
+
+  // Fixed diff rows
+  var tbody = document.getElementById('cfgFdRows');
+  if (tbody) {
+    tbody.innerHTML = '';
+    var fd = c.worker_fixed_diff || {};
+    Object.keys(fd).sort().forEach(function(w) { cfgFdAddRow(w, fd[w]); });
+  }
+}
+
+function cfgFdAddRow(worker, diff) {
+  var tbody = document.getElementById('cfgFdRows');
+  if (!tbody) return;
+  var tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td><input class="cfg-fd-input" style="width:160px" type="text" placeholder="wallet.worker" value="'+worker+'"></td>'+
+    '<td style="padding-left:8px"><input class="cfg-fd-input" type="number" step="any" placeholder="e.g. 256" value="'+diff+'"></td>'+
+    '<td style="padding-left:6px"><button class="cfg-fd-del" onclick="this.closest(\'tr\').remove()" title="Remove">&#215;</button></td>';
+  tbody.appendChild(tr);
+}
+
+function saveCfg() {
+  var status = document.getElementById('cfgSaveStatus');
+
+  // Collect wallets
+  var wallets = {};
+  if (cfgState.wallets) {
+    Object.keys(cfgState.wallets).forEach(function(sym) {
+      var el = document.getElementById('cfgWallet_'+sym);
+      if (el) wallets[sym] = el.value.trim();
+    });
+  }
+
+  // Collect vardiff
+  var vmins = {}, vmaxs = {};
+  if (cfgState.vardiff_min) {
+    Object.keys(cfgState.vardiff_min).forEach(function(sym) {
+      var elMin = document.getElementById('cfgVmin_'+sym);
+      var elMax = document.getElementById('cfgVmax_'+sym);
+      if (elMin) vmins[sym] = parseFloat(elMin.value) || 0;
+      if (elMax) vmaxs[sym] = parseFloat(elMax.value) || 0;
+    });
+  }
+
+  // Collect fixed diffs
+  var fd = {};
+  var rows = document.querySelectorAll('#cfgFdRows tr');
+  rows.forEach(function(tr) {
+    var inputs = tr.querySelectorAll('input');
+    var name = inputs[0] ? inputs[0].value.trim() : '';
+    var d = inputs[1] ? parseFloat(inputs[1].value) : 0;
+    if (name && d > 0) fd[name] = d;
+  });
+
+  var payload = {
+    temp_limit_c:       parseInt(document.getElementById('cfgTempLimit').value)||75,
+    worker_timeout_s:   parseInt(document.getElementById('cfgWorkerTimeout').value)||120,
+    discord_webhook:    document.getElementById('cfgWebhook').value.trim(),
+    auto_kick_pct:      parseInt(document.getElementById('cfgAutoKickPct').value)||0,
+    auto_kick_min_shares: parseInt(document.getElementById('cfgAutoKickMin').value)||50,
+    wallets:            wallets,
+    vardiff_min:        vmins,
+    vardiff_max:        vmaxs,
+    worker_fixed_diff:  fd,
+    kwh_rate_usd:       parseFloat(document.getElementById('cfgKwhRate').value) || 0
+  };
+
+  fetch('/api/config', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r) {
+    if (status) status.textContent = r.ok ? 'SAVED' : 'ERROR';
+    setTimeout(function(){ if(status) status.textContent = 'CONFIG EDITOR'; }, 3000);
+    if (r.ok) fetch('/api/config').then(function(r2){return r2.json();}).then(applyCfg);
+  }).catch(function() {
+    if (status) status.textContent = 'ERROR';
+    setTimeout(function(){ if(status) status.textContent = 'CONFIG EDITOR'; }, 3000);
+  });
+}
 </script>
 </body>
 </html>`

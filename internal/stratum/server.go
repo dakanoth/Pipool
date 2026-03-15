@@ -59,6 +59,10 @@ type Server struct {
 	currentJob      *Job
 	recentJobs      map[string]*Job    // last 4 jobs by ID — used to validate non-stale shares
 
+	// Luck tracking — valid work accumulated since last block found or session start
+	validWorkSinceBlock float64 // sum of accepted share diffs since last block (under mu)
+	lastNetworkDiff     float64 // network difficulty of most recent job (under mu)
+
 	// Stats (updated atomically for lock-free reads)
 	totalShares   atomic.Uint64
 	validShares   atomic.Uint64
@@ -71,8 +75,14 @@ type Server struct {
 	ln           net.Listener   // stored so Stop() can close the TCP port cleanly
 	wg           sync.WaitGroup // tracks active worker goroutines for graceful drain
 
+	// Upstream proxy fallback — activated when the local node goes offline
+	upstream     *UpstreamProxy // nil = solo mode
+	proxyActive  atomic.Bool
+	upstreamEn1  string  // extranonce1 from upstream pool (under mu)
+	upstreamDiff float64 // difficulty from upstream pool (under mu)
+
 	// Callbacks for Discord notifications
-	OnBlockFound      func(coin, hash string, reward float64)
+	OnBlockFound      func(coin, hash, worker string, reward, luck float64)
 	OnMinerConnect    func(worker string, addr string)
 	OnMinerDisconnect func(worker string)
 	OnNodeUnreachable func(err error)
@@ -84,6 +94,8 @@ type Server struct {
 	OnAuxBlockFound func(info AuxBlockInfo)
 	// Callback fired when a block becomes orphaned
 	OnBlockOrphaned func(coin, hash string, height int64)
+	// Callback fired when a block crosses the maturity threshold (confirmations become spendable)
+	OnBlockMature func(coin, hash string, height int64, reward string)
 }
 
 // Worker represents a connected miner
@@ -105,13 +117,15 @@ type Worker struct {
 	lastAcceptedAt      time.Time // time of last ACCEPTED share — used for vardiff decay
 	lastRetargetAt      time.Time
 	sharesSinceRetarget uint64
+	fixedDiff           float64 // if > 0: skip vardiff and pin to this value
 
 	// Share counters
-	sharesAccepted uint64
-	sharesRejected uint64
-	sharesStale    uint64
-	connectedAt    time.Time
-	bestShare      float64 // highest difficulty share submitted this session
+	sharesAccepted  uint64
+	sharesRejected  uint64
+	sharesStale     uint64
+	connectedAt     time.Time
+	bestShare       float64  // highest difficulty share submitted this session
+	suggestedMinDiff float64 // floor set by mining.suggest_difficulty
 
 	// Extranonce assigned to this worker
 	extranonce1  string
@@ -121,6 +135,7 @@ type Worker struct {
 type SeenWorker struct {
 	Name           string
 	DeviceName     string
+	UserAgent      string
 	LastAddr       string
 	Coin           string
 	SharesAccepted uint64
@@ -142,8 +157,9 @@ type SeenWorker struct {
 // ShareSample records a single submitted share for the difficulty chart
 type ShareSample struct {
 	Difficulty float64
-	TimeMS     int64 // unix milliseconds
+	TimeMS     int64  // unix milliseconds
 	Accepted   bool
+	Worker     string // worker name — used for per-worker hashrate estimation
 }
 
 // HashrateSample is a periodic hashrate snapshot for the chart
@@ -202,8 +218,9 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 
 // Start begins listening for miner connections and polling for new work
 func (s *Server) Start() error {
-	// Restore persisted worker state (LastDifficulty, BestShare) from previous run
+	// Restore persisted worker state (LastDifficulty, BestShare) and block log from previous run
 	s.loadWorkerState()
+	s.loadBlockLog()
 
 	// Bind on all interfaces so startup succeeds even if the pool's public IP
 	// is not yet assigned (e.g. immediately after a reboot / DHCP renewal).
@@ -281,6 +298,64 @@ func (s *Server) Stop() {
 		log.Printf("[%s] all workers drained cleanly", s.coin.Symbol)
 	case <-time.After(10 * time.Second):
 		log.Printf("[%s] shutdown timeout — %d workers still active, forcing close", s.coin.Symbol, s.connectedMiners.Load())
+	}
+	s.saveBlockLog() // persist block log on clean shutdown
+}
+
+// activateProxy starts the upstream stratum proxy fallback.
+func (s *Server) activateProxy() {
+	if s.upstream != nil {
+		return // already active
+	}
+	cfg := s.coin.UpstreamPool
+	log.Printf("[%s] node offline — activating upstream proxy to %s:%d", s.coin.Symbol, cfg.Host, cfg.Port)
+	u := newUpstreamProxy(cfg, s.coin.Symbol, func(job *Job, en1 string, diff float64) {
+		s.mu.Lock()
+		s.upstreamEn1 = en1
+		s.upstreamDiff = diff
+		s.currentJob = job
+		if len(s.recentJobs) > 4 {
+			// keep only the latest
+			s.recentJobs = map[string]*Job{job.ID: job}
+		} else {
+			s.recentJobs[job.ID] = job
+		}
+		s.mu.Unlock()
+		// Kick all connected workers so they reconnect and get the new extranonce1
+		s.kickAllConnected()
+		select {
+		case s.jobBroadcast <- job:
+		default:
+		}
+	})
+	if err := u.Start(); err != nil {
+		log.Printf("[%s] proxy start failed: %v", s.coin.Symbol, err)
+		return
+	}
+	s.upstream = u
+	s.proxyActive.Store(true)
+}
+
+// deactivateProxy stops the upstream stratum proxy fallback.
+func (s *Server) deactivateProxy() {
+	if s.upstream == nil {
+		return
+	}
+	log.Printf("[%s] node back online — deactivating upstream proxy", s.coin.Symbol)
+	s.upstream.Stop()
+	s.upstream = nil
+	s.proxyActive.Store(false)
+	// Kick workers so they reconnect and get local extranonce1
+	s.kickAllConnected()
+}
+
+// kickAllConnected closes all active miner connections,
+// causing them to reconnect and receive updated session parameters.
+func (s *Server) kickAllConnected() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, w := range s.workers {
+		w.conn.Close()
 	}
 }
 
@@ -430,6 +505,11 @@ func (s *Server) pollBlockTemplate() {
 						}
 					}
 				}
+				// Activate upstream proxy fallback when node has been down > 30 seconds
+				if s.coin.UpstreamPool.Enabled && !s.proxyActive.Load() &&
+					!daemonDownSince.IsZero() && time.Since(daemonDownSince) > 30*time.Second {
+					s.activateProxy()
+				}
 				// Exponential backoff up to maxRetryDelay
 				time.Sleep(retryDelay)
 				if retryDelay < maxRetryDelay {
@@ -446,6 +526,10 @@ func (s *Server) pollBlockTemplate() {
 				}
 				daemonWasDown = false
 				retryDelay = 5 * time.Second
+				// Deactivate upstream proxy now that the local node is back
+				if s.proxyActive.Load() {
+					s.deactivateProxy()
+				}
 			}
 
 			if hash == lastHash {
@@ -505,6 +589,13 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		bt.DefaultWitnessCommitment,
 		auxCommitment, // ← new parameter
 	)
+
+	// Update network difficulty from this job's nBits
+	if nd := diffFromBits(bt.Bits, s.coin.Algorithm); nd > 0 {
+		s.mu.Lock()
+		s.lastNetworkDiff = nd
+		s.mu.Unlock()
+	}
 
 	job := &Job{
 		ID:             fmt.Sprintf("%x", rand.Uint32()),
@@ -586,8 +677,21 @@ func (s *Server) handleWorker(conn net.Conn) {
 			go s.saveWorkerState() // persist LastDifficulty and BestShare for next startup
 		}
 		log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
+		// Smarter offline alert: wait 3 minutes before firing Discord notification.
+		// If the worker reconnects within that window, skip the alert to avoid noise.
 		if s.OnMinerDisconnect != nil && w.authorized {
-			s.OnMinerDisconnect(w.workerName)
+			disconnectedName := w.workerName
+			onDisconnect := s.OnMinerDisconnect
+			go func() {
+				time.Sleep(3 * time.Minute)
+				s.mu.RLock()
+				sw, exists := s.seenWorkers[disconnectedName]
+				stillOffline := !exists || !sw.Online
+				s.mu.RUnlock()
+				if stillOffline {
+					onDisconnect(disconnectedName)
+				}
+			}()
 		}
 	}()
 
@@ -674,6 +778,30 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 		}
 		return s.reply(w, msg.ID, result, nil)
 	case "mining.suggest_difficulty":
+		// Parse the requested difficulty and store as per-worker vardiff floor.
+		var sdParams []json.RawMessage
+		if json.Unmarshal(msg.Params, &sdParams) == nil && len(sdParams) > 0 {
+			var sugDiff float64
+			if json.Unmarshal(sdParams[0], &sugDiff) == nil && sugDiff > 0 {
+				vd := s.coin.Stratum.Vardiff
+				if sugDiff < vd.MinDiff {
+					sugDiff = vd.MinDiff
+				}
+				if sugDiff > vd.MaxDiff {
+					sugDiff = vd.MaxDiff
+				}
+				w.mu.Lock()
+				w.suggestedMinDiff = sugDiff
+				// Immediately apply if current difficulty is below the requested floor
+				if w.difficulty < sugDiff {
+					w.difficulty = sugDiff
+					w.mu.Unlock()
+					s.sendDifficulty(w, sugDiff)
+				} else {
+					w.mu.Unlock()
+				}
+			}
+		}
 		return s.reply(w, msg.ID, true, nil)
 	case "mining.extranonce.subscribe":
 		// Acknowledge but don't change extranonce dynamically for now
@@ -694,13 +822,26 @@ func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 	}
 	log.Printf("[%s] subscribe from %s: user-agent=%q params=%s", s.coin.Symbol, w.remoteAddr, w.userAgent, msg.Params)
 
+	// When upstream proxy is active, use the upstream extranonce1 so miner
+	// shares are valid against the upstream pool's template.
+	en1 := w.extranonce1
+	if s.proxyActive.Load() {
+		s.mu.RLock()
+		upEn1 := s.upstreamEn1
+		s.mu.RUnlock()
+		if upEn1 != "" {
+			en1 = upEn1
+			w.extranonce1 = upEn1
+		}
+	}
+
 	// Reply: [session_id, extranonce1, extranonce2_size]
 	result := []any{
 		[]any{
 			[]string{"mining.set_difficulty", w.id},
 			[]string{"mining.notify", w.id},
 		},
-		w.extranonce1,
+		en1,
 		4, // extranonce2 size in bytes
 	}
 	if err := s.reply(w, msg.ID, result, nil); err != nil {
@@ -745,6 +886,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		existing.LastSeenAt = now
 		existing.LastAddr = w.remoteAddr
 		existing.DeviceName = device.Name
+		existing.UserAgent = w.userAgent
 		existing.ReconnectCount++
 		existing.SessionStartedAt = now
 		// Restore last-known difficulty so the miner doesn't flood the pool with
@@ -770,6 +912,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		s.seenWorkers[workerName] = &SeenWorker{
 			Name:             workerName,
 			DeviceName:       device.Name,
+			UserAgent:        w.userAgent,
 			LastAddr:         w.remoteAddr,
 			Coin:             s.coin.Symbol,
 			ConnectedAt:      now,
@@ -780,6 +923,15 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	}
 	s.mu.Unlock()
 
+	// Check for a fixed difficulty override from config
+	fixedDiff := 0.0
+	if s.poolCfg.Pool.WorkerFixedDiff != nil {
+		if fd, ok := s.poolCfg.Pool.WorkerFixedDiff[workerName]; ok && fd > 0 {
+			fixedDiff = fd
+			startDiff = fd
+		}
+	}
+
 	// Update worker fields under w.mu only (never while holding s.mu).
 	w.mu.Lock()
 	prevDiff := w.difficulty
@@ -787,6 +939,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	w.workerName = workerName
 	w.deviceName = device.Name
 	w.difficulty = startDiff
+	w.fixedDiff = fixedDiff
 	w.mu.Unlock()
 
 	// Count only authorized workers so the coin "Miners" card stays in sync
@@ -859,7 +1012,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	// Extranonce2 must be exactly 4 bytes (8 hex chars) as declared in mining.subscribe
 	if len(extranonce2) != 8 {
 		w.sharesRejected++
-		s.recordShareSample(w.difficulty, false)
+		s.recordShareSample(w.difficulty, false, w.workerName)
 		return s.reply(w, msg.ID, false, []any{20, "Invalid extranonce2 length", nil})
 	}
 	ntime := params[3]
@@ -896,9 +1049,23 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	if !valid {
 		w.sharesRejected++
 		s.updateSeenWorkerShares(w)
-		s.recordShareSample(validationDiff, false)
+		s.recordShareSample(validationDiff, false, w.workerName)
 		s.decayVardiff(w)
 		log.Printf("[%s] rejected share from %s (hash above target)", s.coin.Symbol, w.workerName)
+		// Auto-kick: disconnect workers with persistently high invalid share rates
+		autoKickPct := s.poolCfg.Pool.AutoKickRejectPct
+		autoKickMin := s.poolCfg.Pool.AutoKickMinShares
+		if autoKickPct > 0 && autoKickMin > 0 {
+			total := w.sharesAccepted + w.sharesRejected + w.sharesStale
+			if int(total) >= autoKickMin {
+				rejectPct := float64(w.sharesRejected) / float64(total) * 100
+				if rejectPct >= float64(autoKickPct) {
+					log.Printf("[%s] auto-kick %s: reject rate %.1f%% >= threshold %d%% after %d shares",
+						s.coin.Symbol, w.workerName, rejectPct, autoKickPct, total)
+					w.conn.Close()
+				}
+			}
+		}
 		return s.reply(w, msg.ID, false, []any{23, "Low difficulty share", nil})
 	}
 
@@ -916,7 +1083,12 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	}
 	s.mu.Unlock()
 	s.updateSeenWorkerShares(w)
-	s.recordShareSample(validationDiff, true)
+	s.recordShareSample(validationDiff, true, w.workerName)
+
+	// Track work for luck computation
+	s.mu.Lock()
+	s.validWorkSinceBlock += validationDiff
+	s.mu.Unlock()
 
 	// Adjust vardiff
 	s.adjustVardiff(w)
@@ -934,10 +1106,25 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 		} else {
 			go s.submitBlock(blockHex, w.workerName, job.Height)
 
-			s.recordBlock(blockHash, job.Height, reward, w.workerName)
+			// Compute luck: networkDiff / validWork * 100
+			// >100% = found faster than expected (lucky), <100% = found slower (unlucky)
+			s.mu.Lock()
+			luck := -1.0
+			validWork := s.validWorkSinceBlock
+			netDiff := s.lastNetworkDiff
+			if validWork > 0 && netDiff > 0 {
+				luck = netDiff / validWork * 100
+			}
+			s.validWorkSinceBlock = 0 // reset for next block
+			s.mu.Unlock()
+
+			log.Printf("[%s] block luck: %.1f%% (network diff=%.2f, work done=%.2f)",
+				s.coin.Symbol, luck, netDiff, validWork)
+
+			s.recordBlock(blockHash, job.Height, reward, w.workerName, luck)
 
 			if s.OnBlockFound != nil {
-				s.OnBlockFound(s.coin.Symbol, blockHash, reward)
+				s.OnBlockFound(s.coin.Symbol, blockHash, w.workerName, reward, luck)
 			}
 
 			// Notify merge mining coordinator so it can submit aux chain blocks
@@ -956,6 +1143,15 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 					AuxWorkSnap:   job.AuxWorks,
 				})
 			}
+		}
+	}
+
+	// When proxy is active and the share is valid but not a block, forward to upstream.
+	if s.proxyActive.Load() && s.upstream != nil {
+		accepted := s.upstream.Submit(params[0], params[1], params[2], params[3], params[4])
+		if !accepted {
+			log.Printf("[%s] upstream rejected share from %s", s.coin.Symbol, w.workerName)
+			return s.reply(w, msg.ID, false, []any{23, "Upstream rejected", nil})
 		}
 	}
 
@@ -1218,10 +1414,13 @@ func dsha256(data []byte) [32]byte {
 // Returns the raw hash bytes in little-endian order (as produced by the hash function).
 func hashHeader(header []byte, algo string) ([]byte, error) {
 	switch algo {
-	case "scrypt", "scryptn":
-		// Litecoin/Dogecoin scrypt: N=1024, r=1, p=1, keyLen=32.
-		// Both password and salt are the 80-byte header.
+	case "scrypt":
+		// Standard Scrypt (LTC, DOGE, DGBS): N=1024, r=1, p=1, keyLen=32
 		return scrypt.Key(header, header, 1024, 1, 1, 32)
+	case "scryptn":
+		// Scrypt-N (Pepecoin): N=2048, r=1, p=1, keyLen=32
+		// Pepecoin uses a larger N value than standard Scrypt for increased memory hardness
+		return scrypt.Key(header, header, 2048, 1, 1, 32)
 	default:
 		// sha256d for BTC, BCH, and any unknown algorithm.
 		h := dsha256(header)
@@ -1283,12 +1482,48 @@ func diff1Target(algo string) *big.Int {
 	}
 }
 
+// diffFromBits converts a compact nBits hex string to network difficulty as float64.
+// Returns 0 on parse error.
+func diffFromBits(nbitsHex string, algo string) float64 {
+	nbitsBytes, err := hex.DecodeString(nbitsHex)
+	if err != nil || len(nbitsBytes) != 4 {
+		return 0
+	}
+	target := nbitsToTarget(nbitsBytes)
+	if target.Sign() == 0 {
+		return 0
+	}
+	diff1 := diff1Target(algo)
+	f, _ := new(big.Float).Quo(new(big.Float).SetInt(diff1), new(big.Float).SetInt(target)).Float64()
+	return f
+}
+
 // ─── unused compat stub (kept to avoid removing reverseByteOrder callers) ────
 var _ = binary.LittleEndian // ensure encoding/binary stays imported
 
 // ─── Vardiff ──────────────────────────────────────────────────────────────────
 
 func (s *Server) adjustVardiff(w *Worker) {
+	// If the worker has a pinned fixed difficulty, re-apply it and skip auto-adjustment.
+	// Re-read from config each time so live config changes take effect.
+	if s.poolCfg.Pool.WorkerFixedDiff != nil {
+		if fd, ok := s.poolCfg.Pool.WorkerFixedDiff[w.workerName]; ok && fd > 0 {
+			if w.difficulty != fd {
+				w.fixedDiff = fd
+				w.difficulty = fd
+				s.sendDifficulty(w, fd)
+			}
+			return
+		}
+	}
+	if w.fixedDiff > 0 {
+		if w.difficulty != w.fixedDiff {
+			w.difficulty = w.fixedDiff
+			s.sendDifficulty(w, w.fixedDiff)
+		}
+		return
+	}
+
 	vd := s.coin.Stratum.Vardiff
 	retarget := time.Duration(vd.RetargetS) * time.Second
 
@@ -1313,6 +1548,10 @@ func (s *Server) adjustVardiff(w *Worker) {
 
 	if newDiff < vd.MinDiff {
 		newDiff = vd.MinDiff
+	}
+	// Respect per-worker suggested floor (from mining.suggest_difficulty)
+	if w.suggestedMinDiff > 0 && newDiff < w.suggestedMinDiff {
+		newDiff = w.suggestedMinDiff
 	}
 	if newDiff > vd.MaxDiff {
 		newDiff = vd.MaxDiff
@@ -1467,17 +1706,21 @@ type BlockEntry struct {
 	Reward        string
 	Worker        string
 	FoundAt       time.Time
-	Confirmations int64  // -1 = orphaned, 0 = unconfirmed, N = confirmations
+	Confirmations int64   // -1 = orphaned, 0 = unconfirmed, N = confirmations
 	IsOrphaned    bool
-	IsAux         bool   // true for DOGE/BCH (merge-mined) blocks
-	AuxParentCoin string // e.g. "LTC" for a DOGE block
+	IsAux         bool    // true for DOGE/BCH (merge-mined) blocks
+	AuxParentCoin string  // e.g. "LTC" for a DOGE block
+	BlockLuck     float64 // luck % (100=expected, 200=found at half expected work); -1=N/A (aux)
+	MatureNotified bool   // true once the maturity Discord alert has been sent
 }
 
 // WorkerInfo is a public snapshot of a worker (online or previously seen)
 type WorkerInfo struct {
 	Name             string
 	DeviceName       string
+	UserAgent        string
 	Difficulty       float64
+	HashrateKHs      float64   // 5-minute rolling hashrate estimate
 	SharesAccepted   uint64
 	SharesRejected   uint64
 	SharesStale      uint64
@@ -1487,7 +1730,9 @@ type WorkerInfo struct {
 	SessionStartedAt time.Time // time of the current session start (zero if offline)
 	ConnectedAt      time.Time
 	LastSeenAt       time.Time
+	LastShareAt      time.Time // time of the most recent accepted share (zero if none)
 	Online           bool
+	WattsEstimate    float64   // estimated power consumption in watts (from RouterTable or manual override)
 }
 
 // AllWorkers returns all workers seen this session (online + offline)
@@ -1503,11 +1748,25 @@ func (s *Server) AllWorkers() []WorkerInfo {
 		}
 	}
 
+	// Compute 5-minute rolling hashrate per worker from recent share samples.
+	// Formula: sum(diffs) * 2^32 / 300s / 1000 → KH/s
+	const windowMs = 5 * 60 * 1000
+	nowMs := time.Now().UnixMilli()
+	workerDiffSum := make(map[string]float64)
+	for _, ss := range s.shareSamples {
+		if ss.Accepted && ss.Worker != "" && nowMs-ss.TimeMS <= windowMs {
+			workerDiffSum[ss.Worker] += ss.Difficulty
+		}
+	}
+
 	out := make([]WorkerInfo, 0, len(s.seenWorkers))
 	for name, seen := range s.seenWorkers {
+		khs := workerDiffSum[name] * 4294967296.0 / 300.0 / 1000.0
 		wi := WorkerInfo{
 			Name:           name,
 			DeviceName:     seen.DeviceName,
+			UserAgent:      seen.UserAgent,
+			HashrateKHs:    khs,
 			SharesAccepted: seen.SharesAccepted,
 			SharesRejected: seen.SharesRejected,
 			SharesStale:    seen.SharesStale,
@@ -1524,7 +1783,28 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			wi.Difficulty       = w.difficulty
 			wi.Online           = true
 			wi.SessionStartedAt = w.connectedAt
+			wi.LastShareAt      = w.lastShareAt
+		} else {
+			// Offline — use last seen time as fallback
+			wi.LastShareAt = seen.LastSeenAt
 		}
+		// Get wattage: check manual override first, then device class lookup
+		watts := 0.0
+		if s.poolCfg.Pool.WorkerFixedWatts != nil {
+			if w, ok := s.poolCfg.Pool.WorkerFixedWatts[name]; ok {
+				watts = w
+			}
+		}
+		if watts == 0 {
+			// Look up by device name in RouterTable
+			for _, sig := range RouterTable {
+				if sig.class.Name == seen.DeviceName {
+					watts = sig.class.WattsEstimate
+					break
+				}
+			}
+		}
+		wi.WattsEstimate = watts
 		out = append(out, wi)
 	}
 	return out
@@ -1606,12 +1886,13 @@ func (s *Server) BestShareEver() float64 {
 }
 
 // recordShareSample appends a share difficulty sample (ring buffer, max 200)
-func (s *Server) recordShareSample(diff float64, accepted bool) {
+func (s *Server) recordShareSample(diff float64, accepted bool, worker string) {
 	s.mu.Lock()
 	s.shareSamples = append(s.shareSamples, ShareSample{
 		Difficulty: diff,
 		TimeMS:     time.Now().UnixMilli(),
 		Accepted:   accepted,
+		Worker:     worker,
 	})
 	if len(s.shareSamples) > 200 {
 		s.shareSamples = s.shareSamples[len(s.shareSamples)-200:]
@@ -1626,6 +1907,37 @@ func (s *Server) ShareSamples() []ShareSample {
 	out := make([]ShareSample, len(s.shareSamples))
 	copy(out, s.shareSamples)
 	return out
+}
+
+// HistoBucket is one bin of the share difficulty distribution
+type HistoBucket struct {
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Count int     `json:"count"`
+}
+
+// ShareHistogram returns a log10-spaced distribution of accepted share difficulties
+// from the current rolling sample window (last 200 shares).
+func (s *Server) ShareHistogram() []HistoBucket {
+	bounds := []float64{0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000, 100000, 1000000}
+	buckets := make([]HistoBucket, len(bounds)-1)
+	for i := 0; i < len(bounds)-1; i++ {
+		buckets[i] = HistoBucket{Min: bounds[i], Max: bounds[i+1]}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ss := range s.shareSamples {
+		if !ss.Accepted {
+			continue
+		}
+		for i := range buckets {
+			if ss.Difficulty >= buckets[i].Min && ss.Difficulty < buckets[i].Max {
+				buckets[i].Count++
+				break
+			}
+		}
+	}
+	return buckets
 }
 
 // BlockLog returns a copy of the found-block log for the dashboard
@@ -1648,14 +1960,15 @@ func (s *Server) currentJobHeight() int64 {
 }
 
 // recordBlock appends a found block to the ring buffer (max 50 entries)
-func (s *Server) recordBlock(hash string, height int64, reward float64, worker string) {
+func (s *Server) recordBlock(hash string, height int64, reward float64, worker string, luck float64) {
 	entry := BlockEntry{
-		Coin:    s.coin.Symbol,
-		Height:  height,
-		Hash:    hash,
-		Reward:  fmt.Sprintf("%.4f %s", reward, s.coin.Symbol),
-		Worker:  worker,
-		FoundAt: time.Now(),
+		Coin:      s.coin.Symbol,
+		Height:    height,
+		Hash:      hash,
+		Reward:    fmt.Sprintf("%.4f %s", reward, s.coin.Symbol),
+		Worker:    worker,
+		FoundAt:   time.Now(),
+		BlockLuck: luck,
 	}
 	s.mu.Lock()
 	s.blockLog = append(s.blockLog, entry)
@@ -1663,6 +1976,7 @@ func (s *Server) recordBlock(hash string, height int64, reward float64, worker s
 		s.blockLog = s.blockLog[len(s.blockLog)-50:]
 	}
 	s.mu.Unlock()
+	go s.saveBlockLog()
 }
 
 // RecordBlock publicly records a found block (used by main.go for aux chain blocks).
@@ -1676,6 +1990,7 @@ func (s *Server) RecordBlock(symbol, hash string, height int64, reward float64, 
 		FoundAt:       time.Now(),
 		IsAux:         auxParent != "",
 		AuxParentCoin: auxParent,
+		BlockLuck:     -1, // luck N/A for aux chain blocks
 	}
 	s.mu.Lock()
 	s.blockLog = append(s.blockLog, entry)
@@ -1683,28 +1998,37 @@ func (s *Server) RecordBlock(symbol, hash string, height int64, reward float64, 
 		s.blockLog = s.blockLog[len(s.blockLog)-50:]
 	}
 	s.mu.Unlock()
+	go s.saveBlockLog()
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 type Stats struct {
-	Symbol          string
-	Algorithm       string
-	ConnectedMiners int32
-	TotalShares     uint64
-	ValidShares     uint64
-	BlocksFound     uint64
-	HashrateKHs     float64 // estimated from valid shares
+	Symbol              string
+	Algorithm           string
+	ConnectedMiners     int32
+	TotalShares         uint64
+	ValidShares         uint64
+	BlocksFound         uint64
+	HashrateKHs         float64 // estimated from valid shares
+	ValidWorkSinceBlock float64 // sum of accepted share diffs since last block
+	LastNetworkDiff     float64 // network difficulty of most recent job
 }
 
 func (s *Server) Stats() Stats {
+	s.mu.RLock()
+	vwsb := s.validWorkSinceBlock
+	lnd := s.lastNetworkDiff
+	s.mu.RUnlock()
 	return Stats{
-		Symbol:          s.coin.Symbol,
-		Algorithm:       s.coin.Algorithm,
-		ConnectedMiners: s.connectedMiners.Load(),
-		TotalShares:     s.totalShares.Load(),
-		ValidShares:     s.validShares.Load(),
-		BlocksFound:     s.blocksFound.Load(),
+		Symbol:              s.coin.Symbol,
+		Algorithm:           s.coin.Algorithm,
+		ConnectedMiners:     s.connectedMiners.Load(),
+		TotalShares:         s.totalShares.Load(),
+		ValidShares:         s.validShares.Load(),
+		BlocksFound:         s.blocksFound.Load(),
+		ValidWorkSinceBlock: vwsb,
+		LastNetworkDiff:     lnd,
 	}
 }
 
@@ -1758,6 +2082,16 @@ func (s *Server) Diag() DiagStats {
 		CurrentJobAge:  jobAge,
 		HasJob:         hasJob,
 		WorkerCount:    workerCount,
+	}
+}
+
+// coinMaturityThreshold returns the number of confirmations required before a block reward is spendable.
+func coinMaturityThreshold(symbol string) int64 {
+	switch strings.ToUpper(symbol) {
+	case "DOGE":
+		return 60
+	default:
+		return 100
 	}
 }
 
@@ -1817,6 +2151,14 @@ func (s *Server) trackConfirmations() {
 						}
 					} else {
 						s.blockLog[i].Confirmations = u.confirmations
+						threshold := coinMaturityThreshold(s.blockLog[i].Coin)
+						if !s.blockLog[i].MatureNotified && s.blockLog[i].Confirmations >= threshold {
+							s.blockLog[i].MatureNotified = true
+							if s.OnBlockMature != nil {
+								entry := s.blockLog[i]
+								go s.OnBlockMature(entry.Coin, entry.Hash, entry.Height, entry.Reward)
+							}
+						}
 					}
 				}
 			}
@@ -1949,6 +2291,13 @@ func (s *Server) stateFilePath() string {
 	return fmt.Sprintf("%s_%s.json", s.poolCfg.Pool.StateFile, s.coin.Symbol)
 }
 
+func (s *Server) blockLogFilePath() string {
+	if s.poolCfg.Pool.StateFile == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s_blocklog_%s.json", s.poolCfg.Pool.StateFile, s.coin.Symbol)
+}
+
 // saveWorkerState writes LastDifficulty and BestShare for all known workers to disk.
 func (s *Server) saveWorkerState() {
 	path := s.stateFilePath()
@@ -2023,5 +2372,112 @@ func (s *Server) loadWorkerState() {
 	s.mu.Unlock()
 	if loaded > 0 {
 		log.Printf("[%s] restored state for %d worker(s) from %s", s.coin.Symbol, loaded, path)
+	}
+}
+
+// blockLogFileEntry is the on-disk representation of a found block.
+type blockLogFileEntry struct {
+	Coin          string    `json:"coin"`
+	Height        int64     `json:"height"`
+	Hash          string    `json:"hash"`
+	Reward        string    `json:"reward"`
+	Worker        string    `json:"worker"`
+	FoundAt       time.Time `json:"found_at"`
+	Confirmations int64     `json:"confirmations"`
+	IsOrphaned    bool      `json:"is_orphaned"`
+	IsAux         bool      `json:"is_aux"`
+	AuxParentCoin  string    `json:"aux_parent_coin,omitempty"`
+	BlockLuck      float64   `json:"luck"`
+	MatureNotified bool      `json:"mature_notified"`
+}
+
+type blockLogFile struct {
+	Version int                  `json:"version"`
+	Saved   time.Time            `json:"saved"`
+	Entries []blockLogFileEntry  `json:"entries"`
+}
+
+// saveBlockLog persists the in-memory block log to disk.
+func (s *Server) saveBlockLog() {
+	path := s.blockLogFilePath()
+	if path == "" {
+		return
+	}
+	s.mu.RLock()
+	entries := make([]blockLogFileEntry, len(s.blockLog))
+	for i, b := range s.blockLog {
+		entries[i] = blockLogFileEntry{
+			Coin: b.Coin, Height: b.Height, Hash: b.Hash,
+			Reward: b.Reward, Worker: b.Worker, FoundAt: b.FoundAt,
+			Confirmations: b.Confirmations, IsOrphaned: b.IsOrphaned,
+			IsAux: b.IsAux, AuxParentCoin: b.AuxParentCoin, BlockLuck: b.BlockLuck,
+			MatureNotified: b.MatureNotified,
+		}
+	}
+	s.mu.RUnlock()
+
+	f := blockLogFile{Version: 1, Saved: time.Now(), Entries: entries}
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("[%s] block log save marshal: %v", s.coin.Symbol, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		log.Printf("[%s] block log save write %s: %v", s.coin.Symbol, path, err)
+	}
+}
+
+// loadBlockLog reads persisted block log entries and prepends them to the in-memory log.
+// Existing in-memory entries (from this session) take precedence; historical entries are
+// appended only when not already present (dedup by hash).
+func (s *Server) loadBlockLog() {
+	path := s.blockLogFilePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[%s] block log load %s: %v", s.coin.Symbol, path, err)
+		}
+		return
+	}
+	var f blockLogFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		log.Printf("[%s] block log parse: %v", s.coin.Symbol, err)
+		return
+	}
+	s.mu.Lock()
+	// Build set of hashes already in memory
+	known := make(map[string]bool, len(s.blockLog))
+	for _, b := range s.blockLog {
+		if b.Hash != "" {
+			known[b.Hash] = true
+		}
+	}
+	// Prepend historical entries not already present
+	var historical []BlockEntry
+	for _, e := range f.Entries {
+		if known[e.Hash] {
+			continue
+		}
+		historical = append(historical, BlockEntry{
+			Coin: e.Coin, Height: e.Height, Hash: e.Hash,
+			Reward: e.Reward, Worker: e.Worker, FoundAt: e.FoundAt,
+			Confirmations: e.Confirmations, IsOrphaned: e.IsOrphaned,
+			IsAux: e.IsAux, AuxParentCoin: e.AuxParentCoin, BlockLuck: e.BlockLuck,
+			MatureNotified: e.MatureNotified,
+		})
+	}
+	if len(historical) > 0 {
+		combined := append(historical, s.blockLog...)
+		if len(combined) > 50 {
+			combined = combined[len(combined)-50:]
+		}
+		s.blockLog = combined
+	}
+	s.mu.Unlock()
+	if len(historical) > 0 {
+		log.Printf("[%s] restored %d block log entries from %s", s.coin.Symbol, len(historical), path)
 	}
 }

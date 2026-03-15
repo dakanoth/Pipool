@@ -81,10 +81,16 @@ type embedFooter struct {
 
 // ─── Public notification methods ──────────────────────────────────────────────
 
-func (n *Notifier) BlockFound(coin, blockHash string, height int64, reward float64, workerName string) {
+func (n *Notifier) BlockFound(coin, blockHash string, height int64, reward, luck float64, workerName string) {
 	if !n.cfg.Enabled || !n.cfg.Alerts.BlockFound {
 		return
 	}
+
+	luckStr := "N/A"
+	if luck >= 0 {
+		luckStr = fmt.Sprintf("%.1f%%", luck)
+	}
+
 	go n.send(webhookPayload{
 		Username:  botName,
 		AvatarURL: n.cfg.AvatarURL,
@@ -100,6 +106,33 @@ func (n *Notifier) BlockFound(coin, blockHash string, height int64, reward float
 				{Name: "WORKER", Value: workerName, Inline: true},
 				{Name: "BLOCK HEIGHT", Value: fmt.Sprintf("%d", height), Inline: true},
 				{Name: "REWARD", Value: fmt.Sprintf("%.4f %s", reward, coin), Inline: true},
+				{Name: "LUCK", Value: luckStr, Inline: true},
+				{Name: "BLOCK HASH", Value: fmt.Sprintf("`%s`", truncateHash(blockHash)), Inline: false},
+			},
+			Footer:    &embedFooter{Text: botFooter},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
+func (n *Notifier) BlockMatured(coin, blockHash string, height int64, reward string) {
+	if !n.cfg.Enabled || !n.cfg.Alerts.BlockFound {
+		return
+	}
+	go n.send(webhookPayload{
+		Username:  botName,
+		AvatarURL: n.cfg.AvatarURL,
+		Embeds: []embed{{
+			Title: fmt.Sprintf("BLOCK MATURED — %s", coin),
+			Description: fmt.Sprintf(
+				"%s\n\nBlock **#%d** on **%s** has reached maturity. Reward is now **spendable**.",
+				lvlAlert, height, coin,
+			),
+			Color: ColorAlert,
+			Fields: []embedField{
+				{Name: "CHAIN", Value: coin, Inline: true},
+				{Name: "BLOCK HEIGHT", Value: fmt.Sprintf("%d", height), Inline: true},
+				{Name: "REWARD", Value: reward, Inline: true},
 				{Name: "BLOCK HASH", Value: fmt.Sprintf("`%s`", truncateHash(blockHash)), Inline: false},
 			},
 			Footer:    &embedFooter{Text: botFooter},
@@ -321,6 +354,37 @@ func (n *Notifier) NodeUnreachable(coin string, err error) {
 			Color:     ColorWarning,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Footer:    &embedFooter{Text: botFooter},
+		}},
+	})
+}
+
+func (n *Notifier) WorkerStale(coin, workerName string, silentMin int) {
+	if !n.cfg.Enabled {
+		return
+	}
+	key := "stale:" + coin + ":" + workerName
+	if time.Since(n.lastSent[key]) < 30*time.Minute {
+		return
+	}
+	n.lastSent[key] = time.Now()
+
+	go n.send(webhookPayload{
+		Username: botName,
+		Embeds: []embed{{
+			Title: fmt.Sprintf("WORKER SILENT — %s", coin),
+			Description: fmt.Sprintf(
+				"%s\n\nMiner **%s** has not submitted a share in **%d minutes** on **%s**. "+
+					"It may be stalled, overheated, or disconnected without a TCP RST.",
+				lvlCaution, workerName, silentMin, coin,
+			),
+			Color: ColorCaution,
+			Fields: []embedField{
+				{Name: "WORKER", Value: workerName, Inline: true},
+				{Name: "CHAIN", Value: coin, Inline: true},
+				{Name: "SILENT FOR", Value: fmt.Sprintf("%d min", silentMin), Inline: true},
+			},
+			Footer:    &embedFooter{Text: botFooter},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}},
 	})
 }

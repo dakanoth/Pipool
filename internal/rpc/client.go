@@ -295,11 +295,40 @@ func (c *Client) GetBlock(hash string) (*BlockInfo, error) {
 	return &info, nil
 }
 
+// WalletInfo holds balance information from getwalletinfo
+type WalletInfo struct {
+	Balance            float64 `json:"balance"`
+	UnconfirmedBalance float64 `json:"unconfirmed_balance"`
+	ImmatureBalance    float64 `json:"immature_balance"`
+}
+
+// GetWalletInfo returns current wallet balance info
+func (c *Client) GetWalletInfo() (*WalletInfo, error) {
+	var wi WalletInfo
+	err := c.Call("getwalletinfo", nil, &wi)
+	return &wi, err
+}
+
 // GetBlockHash returns the block hash at the given height.
 func (c *Client) GetBlockHash(height int64) (string, error) {
 	var hash string
 	err := c.Call("getblockhash", []any{height}, &hash)
 	return hash, err
+}
+
+// BlockHeaderInfo holds the result of getblockheader
+type BlockHeaderInfo struct {
+	Hash       string  `json:"hash"`
+	Height     int64   `json:"height"`
+	Time       int64   `json:"time"`
+	Difficulty float64 `json:"difficulty"`
+}
+
+// GetBlockHeader returns header info for the block with the given hash
+func (c *Client) GetBlockHeader(hash string) (*BlockHeaderInfo, error) {
+	var bh BlockHeaderInfo
+	err := c.Call("getblockheader", []any{hash, true}, &bh)
+	return &bh, err
 }
 
 // CreateCoinbaseTx builds a coinbase transaction split around the extranonce space.

@@ -2,8 +2,8 @@
 
 **A lightweight, original solo mining pool server built in Go for the Raspberry Pi 5.**
 
-Supports merge mining for LTC+DOGE and BTC+BCH, Discord Sentinel notifications,
-an optional web dashboard, and runs comfortably within 8GB RAM on Ubuntu Server.
+Supports merge mining for LTC+DOGE and BTC+BCH, real-time web dashboard, Discord notifications,
+Prometheus metrics, and runs comfortably within 8 GB RAM on Ubuntu Server.
 
 ---
 
@@ -27,34 +27,47 @@ By downloading, installing, or running this software you agree to the following:
 
 ## Features
 
-| Feature | Detail |
+| Category | Feature |
 |---|---|
 | **Language** | Go — single binary, minimal RAM, native concurrency |
-| **LTC + DOGE** | Merge mined via AuxPoW — one Scrypt sync, two rewards |
-| **BTC + BCH** | Merge mined via AuxPoW — one SHA-256d sync, two rewards |
-| **PEP** | Optional Scrypt-N, enable in config |
-| **Quai Network** | SHA-256d and Scrypt ASIC support via built-in stratum |
-| **Stratum V1** | Full vardiff, per-worker extranonce, clean job broadcast |
-| **Discord** | Block found, miner events, high temp, hashrate reports, node down |
-| **Dashboard** | Optional SSE-powered web UI — disabled by default to save RAM |
-| **RAM Safety** | 512MB systemd MemoryMax cap on PiPool itself |
-| **Config** | Single `pipool.json` — wallets, RPC creds, alerts all in one place |
+| **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt-N), DGB, DGBS, Quai Network |
+| **Merge Mining** | AuxPoW for LTC+DOGE and BTC+BCH — one sync, two rewards |
+| **Stratum** | Full Stratum V1 — vardiff, per-worker extranonce, clean job broadcast |
+| **ASIC Support** | 65 device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, …) |
+| **TLS** | Optional TLS stratum listener per coin (auto-generates self-signed cert) |
+| **Vardiff** | Per-worker vardiff with fixed-diff override, `mining.suggest_difficulty` support |
+| **ZMQ** | Instant block notifications via ZMQ — sub-second job broadcasts |
+| **Node Watchdog** | Auto-restarts unresponsive coin daemons via `systemctl` |
+| **Proxy Fallback** | When local node is offline, transparently proxies miners to a configured upstream pool |
+| **Block Log** | Persisted block log with confirmations, luck %, and maturity tracking |
+| **State Persistence** | Worker difficulty and best share persist across restarts |
+| **Discord** | Block found/matured, miner events, high temp, hashrate reports, node down, worker silent |
+| **Dashboard** | SSE-powered web UI — live hashrate, workers, coin cards, block log, share chart |
+| **Config Editor** | Edit wallets, vardiff, Discord webhook, auto-kick, fixed diffs, kWh rate — live from browser |
+| **Worker Groups** | Tag workers into named groups; see per-group hashrate and profit |
+| **Profit Tracker** | Per-worker cost/day and profit/day based on device wattage and electricity rate |
+| **Diff Countdown** | BTC/LTC epoch progress bar and projected next difficulty change % |
+| **Prometheus** | `/metrics` endpoint exposing hashrate, miners, temp, wallet balance, worker hashrate, and more |
+| **pipoolctl** | Unix-socket CLI for live status, worker management, and config changes |
+| **Security** | IP allowlist, high-reject-rate auto-kick, optional dashboard password |
 
 ---
 
-## Stratum Ports
+## Stratum Ports (defaults)
 
-| Coin | Port | Notes |
-|---|---|---|
-| LTC | 3333 | Primary Scrypt — miners connect here for LTC+DOGE |
-| DOGE | 3334 | AuxPoW merged via LTC — no separate miner needed |
-| BTC | 3335 | Primary SHA-256d — miners connect here for BTC+BCH |
-| BCH | 3336 | AuxPoW merged via BTC — no separate miner needed |
-| PEP | 3337 | Optional Scrypt-N |
-| QUAI (SHA-256) | 3340 | Quai Network SHA-256d ASICs |
-| QUAI (Scrypt) | 3341 | Quai Network Scrypt ASICs |
+| Coin | Port | Algorithm | Notes |
+|---|---|---|---|
+| LTC | 3333 | Scrypt | Primary — miners connect here for LTC+DOGE |
+| DOGE | 3334 | Scrypt / AuxPoW | Merged via LTC — no separate miner needed |
+| BTC | 3335 | SHA-256d | Primary — miners connect here for BTC+BCH |
+| BCH | 3336 | SHA-256d / AuxPoW | Merged via BTC — no separate miner needed |
+| PEP | 3337 | Scrypt-N (N=2048) | Optional — enable in config |
+| DGB | 3339 | SHA-256d | Optional DigiByte SHA-256d |
+| DGBS | 3342 | Scrypt | Optional DigiByte Scrypt |
+| QUAI (SHA-256d) | 3340 | SHA-256d | Quai Network |
+| QUAI (Scrypt) | 3341 | Scrypt | Quai Network |
 
-**You only need to point your miner at ports 3333 (Scrypt) and/or 3335 (SHA-256d).**
+**You only need to point your miner at 3333 (Scrypt) and/or 3335 (SHA-256d).**
 DOGE and BCH are earned for free via merge mining.
 
 ---
@@ -62,7 +75,7 @@ DOGE and BCH are earned for free via merge mining.
 ## Quick Start
 
 ```bash
-# 1. Install (Ubuntu Server, Pi 5)
+# 1. Clone and install (Ubuntu Server, Pi 5)
 git clone https://github.com/dakanoth/Pipool
 cd Pipool
 sudo bash scripts/install.sh
@@ -73,36 +86,28 @@ go build -o pipool ./cmd/pipool/
 # 3. Generate default config
 ./pipool -init
 
-# 4. Edit config
+# 4. Edit config — set your wallets and RPC credentials
 nano configs/pipool.json
 
 # 5. Run
 ./pipool -config configs/pipool.json
 
-# 6. Run with dashboard enabled
-./pipool -config configs/pipool.json -dashboard
-
-# 7. As a systemd service
+# 6. As a systemd service
 sudo systemctl start pipool
 sudo journalctl -u pipool -f
+
+# 7. Dashboard (always on by default, port 8080)
+# Open http://<pi-ip>:8080 in your browser
+
+# 8. Prometheus metrics (port 9100 by default)
+./pipool -config configs/pipool.json -metrics-port 9100
+
+# 9. pipoolctl (requires pipool to be running)
+pipoolctl status
+pipoolctl workers
+pipoolctl kick wallet.miner1
+pipoolctl fixdiff wallet.miner1 256
 ```
-
----
-
-## RAM Budget (Pi 5, 8GB)
-
-| Component | RAM Usage |
-|---|---|
-| PiPool itself | ~30–80 MB |
-| litecoind (LTC) | ~400–600 MB |
-| dogecoind (DOGE) | ~300–500 MB |
-| bitcoind (BTC) | ~500–700 MB |
-| bchd (BCH) | ~300–500 MB |
-| Ubuntu Server overhead | ~400 MB |
-| **Total (all 4 daemons)** | **~2–3 GB** |
-
-> 💡 **Tip:** Use `dbcache=256` in coin daemon configs to cap their RAM usage.
-> The install script sets these automatically.
 
 ---
 
@@ -111,45 +116,82 @@ sudo journalctl -u pipool -f
 ```json
 {
   "pool": {
+    "name": "PiPool",
+    "host": "0.0.0.0",
+    "coinbase_tag": "/PiPool/",
     "max_connections": 64,
-    "temp_limit_c": 75
-  },
-  "coins": {
-    "DOGE": {
-      "enabled": true,
-      "merge_parent": "LTC"
+    "worker_timeout": 120,
+    "temp_limit_c": 75,
+    "ip_allowlist": [],
+    "state_file": "/opt/pipool/worker_state",
+    "auto_kick_reject_pct": 0,
+    "auto_kick_min_shares": 50,
+    "last_share_alert_min": 0,
+    "kwh_rate_usd": 0.12,
+    "worker_fixed_diff": {
+      "wallet.miner1": 256
+    },
+    "worker_fixed_watts": {
+      "wallet.miner1": 3250
+    },
+    "worker_groups": {
+      "garage rig": ["wallet.miner1", "wallet.miner2"],
+      "office rig": ["wallet.miner3"]
     }
   },
-  "quai": {
-    "enabled": false,
-    "node": {
-      "host": "192.168.1.92",
-      "ws_port": 8548
-    },
-    "sha256": {
+  "coins": {
+    "LTC": {
       "enabled": true,
-      "port": 3340,
-      "min_diff": 65536,
-      "max_diff": 67108864,
-      "target_time": 15
+      "algorithm": "scrypt",
+      "wallet": "YOUR_LTC_WALLET",
+      "block_reward": 6.25,
+      "stratum": { "port": 3333 },
+      "node": {
+        "host": "127.0.0.1", "port": 9332,
+        "user": "litecoind", "password": "changeme",
+        "zmq_pub_hashblock": "tcp://127.0.0.1:28332",
+        "systemd_service": "litecoind"
+      },
+      "upstream_pool": {
+        "enabled": false,
+        "host": "stratum.litecoinpool.org",
+        "port": 3333,
+        "user": "YOUR_LTC_WALLET",
+        "password": "x"
+      }
     },
-    "scrypt": {
+    "DOGE": {
       "enabled": true,
-      "port": 3341,
-      "min_diff": 64,
-      "max_diff": 65536,
-      "target_time": 15
+      "algorithm": "scrypt",
+      "merge_parent": "LTC",
+      "wallet": "YOUR_DOGE_WALLET",
+      "block_reward": 10000,
+      "node": { "host": "127.0.0.1", "port": 22555 }
     }
   },
   "discord": {
-    "webhook_url": "https://discord.com/api/webhooks/...",
+    "enabled": true,
+    "webhook_url": "https://discord.com/api/webhooks/YOUR/WEBHOOK",
     "alerts": {
+      "block_found": true,
+      "miner_connected": true,
+      "miner_disconnect": false,
+      "high_temp": true,
+      "hashrate_report": true,
       "hashrate_interval_min": 60,
-      "hashrate_drop_pct": 20
+      "hashrate_drop_pct": 20,
+      "node_unreachable": true
     }
   },
   "dashboard": {
-    "enabled": false
+    "enabled": true,
+    "port": 8080,
+    "push_interval_s": 15
+  },
+  "logging": {
+    "level": "info",
+    "to_file": true,
+    "path": "/var/log/pipool/pipool.log"
   }
 }
 ```
@@ -160,33 +202,138 @@ sudo journalctl -u pipool -f
 
 | Event | Trigger |
 |---|---|
-| 🏆 Block Found | Every solved block |
-| 🔌 Miner Connected | New miner connects (throttled: max 1/30s per coin) |
-| 🌡️ High Temp | CPU exceeds `temp_limit_c` (throttled: max 1/10min) |
-| 📊 Hashrate Report | Every `hashrate_interval_min` minutes |
-| 📉 Hashrate Drop | When hashrate falls > `hashrate_drop_pct` % |
-| 💀 Node Unreachable | Coin daemon goes offline (throttled: max 1/5min) |
-| 🚀 Pool Started | On every startup |
+| **BLOCK FOUND** | Every solved block — includes height, reward, luck %, worker |
+| **BLOCK MATURED** | Block reaches 100 confirmations (60 for DOGE) — reward is now spendable |
+| **MINER CONNECTED** | New miner authorizes (throttled: 1 per 30s per coin) |
+| **MINER DISCONNECTED** | Miner drops (3-minute debounce — skipped if miner reconnects) |
+| **WORKER SILENT** | Connected worker goes N minutes without a share (`last_share_alert_min`) |
+| **HIGH TEMP** | CPU exceeds `temp_limit_c` (throttled: 1 per 10 min) |
+| **HASHRATE REPORT** | Periodic summary every `hashrate_interval_min` minutes |
+| **HASHRATE DROP** | Hashrate falls more than `hashrate_drop_pct` % (throttled: 1 per 15 min) |
+| **NODE UNREACHABLE** | Coin daemon goes offline (throttled: 1 per 5 min) |
+| **WATCHDOG RESTART** | PiPool auto-restarts a crashed daemon via systemctl |
+| **NODE RESTORED** | Daemon comes back online |
+| **POOL STARTED** | On every startup |
+
+---
+
+## Dashboard
+
+Open `http://<pi-ip>:8080` in any browser on your network.
+
+| Section | What it shows |
+|---|---|
+| **Status bar** | Pool name, live/reconnecting, last update time |
+| **Header metrics** | Scrypt hashrate, SHA-256d hashrate, blocks found, uptime |
+| **System** | CPU %, RAM, core temp with live bars |
+| **Coin cards** | Per-coin: hashrate, miners, difficulty, price, expected block time, session effort, wallet balance (confirmed + maturing), difficulty retarget countdown (BTC/LTC), share histogram |
+| **Workers table** | All seen workers (online + offline history): hashrate, difficulty, shares, best share, profit/day, device, user-agent tooltip |
+| **Groups** | Per-group aggregate hashrate, online count, profit/day (when `worker_groups` configured) |
+| **Share chart** | Rolling scatter plot of submitted share difficulties with network diff overlay and block markers |
+| **Hashrate chart** | 24-hour area chart per coin |
+| **Block log** | All found blocks with height, reward, luck %, confirmations, orphan status |
+| **Storage** | Disk usage per mount with per-chain data sizes |
+| **Chain diagnostics** | Stale %, reject %, job age, issue detection per chain |
+| **Connection info** | Stratum address, port, and algorithm per coin |
+| **Notifications** | Toggle Discord alerts live |
+| **Pool settings** | Edit wallets, vardiff, webhook, auto-kick, fixed diffs, electricity rate — saved to disk |
+
+---
+
+## Profit Tracking
+
+Set `kwh_rate_usd` in config (e.g. `0.12` for 12¢/kWh). PiPool looks up estimated wattage for each connected ASIC from its built-in device table (65 models). You can override per-worker with `worker_fixed_watts`.
+
+The dashboard worker table then shows:
+- **WATTS** — estimated draw for that device
+- **COST/DAY** — electricity cost in USD
+- **PROFIT/DAY** — revenue share minus electricity cost (green = profit, red = loss)
+
+---
+
+## Prometheus Metrics
+
+Start with `-metrics-port 9100` (or any port). Exposes at `http://<pi-ip>:9100/metrics`:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `pipool_cpu_temp_celsius` | gauge | — |
+| `pipool_cpu_usage_percent` | gauge | — |
+| `pipool_ram_used_gigabytes` | gauge | — |
+| `pipool_uptime_seconds` | counter | — |
+| `pipool_connected_miners` | gauge | `coin` |
+| `pipool_hashrate_khs` | gauge | `coin` |
+| `pipool_blocks_found_total` | counter | `coin` |
+| `pipool_valid_shares_total` | counter | `coin` |
+| `pipool_total_shares_total` | counter | `coin` |
+| `pipool_rejected_shares_total` | counter | `coin` |
+| `pipool_stale_shares_total` | counter | `coin` |
+| `pipool_network_difficulty` | gauge | `coin` |
+| `pipool_block_height` | gauge | `coin` |
+| `pipool_wallet_balance` | gauge | `coin` |
+| `pipool_wallet_immature` | gauge | `coin` |
+| `pipool_worker_hashrate_khs` | gauge | `worker` |
+| `pipool_device_count` | gauge | `device` |
+
+---
+
+## pipoolctl
+
+```bash
+pipoolctl status               # system health snapshot
+pipoolctl workers              # list all connected workers
+pipoolctl coins                # per-coin hashrate and block count
+pipoolctl kick wallet.miner1   # disconnect a specific worker
+pipoolctl fixdiff wallet.miner1 256   # pin worker to difficulty (0 = remove)
+pipoolctl coin enable DGB      # enable/disable a coin
+pipoolctl vardiff LTC 0.1 1024 # update vardiff bounds
+pipoolctl reload               # hot-reload discord/dashboard config from disk
+pipoolctl loglevel debug        # change log verbosity live
+pipoolctl discord test          # send a test Discord notification
+pipoolctl stop                 # graceful stop (systemd restarts automatically)
+pipoolctl version              # print version
+```
 
 ---
 
 ## Architecture
 
 ```
-cmd/pipool/main.go          — Entry point, wires everything together
+cmd/pipool/main.go              — Entry point, wires everything together
 internal/
-  config/config.go          — Config structs + load/save
-  rpc/client.go             — JSON-RPC client for coin daemons
-  stratum/server.go         — Stratum V1 server (per primary coin)
-  merge/auxpow.go           — AuxPoW merge mining coordinator
-  mining/monitor.go         — CPU temp, RAM, uptime monitor
-  discord/notifier.go       — Discord webhook notifications
-  dashboard/server.go       — Optional HTTP dashboard + SSE push
-  quai/rpc.go               — Quai Network WebSocket node client
-  quai/server.go            — Quai Stratum V1 server (SHA-256d + Scrypt)
-configs/pipool.json         — Your config (generated by -init or install.sh)
-scripts/install.sh          — Full Ubuntu Server install script
+  config/config.go              — Config structs, load/save, defaults
+  rpc/client.go                 — JSON-RPC client for coin daemons
+  stratum/server.go             — Stratum V1 server (per primary coin)
+  stratum/proxy.go              — Upstream proxy fallback (when node offline)
+  stratum/router.go             — ASIC fingerprinting — 65 device classes
+  stratum/tls.go                — Optional TLS listener
+  merge/auxpow.go               — AuxPoW merge mining coordinator
+  mining/monitor.go             — CPU temp, RAM, uptime monitor
+  discord/notifier.go           — Discord webhook notifications
+  dashboard/server.go           — HTTP dashboard + SSE push + config editor
+  metrics/prometheus.go         — Prometheus text-format metrics registry
+  ctl/server.go                 — pipoolctl Unix socket server
+  quai/rpc.go                   — Quai Network WebSocket node client
+  quai/server.go                — Quai Stratum V1 server
+configs/pipool.json             — Your config (generated by -init or install.sh)
+scripts/install.sh              — Full Ubuntu Server install script
 ```
+
+---
+
+## RAM Budget (Pi 5, 8 GB)
+
+| Component | RAM |
+|---|---|
+| PiPool itself | ~30–80 MB |
+| litecoind | ~400–600 MB |
+| dogecoind | ~300–500 MB |
+| bitcoind | ~500–700 MB |
+| bitcoin-cash-node | ~300–500 MB |
+| Ubuntu Server overhead | ~400 MB |
+| **Total (all 4 daemons)** | **~2–3 GB** |
+
+> Use `dbcache=256` in coin daemon configs to cap their RAM. The install script sets this automatically.
 
 ---
 
@@ -216,7 +363,7 @@ sudo install -m 0755 bitcoin-26.0/bin/* /usr/local/bin/
 bitcoind -daemon
 ```
 
-### Bitcoin Cash
+### Bitcoin Cash Node
 ```bash
 wget https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v27.1.0/bitcoin-cash-node-27.1.0-aarch64-linux-gnu.tar.gz
 tar xzf bitcoin-cash-node-*.tar.gz
@@ -228,9 +375,7 @@ bitcoind -conf=/root/.bch/bitcoin.conf -daemon
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 dakanoth
+MIT License — Copyright (c) 2025 dakanoth
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

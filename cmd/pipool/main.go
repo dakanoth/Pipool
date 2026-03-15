@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,6 +95,83 @@ func fetchPricesLoop(ctx context.Context) {
 		case <-ticker.C:
 			do()
 		}
+	}
+}
+
+// ─── Difficulty adjustment epoch cache ───────────────────────────────────────
+
+var (
+	epochCacheMu     sync.RWMutex
+	epochStartTime   = make(map[string]int64)  // coin → epoch start unix timestamp
+	epochStartHeight = make(map[string]int64)  // coin → epoch start height
+)
+
+// computeDiffAdjustment returns difficulty retarget info for BTC/LTC (which have fixed 2016-block epochs).
+// Returns nil for other coins.
+func computeDiffAdjustment(sym string, height int64, cli *rpc.Client) *dashboard.DiffAdjustment {
+	const epochSize = 2016
+	var targetBlockSec int
+	switch sym {
+	case "BTC", "BCH":
+		targetBlockSec = 600
+	case "LTC":
+		targetBlockSec = 150
+	default:
+		return nil // other coins don't have fixed epochs
+	}
+	blocksInEpoch := height % epochSize
+	blocksRemaining := int64(epochSize) - blocksInEpoch
+	epochStartH := height - blocksInEpoch
+
+	// Check cache
+	epochCacheMu.RLock()
+	cachedHeight := epochStartHeight[sym]
+	cachedTime := epochStartTime[sym]
+	epochCacheMu.RUnlock()
+
+	var epochStartUnix int64
+	if cachedHeight == epochStartH && cachedTime > 0 {
+		epochStartUnix = cachedTime
+	} else {
+		// Fetch from node
+		hash, err := cli.GetBlockHash(epochStartH)
+		if err == nil {
+			bh, err2 := cli.GetBlockHeader(hash)
+			if err2 == nil {
+				epochStartUnix = bh.Time
+				epochCacheMu.Lock()
+				epochStartHeight[sym] = epochStartH
+				epochStartTime[sym] = epochStartUnix
+				epochCacheMu.Unlock()
+			}
+		}
+	}
+
+	var projectedPct float64
+	var estimatedDate string
+	if epochStartUnix > 0 && blocksInEpoch > 0 {
+		elapsedSec := time.Now().Unix() - epochStartUnix
+		expectedSec := int64(blocksInEpoch) * int64(targetBlockSec)
+		// difficulty increases if blocks came faster than expected (elapsedSec < expectedSec)
+		// projected % change: (expectedSec/elapsedSec - 1) * 100
+		projectedPct = (float64(expectedSec)/float64(elapsedSec) - 1) * 100
+		// ETA: average block time so far, extrapolated to remaining blocks
+		avgBlockSec := elapsedSec / blocksInEpoch
+		etaSec := blocksRemaining * avgBlockSec
+		etaTime := time.Now().Add(time.Duration(etaSec) * time.Second)
+		estimatedDate = etaTime.Format("Jan 2, 15:04")
+	} else if blocksInEpoch == 0 {
+		// Just started epoch
+		estimatedDate = "~" + fmtUptime(time.Duration(epochSize)*time.Duration(targetBlockSec)*time.Second)
+	}
+
+	return &dashboard.DiffAdjustment{
+		EpochSize:      epochSize,
+		BlocksInEpoch:  blocksInEpoch,
+		BlocksRemaining: blocksRemaining,
+		ProjectedPct:   projectedPct,
+		EstimatedDate:  estimatedDate,
+		TargetBlockSec: targetBlockSec,
 	}
 }
 
@@ -228,8 +306,11 @@ func main() {
 		srv.OnNodeWatchdogRestart = func(service string) {
 			notifier.DaemonRestarted(coin.Symbol, service)
 		}
-		srv.OnBlockFound = func(sym, hash string, reward float64) {
-			notifier.BlockFound(sym, hash, 0, reward, "unknown")
+		srv.OnBlockFound = func(sym, hash, worker string, reward, luck float64) {
+			notifier.BlockFound(sym, hash, 0, reward, luck, worker)
+		}
+		srv.OnBlockMature = func(coin, hash string, height int64, reward string) {
+			notifier.BlockMatured(coin, hash, height, reward)
 		}
 		srv.OnAuxBlockFound = func(info stratum.AuxBlockInfo) {
 			// Build the allHashes slice in sorted symbol order (same order used when
@@ -275,7 +356,7 @@ func main() {
 						log.Printf("[%s] submitauxblock failed: %v", child.Symbol, err)
 					} else {
 						log.Printf("[%s] aux block submitted successfully! (merged via %s)", child.Symbol, coin.Symbol)
-						notifier.BlockFound(child.Symbol, auxWork.HashHex, 0, child.BlockReward, "merged")
+						notifier.BlockFound(child.Symbol, auxWork.HashHex, 0, child.BlockReward, -1, "merged")
 					}
 				}()
 			}
@@ -320,7 +401,7 @@ func main() {
 				}, quaiNode)
 				qSHA.SetCallbacks(
 					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, int64(height), 0, worker)
+						notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
 					},
 					nil,
 				)
@@ -343,7 +424,7 @@ func main() {
 				}, quaiNode)
 				qScrypt.SetCallbacks(
 					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, int64(height), 0, worker)
+						notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
 					},
 					nil,
 				)
@@ -389,6 +470,13 @@ func main() {
 		}()
 	}
 
+	// ─── Pre-build RPC clients (shared by metrics updater and dashboard) ───────
+	dashClients := make(map[string]*rpc.Client, len(cfg.Coins))
+	for sym, coinCfg := range cfg.Coins {
+		dashClients[sym] = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
+			coinCfg.Node.User, coinCfg.Node.Password, sym)
+	}
+
 	// ─── Metrics updater goroutine ────────────────────────────────────────────
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -404,6 +492,24 @@ func main() {
 				reg.ValidShares.Add(sym, 0) // ensure label exists
 				reg.TotalShares.Add(sym, 0)
 				reg.BlocksFound.Add(sym, 0)
+				// Per-worker hashrate metrics
+				for _, w := range srv.AllWorkers() {
+					if w.Online && w.HashrateKHs > 0 {
+						reg.WorkerHashrateKHs.Set(w.Name, w.HashrateKHs)
+					}
+				}
+				// Rejected and stale shares from seenWorkers
+				diag := srv.Diag()
+				reg.RejectedShares.Add(sym, 0) // ensure label exists
+				reg.StaleShares.Add(sym, 0)
+				_ = diag
+			}
+			// Wallet balances from dash clients
+			for sym, cli := range dashClients {
+				if wi, err := cli.GetWalletInfo(); err == nil {
+					reg.WalletBalance.Set(sym, wi.Balance)
+					reg.WalletImmature.Set(sym, wi.ImmatureBalance)
+				}
 			}
 		}
 	}()
@@ -438,6 +544,33 @@ func main() {
 		}
 	}()
 
+	// ─── Worker last-share alert ──────────────────────────────────────────────
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			alertMin := cfg.Pool.LastShareAlertMin
+			if alertMin <= 0 {
+				continue
+			}
+			threshold := time.Duration(alertMin) * time.Minute
+			for _, srv := range servers {
+				sym := srv.Stats().Symbol
+				for _, w := range srv.AllWorkers() {
+					if !w.Online {
+						continue
+					}
+					if w.LastShareAt.IsZero() {
+						continue
+					}
+					if time.Since(w.LastShareAt) >= threshold {
+						notifier.WorkerStale(sym, w.Name, alertMin)
+					}
+				}
+			}
+		}
+	}()
+
 	// ─── Web dashboard (always on) ───────────────────────────────────────────
 	{
 		dashPort := cfg.Dashboard.Port
@@ -450,11 +583,6 @@ func main() {
 		}
 		// Pre-build one RPC client per coin — reused every dashboard snapshot
 		// instead of allocating a new http.Client every 5 seconds
-		dashClients := make(map[string]*rpc.Client, len(cfg.Coins))
-		for sym, coinCfg := range cfg.Coins {
-			dashClients[sym] = rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
-				coinCfg.Node.User, coinCfg.Node.Password, sym)
-		}
 		dash := dashboard.New(dashPort, pushInterval,
 			func() dashboard.StatsSnapshot {
 				return buildDashboardSnapshot(cfg, servers, sysmon, dashClients)
@@ -490,7 +618,6 @@ func main() {
 			},
 			func(tag string) {
 				cfg.Pool.CoinbaseTag = tag
-				// propagate to all stratum servers
 				for _, srv := range servers {
 					srv.SetCoinbaseTag(tag)
 				}
@@ -498,6 +625,73 @@ func main() {
 					log.Printf("[dashboard] tag save failed: %v", err)
 				}
 				log.Printf("[dashboard] coinbase tag updated to: %s", tag)
+			},
+			// Config editor: GET current editable settings
+			func() dashboard.ConfigEditorData {
+				wallets := make(map[string]string)
+				vmin := make(map[string]float64)
+				vmax := make(map[string]float64)
+				for sym, cc := range cfg.Coins {
+					wallets[sym] = cc.Wallet
+					vmin[sym] = cc.Stratum.Vardiff.MinDiff
+					vmax[sym] = cc.Stratum.Vardiff.MaxDiff
+				}
+				return dashboard.ConfigEditorData{
+					TempLimitC:      cfg.Pool.TempLimitC,
+					WorkerTimeoutS:  cfg.Pool.WorkerTimeout,
+					DiscordWebhook:  cfg.Discord.WebhookURL,
+					Wallets:         wallets,
+					VardiffMin:      vmin,
+					VardiffMax:      vmax,
+					AutoKickPct:     cfg.Pool.AutoKickRejectPct,
+					AutoKickMin:     cfg.Pool.AutoKickMinShares,
+					WorkerFixedDiff: cfg.Pool.WorkerFixedDiff,
+					KwhRateUSD:      cfg.Pool.KwhRateUSD,
+				}
+			},
+			// Config editor: SET and persist
+			func(cd dashboard.ConfigEditorData) {
+				cfg.Pool.TempLimitC      = cd.TempLimitC
+				cfg.Pool.WorkerTimeout   = cd.WorkerTimeoutS
+				cfg.Discord.WebhookURL   = cd.DiscordWebhook
+				cfg.Pool.AutoKickRejectPct = cd.AutoKickPct
+				cfg.Pool.AutoKickMinShares = cd.AutoKickMin
+				cfg.Pool.KwhRateUSD      = cd.KwhRateUSD
+				if cd.WorkerFixedDiff != nil {
+					if cfg.Pool.WorkerFixedDiff == nil {
+						cfg.Pool.WorkerFixedDiff = make(map[string]float64)
+					}
+					for k, v := range cd.WorkerFixedDiff {
+						if v <= 0 {
+							delete(cfg.Pool.WorkerFixedDiff, k)
+						} else {
+							cfg.Pool.WorkerFixedDiff[k] = v
+						}
+					}
+				}
+				for sym, addr := range cd.Wallets {
+					if cc, ok := cfg.Coins[sym]; ok {
+						cc.Wallet = addr
+						cfg.Coins[sym] = cc
+					}
+				}
+				for sym, vd := range cd.VardiffMin {
+					if cc, ok := cfg.Coins[sym]; ok {
+						cc.Stratum.Vardiff.MinDiff = vd
+						cfg.Coins[sym] = cc
+					}
+				}
+				for sym, vd := range cd.VardiffMax {
+					if cc, ok := cfg.Coins[sym]; ok {
+						cc.Stratum.Vardiff.MaxDiff = vd
+						cfg.Coins[sym] = cc
+					}
+				}
+				if err := config.Save(cfg, *cfgPath); err != nil {
+					log.Printf("[dashboard] config save failed: %v", err)
+				} else {
+					log.Printf("[dashboard] config updated and saved")
+				}
 			},
 		)
 		go func() {
@@ -615,6 +809,10 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				if mi, err2 := cli.GetMiningInfo(); err2 == nil {
 					cs.Difficulty = mi.Difficulty
 				}
+				if wi, err3 := cli.GetWalletInfo(); err3 == nil {
+					cs.BalanceConfirmed = wi.Balance
+					cs.BalanceImmature = wi.ImmatureBalance
+				}
 			} else {
 				// Daemon offline — try ping for latency at least
 				t1 := time.Now()
@@ -658,6 +856,10 @@ collect:
 			stats := srv.Stats()
 			cs.Miners = stats.ConnectedMiners
 			cs.Blocks = stats.BlocksFound
+			// Session effort: how much work done relative to expected block cost
+			if stats.ValidWorkSinceBlock > 0 && stats.LastNetworkDiff > 0 {
+				cs.SessionEffortPct = stats.ValidWorkSinceBlock / stats.LastNetworkDiff * 100
+			}
 			// Estimate hashrate from recent share difficulty samples.
 			// Only use samples from the last 5 minutes so hashrate decays to 0
 			// when a miner goes quiet instead of staying stuck at an old value.
@@ -691,6 +893,14 @@ collect:
 				scryptKHs += cs.HashrateKHs
 			}
 			totalBlocks += cs.Blocks
+			// Share difficulty histogram
+			for _, hb := range srv.ShareHistogram() {
+				cs.DiffHistogram = append(cs.DiffHistogram, dashboard.HistoBucket{
+					Min:   hb.Min,
+					Max:   hb.Max,
+					Count: hb.Count,
+				})
+			}
 		} else if coinCfg.MergeParent != "" {
 			// Merge aux coins (DOGE, BCH) share the parent's stratum server.
 			// Reflect the parent's connected miner count so the coin card isn't misleadingly 0.
@@ -698,13 +908,29 @@ collect:
 				cs.Miners = parentSrv.Stats().ConnectedMiners
 			}
 		}
-		// Price, block reward, and estimated daily earnings
+		// Price, block reward, estimated daily earnings, and expected time to block
 		cs.BlockReward = coinCfg.BlockReward
 		cs.PriceUSD = coinPrice(sym)
-		if cs.PriceUSD > 0 && cs.Difficulty > 0 && cs.HashrateKHs > 0 {
+		if cs.Difficulty > 0 && cs.HashrateKHs > 0 {
 			hashPerSec := cs.HashrateKHs * 1000.0
-			expectedBlocksPerDay := (hashPerSec * 86400.0) / (cs.Difficulty * 4294967296.0)
-			cs.EarningsPerDayUSD = expectedBlocksPerDay * coinCfg.BlockReward * cs.PriceUSD
+			// diff1 constant: scrypt uses 65536 (2^16), sha256d uses 2^32
+			diff1Const := 65536.0
+			if coinCfg.Algorithm == "sha256d" {
+				diff1Const = 4294967296.0
+			}
+			cs.ExpectedBlockSec = cs.Difficulty * diff1Const / hashPerSec
+			if cs.PriceUSD > 0 {
+				expectedBlocksPerDay := 86400.0 / cs.ExpectedBlockSec
+				cs.EarningsPerDayUSD = expectedBlocksPerDay * coinCfg.BlockReward * cs.PriceUSD
+			}
+		}
+		// Difficulty adjustment countdown (BTC and LTC only)
+		if (sym == "BTC" || sym == "LTC") && cs.Height > 0 {
+			if cli, ok := dashClients[sym]; ok {
+				if adj := computeDiffAdjustment(sym, cs.Height, cli); adj != nil {
+					cs.DiffAdjust = adj
+				}
+			}
 		}
 		snap.Coins = append(snap.Coins, cs)
 	}
@@ -726,6 +952,7 @@ collect:
 				Coin:           sym,
 				Device:         w.DeviceName,
 				Difficulty:     w.Difficulty,
+				HashrateKHs:    w.HashrateKHs,
 				SharesAccepted: w.SharesAccepted,
 				SharesRejected: w.SharesRejected,
 				SharesStale:    w.SharesStale,
@@ -733,6 +960,7 @@ collect:
 				RemoteAddr:     w.RemoteAddr,
 				Online:         w.Online,
 				ReconnectCount: w.ReconnectCount,
+				UserAgent:      w.UserAgent,
 			}
 			if !w.ConnectedAt.IsZero() {
 				ws.ConnectedAt = w.ConnectedAt.Format("Jan 2 15:04")
@@ -743,8 +971,36 @@ collect:
 			if w.Online && !w.SessionStartedAt.IsZero() {
 				ws.SessionDuration = fmtWorkerUptime(time.Since(w.SessionStartedAt))
 			}
+			// Electricity cost and profit estimation
+			kwhRate := cfg.Pool.KwhRateUSD
+			if kwhRate > 0 && w.WattsEstimate > 0 {
+				ws.WattsEstimate = w.WattsEstimate
+				ws.CostPerDayUSD = w.WattsEstimate / 1000.0 * 24.0 * kwhRate
+				// Find this worker's coin's earnings per day
+				for _, cs := range snap.Coins {
+					if cs.Symbol == sym && cs.HashrateKHs > 0 && cs.EarningsPerDayUSD > 0 {
+						fraction := w.HashrateKHs / cs.HashrateKHs
+						ws.ProfitPerDayUSD = fraction*cs.EarningsPerDayUSD - ws.CostPerDayUSD
+						break
+					}
+				}
+			}
 			snap.Workers = append(snap.Workers, ws)
 		}
+	}
+
+	// After workers loop, compute totals for cost/profit
+	{
+		var totalCost, totalRevenue float64
+		for _, ws := range snap.Workers {
+			totalCost += ws.CostPerDayUSD
+		}
+		for _, cs := range snap.Coins {
+			totalRevenue += cs.EarningsPerDayUSD
+		}
+		snap.TotalCostPerDayUSD = totalCost
+		snap.TotalProfitPerDayUSD = totalRevenue - totalCost
+		snap.KwhRateUSD = cfg.Pool.KwhRateUSD
 	}
 
 	// Share difficulty history for telemetry chart
@@ -788,6 +1044,7 @@ collect:
 				Worker:    b.Worker,
 				FoundAt:   b.FoundAt.Format("Jan 2 15:04:05"),
 				FoundAtMS: b.FoundAt.UnixMilli(),
+				Luck:      b.BlockLuck,
 			})
 		}
 	}
@@ -863,6 +1120,35 @@ collect:
 			}
 		}
 		snap.ChainDiags = append(snap.ChainDiags, cd)
+	}
+
+	// Worker groups
+	if len(cfg.Pool.WorkerGroups) > 0 {
+		// Build worker lookup from snap.Workers
+		workerByName := make(map[string]dashboard.WorkerStat)
+		for _, ws := range snap.Workers {
+			workerByName[ws.Name] = ws
+		}
+		for groupName, memberNames := range cfg.Pool.WorkerGroups {
+			gs := dashboard.GroupStat{Name: groupName}
+			for _, memberName := range memberNames {
+				gs.WorkerCount++
+				if ws, ok := workerByName[memberName]; ok {
+					if ws.Online {
+						gs.OnlineCount++
+					}
+					gs.HashrateKHs += ws.HashrateKHs
+					gs.SharesAccepted += ws.SharesAccepted
+					gs.CostPerDayUSD += ws.CostPerDayUSD
+					gs.ProfitPerDayUSD += ws.ProfitPerDayUSD
+				}
+			}
+			snap.Groups = append(snap.Groups, gs)
+		}
+		// Sort groups by name for stable ordering
+		sort.Slice(snap.Groups, func(i, j int) bool {
+			return snap.Groups[i].Name < snap.Groups[j].Name
+		})
 	}
 
 	snap.Notifs = dashboard.NotifSettings{
@@ -1218,6 +1504,34 @@ func registerCtlHandlers(
 
 	ctlSrv.Register("version", func(args []string) ctl.Response {
 		return ctl.Response{OK: true, Message: fmt.Sprintf("PiPool v%s", version)}
+	})
+
+	// fixdiff <worker> <diff>  — pin a worker to a fixed vardiff target (0 = remove pin)
+	ctlSrv.Register("fixdiff", func(args []string) ctl.Response {
+		if len(args) < 2 {
+			return ctl.Response{OK: false, Message: "usage: fixdiff <worker> <diff>  (0 = remove pin)"}
+		}
+		workerName := args[0]
+		var diff float64
+		if _, err := fmt.Sscanf(args[1], "%f", &diff); err != nil || diff < 0 {
+			return ctl.Response{OK: false, Message: "diff must be a non-negative number"}
+		}
+		if cfg.Pool.WorkerFixedDiff == nil {
+			cfg.Pool.WorkerFixedDiff = make(map[string]float64)
+		}
+		if diff == 0 {
+			delete(cfg.Pool.WorkerFixedDiff, workerName)
+		} else {
+			cfg.Pool.WorkerFixedDiff[workerName] = diff
+		}
+		if err := config.Save(cfg, cfgPath); err != nil {
+			log.Printf("[ctl] fixdiff: save config: %v", err)
+			return ctl.Response{OK: false, Message: fmt.Sprintf("config save failed: %v", err)}
+		}
+		if diff == 0 {
+			return ctl.Response{OK: true, Message: fmt.Sprintf("fixed diff removed for %s — reverting to vardiff", workerName)}
+		}
+		return ctl.Response{OK: true, Message: fmt.Sprintf("worker %s pinned to difficulty %.4f (takes effect on next share)", workerName, diff)}
 	})
 }
 

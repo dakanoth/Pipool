@@ -77,6 +77,15 @@ type Registry struct {
 	NetworkDiff     LabeledGauge
 	BlockHeight     LabeledGauge
 
+	// Per-coin wallet balance
+	WalletBalance  LabeledGauge
+	WalletImmature LabeledGauge
+	// Per-coin share quality
+	RejectedShares LabeledCounter
+	StaleShares    LabeledCounter
+	// Per-worker hashrate
+	WorkerHashrateKHs LabeledGauge
+
 	// Per-device class (label = device name e.g. "Antminer S19")
 	DeviceCount LabeledGauge
 
@@ -86,15 +95,20 @@ type Registry struct {
 // NewRegistry creates a new metrics registry
 func NewRegistry() *Registry {
 	return &Registry{
-		ConnectedMiners: *NewLabeledGauge(),
-		HashrateKHs:     *NewLabeledGauge(),
-		BlocksFound:     *NewLabeledCounter(),
-		ValidShares:     *NewLabeledCounter(),
-		TotalShares:     *NewLabeledCounter(),
-		NetworkDiff:     *NewLabeledGauge(),
-		BlockHeight:     *NewLabeledGauge(),
-		DeviceCount:     *NewLabeledGauge(),
-		startTime:       time.Now(),
+		ConnectedMiners:   *NewLabeledGauge(),
+		HashrateKHs:       *NewLabeledGauge(),
+		BlocksFound:       *NewLabeledCounter(),
+		ValidShares:       *NewLabeledCounter(),
+		TotalShares:       *NewLabeledCounter(),
+		NetworkDiff:       *NewLabeledGauge(),
+		BlockHeight:       *NewLabeledGauge(),
+		WalletBalance:     *NewLabeledGauge(),
+		WalletImmature:    *NewLabeledGauge(),
+		RejectedShares:    *NewLabeledCounter(),
+		StaleShares:       *NewLabeledCounter(),
+		WorkerHashrateKHs: *NewLabeledGauge(),
+		DeviceCount:       *NewLabeledGauge(),
+		startTime:         time.Now(),
 	}
 }
 
@@ -154,6 +168,31 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeMeta(&b, "pipool_block_height", "gauge", "Current block height per coin")
 		for coin, v := range r.BlockHeight.GetAll() {
 			writeSample(&b, "pipool_block_height", map[string]string{"coin": coin}, v)
+		}
+
+		writeMeta(&b, "pipool_wallet_balance", "gauge", "Spendable wallet balance per coin")
+		for coin, v := range r.WalletBalance.GetAll() {
+			writeSample(&b, "pipool_wallet_balance", map[string]string{"coin": coin}, v)
+		}
+
+		writeMeta(&b, "pipool_wallet_immature", "gauge", "Immature coinbase balance per coin")
+		for coin, v := range r.WalletImmature.GetAll() {
+			writeSample(&b, "pipool_wallet_immature", map[string]string{"coin": coin}, v)
+		}
+
+		writeMeta(&b, "pipool_rejected_shares_total", "counter", "Total rejected shares per coin")
+		for coin, v := range r.RejectedShares.GetAll() {
+			writeSampleUint(&b, "pipool_rejected_shares_total", map[string]string{"coin": coin}, v)
+		}
+
+		writeMeta(&b, "pipool_stale_shares_total", "counter", "Total stale shares per coin")
+		for coin, v := range r.StaleShares.GetAll() {
+			writeSampleUint(&b, "pipool_stale_shares_total", map[string]string{"coin": coin}, v)
+		}
+
+		writeMeta(&b, "pipool_worker_hashrate_khs", "gauge", "Per-worker 5-minute rolling hashrate in KH/s")
+		for worker, v := range r.WorkerHashrateKHs.GetAll() {
+			writeSample(&b, "pipool_worker_hashrate_khs", map[string]string{"worker": worker}, v)
 		}
 
 		// ── Per-device metrics ────────────────────────────────────────────────
