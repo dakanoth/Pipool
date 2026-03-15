@@ -157,6 +157,8 @@ type SeenWorker struct {
 	ConnectedAt      time.Time
 	LastSeenAt       time.Time
 	Online           bool
+	LiveWatts float64  // live watts from miner HTTP API (0 = not available)
+	LiveTemp  float64  // live ASIC temp from miner HTTP API (0 = not available)
 }
 
 // ShareSample records a single submitted share for the difficulty chart
@@ -1858,6 +1860,7 @@ type WorkerInfo struct {
 	LastShareAt      time.Time // time of the most recent accepted share (zero if none)
 	Online           bool
 	WattsEstimate    float64   // estimated power consumption in watts (from RouterTable or manual override)
+	AsicTempC        float64   // live ASIC temperature from miner HTTP API (0 = not available)
 	DiffHistory      []DiffEvent
 }
 
@@ -1920,11 +1923,13 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			wi.LastShareAt   = seen.LastSeenAt
 			wi.DiffHistory   = seen.DiffHistory
 		}
-		// Get wattage: check manual override first, then device class lookup
-		watts := 0.0
-		if s.poolCfg.Pool.WorkerFixedWatts != nil {
-			if w, ok := s.poolCfg.Pool.WorkerFixedWatts[name]; ok {
-				watts = w
+		// Get wattage: live API data first, then manual override, then device class lookup
+		watts := seen.LiveWatts  // set by background poller if miner has HTTP API
+		if watts == 0 {
+			if s.poolCfg.Pool.WorkerFixedWatts != nil {
+				if w, ok := s.poolCfg.Pool.WorkerFixedWatts[name]; ok {
+					watts = w
+				}
 			}
 		}
 		if watts == 0 {
@@ -1936,10 +1941,27 @@ func (s *Server) AllWorkers() []WorkerInfo {
 				}
 			}
 		}
+		if watts == 0 && seen.DeviceName != "" {
+			// Device not in RouterTable (e.g. "Unknown (Scrypt)") — use the algorithm default
+			watts = defaultDevice(s.coin.Algorithm).WattsEstimate
+		}
 		wi.WattsEstimate = watts
+		if seen.LiveTemp > 0 {
+			wi.AsicTempC = seen.LiveTemp
+		}
 		out = append(out, wi)
 	}
 	return out
+}
+
+// SetLiveWatts updates the live power and temperature for a worker from the miner's HTTP API.
+func (s *Server) SetLiveWatts(workerName string, watts, temp float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sw, ok := s.seenWorkers[workerName]; ok {
+		sw.LiveWatts = watts
+		sw.LiveTemp = temp
+	}
 }
 
 // Coin returns the coin symbol this server is mining.

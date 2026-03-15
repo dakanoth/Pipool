@@ -222,6 +222,25 @@ type ConfigEditorData struct {
 	AutoKickMin     int                `json:"auto_kick_min_shares"`
 	WorkerFixedDiff map[string]float64 `json:"worker_fixed_diff"`  // worker → diff (0 = remove)
 	KwhRateUSD      float64            `json:"kwh_rate_usd"`
+
+	// Per-coin node settings
+	NodeHosts  map[string]string `json:"node_hosts"`  // coin → primary node host
+	NodePorts  map[string]int    `json:"node_ports"`  // coin → primary node port
+	NodeUsers  map[string]string `json:"node_users"`  // coin → rpc user
+	NodePasswords map[string]string `json:"node_passwords"` // coin → rpc password
+
+	// Per-coin backup node
+	BackupEnabled   map[string]bool   `json:"backup_enabled"`
+	BackupHosts     map[string]string `json:"backup_hosts"`
+	BackupPorts     map[string]int    `json:"backup_ports"`
+	BackupUsers     map[string]string `json:"backup_users"`
+	BackupPasswords map[string]string `json:"backup_passwords"`
+
+	// Per-coin upstream stratum fallback
+	UpstreamEnabled map[string]bool   `json:"upstream_enabled"`
+	UpstreamHosts   map[string]string `json:"upstream_hosts"`
+	UpstreamPorts   map[string]int    `json:"upstream_ports"`
+	UpstreamUsers   map[string]string `json:"upstream_users"`
 }
 
 // StatsFn returns the current pool snapshot
@@ -239,6 +258,7 @@ type Server struct {
 	getConfig       func() ConfigEditorData
 	setConfig       func(ConfigEditorData)
 	GetWorkerDetail func(coin, name string) *WorkerDetail
+	TriggerRestart  func()
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -272,6 +292,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/discord", s.handleDiscord)
 	mux.HandleFunc("/api/tag", s.handleTag)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/node/test", s.handleNodeTest)
+	mux.HandleFunc("/api/restart", s.handleRestartReq)
 	mux.HandleFunc("/api/worker/", s.handleWorkerDetail)
 
 	addr := fmt.Sprintf(":%d", s.port)
@@ -352,6 +374,84 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleNodeTest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	type rpcResult struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+		Height  int64  `json:"height,omitempty"`
+	}
+	url := fmt.Sprintf("http://%s:%d/", req.Host, req.Port)
+	body := `{"jsonrpc":"1.0","id":"test","method":"getblockcount","params":[]}`
+	httpReq, err := http.NewRequest("POST", url, strings.NewReader(body))
+	if err != nil {
+		json.NewEncoder(w).Encode(rpcResult{OK: false, Message: "bad request: " + err.Error()})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if req.User != "" {
+		httpReq.SetBasicAuth(req.User, req.Password)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		json.NewEncoder(w).Encode(rpcResult{OK: false, Message: "connection failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	var rpcResp struct {
+		Result interface{} `json:"result"`
+		Error  interface{} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		json.NewEncoder(w).Encode(rpcResult{OK: false, Message: "invalid response"})
+		return
+	}
+	if rpcResp.Error != nil {
+		json.NewEncoder(w).Encode(rpcResult{OK: false, Message: fmt.Sprintf("node error: %v", rpcResp.Error)})
+		return
+	}
+	var height int64
+	switch v := rpcResp.Result.(type) {
+	case float64:
+		height = int64(v)
+	}
+	json.NewEncoder(w).Encode(rpcResult{OK: true, Message: fmt.Sprintf("Connected — block height %d", height), Height: height})
+}
+
+func (s *Server) handleRestartReq(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.TriggerRestart != nil {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			s.TriggerRestart()
+		}()
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "message": "PiPool restarting… back in a few seconds"})
+	} else {
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "message": "restart not available"})
 	}
 }
 
@@ -879,6 +979,19 @@ body::before {
 .cfg-fd-add { background:none; border:1px solid var(--bdr2); color:var(--dim); font-family:var(--scan); font-size:.58rem; padding:2px 10px; cursor:pointer; margin-top:6px; }
 .cfg-fd-add:hover { border-color:var(--hi2); color:var(--hi2); }
 .cfg-fd-del { background:none; border:none; color:var(--red); font-family:var(--vt); font-size:.9rem; cursor:pointer; padding:0 4px; line-height:1; }
+.node-cfg-coin { border:1px solid var(--bdr); padding:8px 10px; margin-bottom:8px; background:var(--off); }
+.node-cfg-coin-title { font-family:var(--scan); font-size:.65rem; color:var(--hi2); letter-spacing:2px; margin-bottom:6px; }
+.node-cfg-row { display:flex; align-items:center; gap:6px; margin-bottom:5px; flex-wrap:wrap; }
+.node-cfg-label { font-family:var(--scan); font-size:.56rem; color:var(--dim2); min-width:80px; letter-spacing:1px; }
+.node-cfg-host { background:var(--off); border:1px solid var(--bdr2); color:var(--hi); font-family:var(--scan); font-size:.6rem; padding:2px 6px; width:160px; }
+.node-cfg-port { background:var(--off); border:1px solid var(--bdr2); color:var(--hi); font-family:var(--scan); font-size:.6rem; padding:2px 6px; width:68px; }
+.node-cfg-user { background:var(--off); border:1px solid var(--bdr); color:var(--hi); font-family:var(--scan); font-size:.6rem; padding:2px 6px; width:100px; }
+.node-test-btn { background:none; border:1px solid var(--dim2); color:var(--dim); font-family:var(--scan); font-size:.56rem; padding:2px 8px; cursor:pointer; letter-spacing:1px; white-space:nowrap; }
+.node-test-btn:hover { border-color:var(--hi2); color:var(--hi2); }
+.node-test-ok { color:var(--hi2); font-family:var(--scan); font-size:.56rem; }
+.node-test-fail { color:var(--red); font-family:var(--scan); font-size:.56rem; }
+.node-enable-toggle { display:flex; align-items:center; gap:4px; cursor:pointer; font-family:var(--scan); font-size:.56rem; color:var(--dim); }
+.node-enable-toggle input { accent-color:var(--hi2); cursor:pointer; }
 
 /* ── LAYOUT ── */
 .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:16px; }
@@ -1075,35 +1188,34 @@ footer {
   </div>
 </div>
 
-<div class="row2">
-  <div class="section">
-    <div class="section-head">
-      <span class="section-title">WORKERS</span>
-      <span id="workerCount" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">0</span>
-      <span style="margin-left:auto;display:flex;gap:6px">
-        <button id="tabBtnActive" onclick="setWorkerTab('active')" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">ACTIVE</button>
-        <button id="tabBtnKnown" onclick="setWorkerTab('known')" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">KNOWN WORKERS</button>
-      </span>
-    </div>
-    <div class="section-body" style="padding:0">
-      <table class="workers-table" id="workersTable">
-        <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Hashrate</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Watts</th><th>Cost/Day</th><th>Profit/Day</th><th>Status</th>
-        </tr></thead>
-        <tbody id="workersBody">
-          <tr><td colspan="14" class="no-workers">No miners connected</td></tr>
-        </tbody>
-      </table>
-    </div>
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">WORKERS</span>
+    <span id="workerCount" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">0</span>
+    <span style="margin-left:auto;display:flex;gap:6px">
+      <button id="tabBtnActive" onclick="setWorkerTab('active')" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">ACTIVE</button>
+      <button id="tabBtnKnown" onclick="setWorkerTab('known')" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">KNOWN WORKERS</button>
+    </span>
   </div>
-  <div class="section">
-    <div class="section-head">
-      <span class="section-title">BLOCK LOG</span>
-      <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">This session</span>
-    </div>
-    <div class="section-body" id="blockLog">
-      <div class="no-blocks">No blocks found this session.<br>Keep hashing.</div>
-    </div>
+  <div class="section-body" style="padding:0;overflow-x:auto">
+    <table class="workers-table" id="workersTable" style="min-width:900px">
+      <thead><tr>
+        <th>Worker</th><th>Coin</th><th>Diff</th><th>Hashrate</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Watts</th><th>Cost/Day</th><th>Profit/Day</th><th>Status</th>
+      </tr></thead>
+      <tbody id="workersBody">
+        <tr><td colspan="13" class="no-workers">No miners connected</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">BLOCK LOG</span>
+    <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">This session</span>
+  </div>
+  <div class="section-body" id="blockLog">
+    <div class="no-blocks">No blocks found this session.<br>Keep hashing.</div>
   </div>
 </div>
 
@@ -1268,9 +1380,19 @@ footer {
         <button class="cfg-fd-add" onclick="cfgFdAddRow('','')">+ ADD WORKER</button>
       </div>
 
+      <div class="cfg-group" style="grid-column:1/-1">
+        <div class="cfg-group-title">NODE SETTINGS</div>
+        <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);margin-bottom:8px">
+          Change which node PiPool connects to. After saving, click APPLY &amp; RESTART to reconnect.
+        </div>
+        <div id="cfgNodes"></div>
+      </div>
+
     </div>
-    <div style="margin-top:14px">
+    <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button class="cfg-save-btn" onclick="saveCfg()">SAVE SETTINGS</button>
+      <button class="cfg-save-btn" id="cfgRestartBtn" onclick="applyAndRestart()" style="background:var(--off);border-color:var(--amber);color:var(--amber);display:none">APPLY &amp; RESTART</button>
+      <span id="cfgRestartStatus" style="font-family:var(--scan);font-size:.6rem;color:var(--dim2)"></span>
     </div>
   </div>
 </div>
@@ -1902,8 +2024,8 @@ function renderWorkersTab(s) {
   var tbody = document.getElementById('workersBody');
   if (workers.length === 0) {
     tbody.innerHTML = workerTab === 'active'
-      ? '<tr><td colspan="14" class="no-workers">NO MINERS CONNECTED</td></tr>'
-      : '<tr><td colspan="14" class="no-workers">NO KNOWN OFFLINE WORKERS</td></tr>';
+      ? '<tr><td colspan="13" class="no-workers">NO MINERS CONNECTED</td></tr>'
+      : '<tr><td colspan="13" class="no-workers">NO KNOWN OFFLINE WORKERS</td></tr>';
     return;
   }
   // Build map of primary coin → merge-mined children
@@ -1964,7 +2086,6 @@ function renderWorkersTab(s) {
       '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
       '<td>'+diffHtml+'</td>' +
       '<td>'+hrHtml+'</td>' +
-      '<td><span class="shares-val">'+total.toLocaleString()+'</span></td>' +
       '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
       '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
       '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
@@ -2506,6 +2627,67 @@ function applyCfg(c) {
     var fd = c.worker_fixed_diff || {};
     Object.keys(fd).sort().forEach(function(w) { cfgFdAddRow(w, fd[w]); });
   }
+
+  // Node settings
+  var nodesDiv = document.getElementById('cfgNodes');
+  if (nodesDiv) {
+    nodesDiv.innerHTML = '';
+    var nodeHosts = c.node_hosts || {};
+    var nodePorts = c.node_ports || {};
+    var nodeUsers = c.node_users || {};
+    var nodePws = c.node_passwords || {};
+    var bkEnabled = c.backup_enabled || {};
+    var bkHosts = c.backup_hosts || {};
+    var bkPorts = c.backup_ports || {};
+    var bkUsers = c.backup_users || {};
+    var bkPws = c.backup_passwords || {};
+    var upEnabled = c.upstream_enabled || {};
+    var upHosts = c.upstream_hosts || {};
+    var upPorts = c.upstream_ports || {};
+    var upUsers = c.upstream_users || {};
+    var coinList = Object.keys(nodeHosts).sort();
+    coinList.forEach(function(sym) {
+      var div = document.createElement('div');
+      div.className = 'node-cfg-coin';
+      var bkOn = bkEnabled[sym] ? 'checked' : '';
+      var upOn = upEnabled[sym] ? 'checked' : '';
+      div.innerHTML =
+        '<div class="node-cfg-coin-title">'+sym+'</div>'+
+        // Primary node
+        '<div class="node-cfg-row">'+
+          '<div class="node-cfg-label">PRIMARY NODE</div>'+
+          '<input class="node-cfg-host" id="nHost_'+sym+'" placeholder="host/IP" value="'+(nodeHosts[sym]||'')+'">'+
+          '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>'+
+          '<input class="node-cfg-port" id="nPort_'+sym+'" type="number" placeholder="port" value="'+(nodePorts[sym]||0)+'">'+
+          '<input class="node-cfg-user" id="nUser_'+sym+'" placeholder="rpc user" value="'+(nodeUsers[sym]||'')+'">'+
+          '<input class="node-cfg-user" id="nPass_'+sym+'" type="password" placeholder="rpc pass" value="'+(nodePws[sym]||'')+'" autocomplete="new-password">'+
+          '<button class="node-test-btn" onclick="testNode(\''+sym+'\',\'primary\')">TEST</button>'+
+          '<span class="node-test-ok" id="nTest_'+sym+'_primary"></span>'+
+        '</div>'+
+        // Backup node
+        '<div class="node-cfg-row">'+
+          '<div class="node-cfg-label">BACKUP NODE</div>'+
+          '<label class="node-enable-toggle"><input type="checkbox" id="bkEnabled_'+sym+'" '+bkOn+'> ENABLED</label>'+
+          '<input class="node-cfg-host" id="bkHost_'+sym+'" placeholder="host/IP" value="'+(bkHosts[sym]||'')+'">'+
+          '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>'+
+          '<input class="node-cfg-port" id="bkPort_'+sym+'" type="number" placeholder="port" value="'+(bkPorts[sym]||0)+'">'+
+          '<input class="node-cfg-user" id="bkUser_'+sym+'" placeholder="rpc user" value="'+(bkUsers[sym]||'')+'">'+
+          '<input class="node-cfg-user" id="bkPass_'+sym+'" type="password" placeholder="rpc pass" value="'+(bkPws[sym]||'')+'" autocomplete="new-password">'+
+          '<button class="node-test-btn" onclick="testNode(\''+sym+'\',\'backup\')">TEST</button>'+
+          '<span class="node-test-ok" id="nTest_'+sym+'_backup"></span>'+
+        '</div>'+
+        // Upstream pool
+        '<div class="node-cfg-row">'+
+          '<div class="node-cfg-label">UPSTREAM POOL</div>'+
+          '<label class="node-enable-toggle"><input type="checkbox" id="upEnabled_'+sym+'" '+upOn+'> ENABLED</label>'+
+          '<input class="node-cfg-host" id="upHost_'+sym+'" placeholder="pool host" value="'+(upHosts[sym]||'')+'">'+
+          '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>'+
+          '<input class="node-cfg-port" id="upPort_'+sym+'" type="number" placeholder="port" value="'+(upPorts[sym]||0)+'">'+
+          '<input class="node-cfg-user" id="upUser_'+sym+'" placeholder="username" value="'+(upUsers[sym]||'')+'">'+
+        '</div>';
+      nodesDiv.appendChild(div);
+    });
+  }
 }
 
 function cfgFdAddRow(worker, diff) {
@@ -2552,6 +2734,27 @@ function saveCfg() {
     if (name && d > 0) fd[name] = d;
   });
 
+  // Collect node settings
+  var nodeHosts = {}, nodePorts = {}, nodeUsers = {}, nodePws = {};
+  var bkEnabled = {}, bkHosts = {}, bkPorts = {}, bkUsers = {}, bkPws = {};
+  var upEnabled = {}, upHosts = {}, upPorts = {}, upUsers = {};
+  var nodeCoins = Object.keys(cfgState.node_hosts || {});
+  nodeCoins.forEach(function(sym) {
+    var h = document.getElementById('nHost_'+sym);    if (h) nodeHosts[sym] = h.value.trim();
+    var p = document.getElementById('nPort_'+sym);    if (p) nodePorts[sym] = parseInt(p.value)||0;
+    var u = document.getElementById('nUser_'+sym);    if (u) nodeUsers[sym] = u.value.trim();
+    var pw= document.getElementById('nPass_'+sym);    if (pw) nodePws[sym] = pw.value;
+    var be= document.getElementById('bkEnabled_'+sym); if (be) bkEnabled[sym] = be.checked;
+    var bh= document.getElementById('bkHost_'+sym);    if (bh) bkHosts[sym] = bh.value.trim();
+    var bp= document.getElementById('bkPort_'+sym);    if (bp) bkPorts[sym] = parseInt(bp.value)||0;
+    var bu= document.getElementById('bkUser_'+sym);    if (bu) bkUsers[sym] = bu.value.trim();
+    var bpw=document.getElementById('bkPass_'+sym);    if (bpw) bkPws[sym] = bpw.value;
+    var ue= document.getElementById('upEnabled_'+sym); if (ue) upEnabled[sym] = ue.checked;
+    var uh= document.getElementById('upHost_'+sym);    if (uh) upHosts[sym] = uh.value.trim();
+    var up= document.getElementById('upPort_'+sym);    if (up) upPorts[sym] = parseInt(up.value)||0;
+    var uu= document.getElementById('upUser_'+sym);    if (uu) upUsers[sym] = uu.value.trim();
+  });
+
   var payload = {
     temp_limit_c:       parseInt(document.getElementById('cfgTempLimit').value)||75,
     worker_timeout_s:   parseInt(document.getElementById('cfgWorkerTimeout').value)||120,
@@ -2562,7 +2765,10 @@ function saveCfg() {
     vardiff_min:        vmins,
     vardiff_max:        vmaxs,
     worker_fixed_diff:  fd,
-    kwh_rate_usd:       parseFloat(document.getElementById('cfgKwhRate').value) || 0
+    kwh_rate_usd:       parseFloat(document.getElementById('cfgKwhRate').value) || 0,
+    node_hosts: nodeHosts, node_ports: nodePorts, node_users: nodeUsers, node_passwords: nodePws,
+    backup_enabled: bkEnabled, backup_hosts: bkHosts, backup_ports: bkPorts, backup_users: bkUsers, backup_passwords: bkPws,
+    upstream_enabled: upEnabled, upstream_hosts: upHosts, upstream_ports: upPorts, upstream_users: upUsers
   };
 
   // Currency preference is client-side only — save to localStorage
@@ -2583,11 +2789,63 @@ function saveCfg() {
   }).then(function(r) {
     if (status) status.textContent = r.ok ? 'SAVED' : 'ERROR';
     setTimeout(function(){ if(status) status.textContent = 'CONFIG EDITOR'; }, 3000);
-    if (r.ok) fetch('/api/config').then(function(r2){return r2.json();}).then(applyCfg);
+    if (r.ok) {
+      fetch('/api/config').then(function(r2){return r2.json();}).then(applyCfg);
+      var rb = document.getElementById('cfgRestartBtn');
+      if (rb) rb.style.display = 'inline-block';
+    }
   }).catch(function() {
     if (status) status.textContent = 'ERROR';
     setTimeout(function(){ if(status) status.textContent = 'CONFIG EDITOR'; }, 3000);
   });
+}
+
+function testNode(sym, which) {
+  var prefix = which === 'backup' ? 'bk' : 'n';
+  var hostEl = document.getElementById(prefix+'Host_'+sym);
+  var portEl = document.getElementById(prefix+'Port_'+sym);
+  var userEl = document.getElementById(prefix+'User_'+sym);
+  var passEl = document.getElementById(prefix+'Pass_'+sym);
+  var statusEl = document.getElementById('nTest_'+sym+'_'+which);
+  if (!hostEl || !portEl || !statusEl) return;
+  var host = hostEl.value.trim();
+  var port = parseInt(portEl.value)||0;
+  if (!host || !port) { statusEl.textContent = 'enter host:port first'; statusEl.className = 'node-test-fail'; return; }
+  statusEl.textContent = 'testing…'; statusEl.className = 'node-test-ok';
+  fetch('/api/node/test', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({host:host, port:port, user:userEl?userEl.value.trim():'', password:passEl?passEl.value:''})
+  }).then(function(r){return r.json();}).then(function(d) {
+    statusEl.textContent = d.ok ? '✓ '+d.message : '✗ '+d.message;
+    statusEl.className = d.ok ? 'node-test-ok' : 'node-test-fail';
+  }).catch(function(e) {
+    statusEl.textContent = '✗ request failed';
+    statusEl.className = 'node-test-fail';
+  });
+}
+
+function applyAndRestart() {
+  var btn = document.getElementById('cfgRestartBtn');
+  var sts = document.getElementById('cfgRestartStatus');
+  if (btn) btn.disabled = true;
+  if (sts) sts.textContent = 'Restarting…';
+  fetch('/api/restart', {method:'POST'})
+    .then(function(r){return r.json();})
+    .then(function(d) {
+      if (sts) sts.textContent = d.message || 'Restarting…';
+      // Poll for reconnect
+      setTimeout(function pollBack() {
+        fetch('/api/stats').then(function(){
+          if (sts) sts.textContent = 'Back online!';
+          if (btn) { btn.disabled = false; btn.style.display = 'none'; }
+          setTimeout(function(){ if(sts) sts.textContent = ''; }, 3000);
+        }).catch(function(){ setTimeout(pollBack, 1500); });
+      }, 2000);
+    }).catch(function() {
+      if (sts) sts.textContent = 'Restart failed';
+      if (btn) btn.disabled = false;
+    });
 }
 // ── Worker detail modal ──────────────────────────────────────────────────
 function openWorkerModal(coin, name) {

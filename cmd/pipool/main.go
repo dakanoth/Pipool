@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -489,6 +490,46 @@ func main() {
 		}
 	}()
 
+	// ─── Live power polling (miner HTTP API) ─────────────────────────────────
+	go func() {
+		powerClient := &http.Client{Timeout: 3 * time.Second}
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, srv := range servers {
+				for _, w := range srv.AllWorkers() {
+					if !w.Online {
+						continue
+					}
+					w := w // capture for goroutine
+					srv := srv
+					go func() {
+						host, _, err := net.SplitHostPort(w.RemoteAddr)
+						if err != nil {
+							return
+						}
+						url := "http://" + host + "/api/system/info"
+						resp, err := powerClient.Get(url)
+						if err != nil {
+							log.Printf("[power] %s: HTTP error: %v", w.Name, err)
+							return
+						}
+						defer resp.Body.Close()
+						var info struct {
+							Power float64 `json:"power"`
+							Temp  float64 `json:"temp"`
+						}
+						if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+							log.Printf("[power] %s: decode error: %v", w.Name, err)
+							return
+						}
+						srv.SetLiveWatts(w.Name, info.Power, info.Temp)
+					}()
+				}
+			}
+		}
+	}()
+
 	// ─── Metrics registry ─────────────────────────────────────────────────────
 	reg := metrics.NewRegistry()
 
@@ -681,10 +722,40 @@ func main() {
 				wallets := make(map[string]string)
 				vmin := make(map[string]float64)
 				vmax := make(map[string]float64)
+				nodeHosts := make(map[string]string)
+				nodePorts := make(map[string]int)
+				nodeUsers := make(map[string]string)
+				nodePws := make(map[string]string)
+				bkEnabled := make(map[string]bool)
+				bkHosts := make(map[string]string)
+				bkPorts := make(map[string]int)
+				bkUsers := make(map[string]string)
+				bkPws := make(map[string]string)
+				upEnabled := make(map[string]bool)
+				upHosts := make(map[string]string)
+				upPorts := make(map[string]int)
+				upUsers := make(map[string]string)
 				for sym, cc := range cfg.Coins {
 					wallets[sym] = cc.Wallet
 					vmin[sym] = cc.Stratum.Vardiff.MinDiff
 					vmax[sym] = cc.Stratum.Vardiff.MaxDiff
+					nodeHosts[sym] = cc.Node.Host
+					nodePorts[sym] = cc.Node.Port
+					nodeUsers[sym] = cc.Node.User
+					nodePws[sym] = cc.Node.Password
+					if cc.BackupNode != nil {
+						bkEnabled[sym] = true
+						bkHosts[sym] = cc.BackupNode.Host
+						bkPorts[sym] = cc.BackupNode.Port
+						bkUsers[sym] = cc.BackupNode.User
+						bkPws[sym] = cc.BackupNode.Password
+					} else {
+						bkEnabled[sym] = false
+					}
+					upEnabled[sym] = cc.UpstreamPool.Enabled
+					upHosts[sym] = cc.UpstreamPool.Host
+					upPorts[sym] = cc.UpstreamPool.Port
+					upUsers[sym] = cc.UpstreamPool.User
 				}
 				return dashboard.ConfigEditorData{
 					TempLimitC:      cfg.Pool.TempLimitC,
@@ -697,6 +768,12 @@ func main() {
 					AutoKickMin:     cfg.Pool.AutoKickMinShares,
 					WorkerFixedDiff: cfg.Pool.WorkerFixedDiff,
 					KwhRateUSD:      cfg.Pool.KwhRateUSD,
+					NodeHosts: nodeHosts, NodePorts: nodePorts,
+					NodeUsers: nodeUsers, NodePasswords: nodePws,
+					BackupEnabled: bkEnabled, BackupHosts: bkHosts, BackupPorts: bkPorts,
+					BackupUsers: bkUsers, BackupPasswords: bkPws,
+					UpstreamEnabled: upEnabled, UpstreamHosts: upHosts, UpstreamPorts: upPorts,
+					UpstreamUsers: upUsers,
 				}
 			},
 			// Config editor: SET and persist
@@ -737,6 +814,45 @@ func main() {
 						cfg.Coins[sym] = cc
 					}
 				}
+				// Apply node settings
+				for sym, host := range cd.NodeHosts {
+					if cc, ok := cfg.Coins[sym]; ok {
+						cc.Node.Host = host
+						if p, ok2 := cd.NodePorts[sym]; ok2 { cc.Node.Port = p }
+						if u, ok2 := cd.NodeUsers[sym]; ok2 { cc.Node.User = u }
+						if pw, ok2 := cd.NodePasswords[sym]; ok2 && pw != "" { cc.Node.Password = pw }
+						cfg.Coins[sym] = cc
+					}
+				}
+				for sym, enabled := range cd.BackupEnabled {
+					if cc, ok := cfg.Coins[sym]; ok {
+						if enabled {
+							bkHost := cd.BackupHosts[sym]
+							bkPort := cd.BackupPorts[sym]
+							if bkHost != "" && bkPort > 0 {
+								if cc.BackupNode == nil {
+									cc.BackupNode = &config.NodeConf{}
+								}
+								cc.BackupNode.Host = bkHost
+								cc.BackupNode.Port = bkPort
+								if u, ok2 := cd.BackupUsers[sym]; ok2 { cc.BackupNode.User = u }
+								if pw, ok2 := cd.BackupPasswords[sym]; ok2 && pw != "" { cc.BackupNode.Password = pw }
+							}
+						} else {
+							cc.BackupNode = nil
+						}
+						cfg.Coins[sym] = cc
+					}
+				}
+				for sym, enabled := range cd.UpstreamEnabled {
+					if cc, ok := cfg.Coins[sym]; ok {
+						cc.UpstreamPool.Enabled = enabled
+						if h, ok2 := cd.UpstreamHosts[sym]; ok2 { cc.UpstreamPool.Host = h }
+						if p, ok2 := cd.UpstreamPorts[sym]; ok2 { cc.UpstreamPool.Port = p }
+						if u, ok2 := cd.UpstreamUsers[sym]; ok2 { cc.UpstreamPool.User = u }
+						cfg.Coins[sym] = cc
+					}
+				}
 				if err := config.Save(cfg, *cfgPath); err != nil {
 					log.Printf("[dashboard] config save failed: %v", err)
 				} else {
@@ -744,6 +860,11 @@ func main() {
 				}
 			},
 		)
+		// Wire restart callback
+		dash.TriggerRestart = func() {
+			log.Printf("[dashboard] restart requested via node picker")
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}
 		// Wire GetWorkerDetail callback
 		dash.GetWorkerDetail = func(coin, name string) *dashboard.WorkerDetail {
 			for _, srv := range servers {
@@ -1122,11 +1243,13 @@ collect:
 		}
 	}
 
-	// After workers loop, compute totals for cost/profit
+	// After workers loop, compute totals for cost/profit (online workers only)
 	{
 		var totalCost, totalRevenue float64
 		for _, ws := range snap.Workers {
-			totalCost += ws.CostPerDayUSD
+			if ws.Online {
+				totalCost += ws.CostPerDayUSD
+			}
 		}
 		for _, cs := range snap.Coins {
 			totalRevenue += cs.EarningsPerDayUSD

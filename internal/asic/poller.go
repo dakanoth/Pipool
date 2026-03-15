@@ -45,8 +45,10 @@ func classify(deviceName string) string {
 func Poll(ip, deviceName string, timeout time.Duration) (*Health, error) {
 	client := &http.Client{Timeout: timeout}
 	switch classify(deviceName) {
-	case "hammer", "bitaxe", "generic":
-		return pollBitaxeHammer(client, ip)
+	case "bitaxe", "generic":
+		return pollBitaxeHammer(client, ip, true) // hashRate field is GH/s
+	case "hammer":
+		return pollBitaxeHammer(client, ip, false) // hashRate field is MH/s
 	case "goldshell":
 		return pollGoldshell(client, ip)
 	case "elphapex":
@@ -71,7 +73,9 @@ type hammerInfoResp struct {
 	DeviceModel    string  `json:"DeviceModel"`
 }
 
-func pollBitaxeHammer(client *http.Client, ip string) (*Health, error) {
+// pollBitaxeHammer polls /api/system/info. isGHs=true when the device reports
+// hashRate in GH/s (Bitaxe); false when it reports in MH/s (Hammer D9).
+func pollBitaxeHammer(client *http.Client, ip string, isGHs bool) (*Health, error) {
 	resp, err := client.Get("http://" + ip + "/api/system/info")
 	if err != nil {
 		return nil, err
@@ -95,8 +99,13 @@ func pollBitaxeHammer(client *http.Client, ip string) (*Health, error) {
 		PoolURL:     info.StratumURL,
 		FanPct:      int(info.Fanspeed),
 		FanRPM:      int(info.Fanrpm),
-		// hashRate is GH/s for both Bitaxe and Hammer; convert to KH/s
-		HashrateKHs: info.HashRate * 1_000_000,
+		// Bitaxe reports hashRate in GH/s; Hammer reports in MH/s
+		HashrateKHs: func() float64 {
+			if isGHs {
+				return info.HashRate * 1_000_000 // GH/s → KH/s
+			}
+			return info.HashRate * 1_000 // MH/s → KH/s
+		}(),
 	}
 	h.TempC = info.Temp
 	if info.Temp1 > h.TempC {

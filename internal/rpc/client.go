@@ -188,12 +188,13 @@ func (c *Client) GetNetworkHashPS() (float64, error) {
 
 // GetMiningInfo returns daemon mining info
 type MiningInfo struct {
-	Blocks           int64   `json:"blocks"`
-	Difficulty       float64 `json:"difficulty"`
-	NetworkHashPS    float64 `json:"networkhashps"`
-	PooledTx         int     `json:"pooledtx"`
-	Chain            string  `json:"chain"`
-	Warnings         string  `json:"warnings"`
+	Blocks           int64              `json:"blocks"`
+	Difficulty       float64            `json:"difficulty"`
+	Difficulties     map[string]float64 `json:"difficulties"` // DGB multi-algo: per-algo difficulties
+	NetworkHashPS    float64            `json:"networkhashps"`
+	PooledTx         int                `json:"pooledtx"`
+	Chain            string             `json:"chain"`
+	Warnings         string             `json:"warnings"`
 }
 
 func (c *Client) GetMiningInfo() (*MiningInfo, error) {
