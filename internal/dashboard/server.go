@@ -1269,9 +1269,10 @@ function fmtHash(khs) {
 
 function fmtDiff(d) {
   if (!d) return '0';
+  if (d >= 1e9) return (d/1e9).toFixed(2)+'G';
   if (d >= 1e6) return (d/1e6).toFixed(2)+'M';
   if (d >= 1e3) return (d/1e3).toFixed(2)+'K';
-  return d.toFixed(4);
+  return d.toFixed(3);
 }
 
 function fmtDuration(sec) {
@@ -2568,13 +2569,7 @@ function drawBarChart(canvasId, values, color) {
     ctx.fillRect(i*bw+1, H-bh, bw-2, bh);
   }
 }
-function fmtDiff(v) {
-  if (!v) return '0';
-  if (v >= 1e9) return (v/1e9).toFixed(2)+'G';
-  if (v >= 1e6) return (v/1e6).toFixed(2)+'M';
-  if (v >= 1e3) return (v/1e3).toFixed(2)+'K';
-  return v.toFixed(3);
-}
+
 </script>
 <!-- Worker detail modal -->
 <div id="worker-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;overflow-y:auto;">

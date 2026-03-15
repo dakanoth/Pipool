@@ -87,10 +87,12 @@ var RouterTable = []deviceSignature{
 	{"jasminer x16", DeviceClass{"Jasminer X16", "sha256d", 131072, 1048576, "Jasminer X16 ~130 TH/s", 1720}},
 
 	// ── Elphapex (Scrypt) ─────────────────────────────────────────────────────
-	{"elphapex dg home 1", DeviceClass{"Elphapex DG Home 1", "scrypt", 512, 4096, "Elphapex DG Home 1 ~2 GH/s", 1200}},
-	{"elphapex dg1+", DeviceClass{"Elphapex DG1+", "scrypt", 2048, 16384, "Elphapex DG1+ ~11 GH/s", 3300}},
-	{"elphapex dg1", DeviceClass{"Elphapex DG1", "scrypt", 2048, 16384, "Elphapex DG1 ~11 GH/s", 3300}},
-	{"elphapex", DeviceClass{"Elphapex", "scrypt", 512, 4096, "Elphapex (generic)", 1200}},
+	// DG Home 1 ~2 GH/s → diff for 30s shares ≈ 64. StartDiff 64, MaxDiff 1024.
+	{"elphapex dg home 1", DeviceClass{"Elphapex DG Home 1", "scrypt", 64, 1024, "Elphapex DG Home 1 ~2 GH/s", 1200}},
+	// DG1 / DG1+ ~11 GH/s → diff for 30s shares ≈ 350. StartDiff 256, MaxDiff 4096.
+	{"elphapex dg1+", DeviceClass{"Elphapex DG1+", "scrypt", 256, 4096, "Elphapex DG1+ ~11 GH/s", 3300}},
+	{"elphapex dg1", DeviceClass{"Elphapex DG1", "scrypt", 256, 4096, "Elphapex DG1 ~11 GH/s", 3300}},
+	{"elphapex", DeviceClass{"Elphapex", "scrypt", 64, 1024, "Elphapex (generic)", 1200}},
 
 	// ── Hammer / iPollo / Innosilicon (Scrypt) ───────────────────────────────
 	{"hammer d9", DeviceClass{"Hammer D9", "scrypt", 4096, 32768, "Hammer D9 Scrypt", 3068}},

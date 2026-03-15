@@ -919,6 +919,15 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 				if mi, err2 := cli.GetMiningInfo(); err2 == nil {
 					cs.Difficulty = mi.Difficulty
 				}
+				// DGB/DGBS multi-algo: getmininginfo returns any algo's diff.
+				// Prefer LastNetworkDiff from the block template, which is algo-specific.
+				if sym == "DGB" || sym == "DGBS" {
+					if srv, ok := srvMap[sym]; ok {
+						if nd := srv.Stats().LastNetworkDiff; nd > 0 {
+							cs.Difficulty = nd
+						}
+					}
+				}
 				if wi, err3 := cli.GetWalletInfo(); err3 == nil {
 					cs.BalanceConfirmed = wi.Balance
 					cs.BalanceImmature = wi.ImmatureBalance

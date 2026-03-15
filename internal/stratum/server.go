@@ -248,6 +248,11 @@ func (s *Server) Start() error {
 	// Start block template poller — recovers from panics internally
 	go s.pollBlockTemplate()
 
+	// Time-based vardiff decay — lowers difficulty for miners that connect at a
+	// too-high StartDiff and never submit shares (vardiff normally only triggers
+	// on share submissions, so without this such miners would be stuck forever).
+	go s.idleVardiffDecay()
+
 	// Accept miner connections
 	go func() {
 		for {
@@ -1655,6 +1660,68 @@ func (s *Server) decayVardiff(w *Worker) {
 	log.Printf("[%s] vardiff decay: %s difficulty %.4g → %.4g (no accepted share in %.0fs)",
 		s.coin.Symbol, w.workerName, w.difficulty*2, newDiff, decayWindow.Seconds())
 	s.sendDifficulty(w, newDiff)
+}
+
+// idleVardiffDecay runs as a background goroutine and halves the difficulty of
+// workers that have been connected for a full retarget window without submitting
+// any shares. This handles the case where a miner's StartDiff is too high for
+// its actual hashrate — without this, vardiff never runs because it is only
+// triggered by submitted shares.
+func (s *Server) idleVardiffDecay() {
+	vd := s.coin.Stratum.Vardiff
+	retarget := time.Duration(vd.RetargetS) * time.Second
+	ticker := time.NewTicker(retarget)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+
+		type adj struct {
+			w       *Worker
+			newDiff float64
+		}
+		var adjustments []adj
+
+		s.mu.Lock()
+		for _, w := range s.workers {
+			if !w.authorized || w.fixedDiff > 0 {
+				continue
+			}
+			if w.sharesSinceRetarget > 0 {
+				continue // active miner — adjustVardiff handles it
+			}
+			if time.Since(w.lastRetargetAt) < retarget {
+				continue
+			}
+			newDiff := w.difficulty / 2
+			if newDiff < vd.MinDiff {
+				newDiff = vd.MinDiff
+			}
+			if newDiff == w.difficulty {
+				w.lastRetargetAt = time.Now()
+				continue
+			}
+			w.prevDifficulty = 0
+			w.difficulty = newDiff
+			w.lastRetargetAt = time.Now()
+			ev := DiffEvent{Diff: newDiff, AtMS: time.Now().UnixMilli()}
+			w.diffHistory = append(w.diffHistory, ev)
+			if len(w.diffHistory) > 100 {
+				w.diffHistory = w.diffHistory[len(w.diffHistory)-100:]
+			}
+			adjustments = append(adjustments, adj{w, newDiff})
+		}
+		s.mu.Unlock()
+
+		for _, a := range adjustments {
+			log.Printf("[%s] idle vardiff decay: %s → %.4g (no shares in %v)",
+				s.coin.Symbol, a.w.workerName, a.newDiff, retarget)
+			s.sendDifficulty(a.w, a.newDiff)
+		}
+	}
 }
 
 // ─── Send helpers ─────────────────────────────────────────────────────────────
