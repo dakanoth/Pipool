@@ -73,6 +73,7 @@ type CoinConfig struct {
 	Wallet       string        `json:"wallet"`
 	BlockReward  float64       `json:"block_reward"`
 	TxFeeTarget  float64       `json:"tx_fee_target"`
+	BackupNode   *NodeConf     `json:"backup_node,omitempty"`
 	UpstreamPool UpstreamConf  `json:"upstream_pool"`
 }
 

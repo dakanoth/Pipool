@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -158,6 +159,25 @@ type WorkerStat struct {
 	WattsEstimate   float64 `json:"watts_estimate"`
 	CostPerDayUSD   float64 `json:"cost_per_day_usd"`
 	ProfitPerDayUSD float64 `json:"profit_per_day_usd"`
+	ASICTempC       float64 `json:"asic_temp_c"`
+	ASICFanRPM      int     `json:"asic_fan_rpm"`
+	ASICFanPct      int     `json:"asic_fan_pct"`
+	ASICPowerW      float64 `json:"asic_power_w"`
+	ASICHashrateKHs float64 `json:"asic_hashrate_khs"`
+	ASICError       string  `json:"asic_error,omitempty"`
+}
+
+// DiffEvent mirrors stratum.DiffEvent for JSON output (avoid import cycle by redefining).
+type DiffEvent struct {
+	Diff float64 `json:"diff"`
+	AtMS int64   `json:"at_ms"`
+}
+
+// WorkerDetail is the full data set returned by /api/worker/{coin}/{name} for the modal.
+type WorkerDetail struct {
+	WorkerStat
+	DiffHistory    []DiffEvent `json:"diff_history"`
+	ShareSparkline []int       `json:"share_sparkline"`
 }
 
 type BlockEvent struct {
@@ -218,6 +238,7 @@ type Server struct {
 	setCoinbaseTag  func(string)
 	getConfig       func() ConfigEditorData
 	setConfig       func(ConfigEditorData)
+	GetWorkerDetail func(coin, name string) *WorkerDetail
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -251,6 +272,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/discord", s.handleDiscord)
 	mux.HandleFunc("/api/tag", s.handleTag)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/worker/", s.handleWorkerDetail)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("[dashboard] http://0.0.0.0%s", addr)
@@ -331,6 +353,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleWorkerDetail(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// path: /api/worker/{coin}/{name}
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/worker/"), "/", 2)
+	if len(parts) != 2 || s.GetWorkerDetail == nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+	detail := s.GetWorkerDetail(parts[0], parts[1])
+	if detail == nil {
+		http.Error(w, "worker not found", 404)
+		return
+	}
+	json.NewEncoder(w).Encode(detail)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -1485,7 +1524,8 @@ function apply(s) {
       if (!a.online && b.online) return 1;
       return 0;
     });
-    tbody.innerHTML = sorted.map(function(w) {
+    tbody.innerHTML = '';
+    sorted.forEach(function(w) {
       var total = (w.shares_accepted||0)+(w.shares_rejected||0)+(w.shares_stale||0);
       var stalePct = total>0 ? ((w.shares_stale||0)/total*100).toFixed(2)+'%' : '0.00%';
       var invPct   = total>0 ? ((w.shares_rejected||0)/total*100).toFixed(2)+'%' : '0.00%';
@@ -1502,10 +1542,11 @@ function apply(s) {
       var workerShort = nameParts.length > 1 ? nameParts.slice(1).join('.') : nameParts[0];
       var addrAbbrev  = nameParts.length > 1 ? nameParts[0].substring(0,10)+'…' : '';
       var ip = (w.addr||'').replace(/:\d+$/, '');
+      var tempBadge = (w.asic_temp_c && w.asic_temp_c > 0) ? ' <span style="color:'+(w.asic_temp_c>=80?'#f44':w.asic_temp_c>=70?'#fa0':'#4af')+';font-size:.6rem">'+w.asic_temp_c.toFixed(0)+'°C</span>' : '';
       var deviceDisplay = w.user_agent
         ? '<span title="'+w.user_agent+'" style="cursor:help">'+(w.device||'')+'</span>'
         : (w.device||'');
-      var subLine = [deviceDisplay, addrAbbrev, ip].filter(Boolean).join(' · ');
+      var subLine = [deviceDisplay+tempBadge, addrAbbrev, ip].filter(Boolean).join(' · ');
       // Show merge children alongside primary coin (e.g. "LTC+DOGE", "BTC+BCH")
       var children = mergeChildren[w.coin];
       var coinLabel = children && children.length ? w.coin+'+'+children.join('+') : w.coin;
@@ -1526,7 +1567,11 @@ function apply(s) {
           profitStr = (profit >= 0 ? '+' : '')+' $'+Math.abs(profit).toFixed(3);
         }
       }
-      return '<tr class="'+(w.online?'':'worker-row-offline')+'">' +
+      var tr = document.createElement('tr');
+      if (!w.online) tr.className = 'worker-row-offline';
+      tr.style.cursor = 'pointer';
+      tr.onclick = (function(ww){ return function(){ openWorkerModal(ww.coin, ww.name); }; })(w);
+      tr.innerHTML =
         '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
         '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
         '<td>'+diffHtml+'</td>' +
@@ -1540,9 +1585,9 @@ function apply(s) {
         '<td><span class="shares-val">'+wattsStr+'</span></td>' +
         '<td><span class="shares-val">'+costStr+'</span></td>' +
         '<td><span class="'+profitCls+'">'+profitStr+'</span></td>' +
-        '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>' +
-        '</tr>';
-    }).join('');
+        '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>';
+      tbody.appendChild(tr);
+    });
   }
 
   var blocks = s.block_log||[];
@@ -2419,6 +2464,137 @@ function saveCfg() {
     setTimeout(function(){ if(status) status.textContent = 'CONFIG EDITOR'; }, 3000);
   });
 }
+// ── Worker detail modal ──────────────────────────────────────────────────
+function openWorkerModal(coin, name) {
+  document.getElementById('worker-modal').style.display = 'block';
+  document.getElementById('wm-title').textContent = name + ' (' + coin + ')';
+  document.getElementById('wm-meta').innerHTML = '<span style="color:#666">Loading...</span>';
+  fetch('/api/worker/' + encodeURIComponent(coin) + '/' + encodeURIComponent(name))
+    .then(function(r){ return r.json(); })
+    .then(function(d) { renderWorkerModal(d); })
+    .catch(function(e) {
+      document.getElementById('wm-meta').innerHTML = '<span style="color:#f66">Error loading worker data</span>';
+    });
+}
+function closeWorkerModal() {
+  document.getElementById('worker-modal').style.display = 'none';
+}
+document.getElementById('worker-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeWorkerModal();
+});
+function renderWorkerModal(d) {
+  var meta = document.getElementById('wm-meta');
+  var rows = [
+    ['Status', d.online ? '<span style="color:#4f4">ONLINE</span>' : '<span style="color:#f64">OFFLINE</span>'],
+    ['Address', d.addr || '—'],
+    ['Device', d.device || '—'],
+    ['User-Agent', (d.user_agent||'—').substring(0,40)],
+    ['Connected', d.connected_at || '—'],
+    ['Reconnects', d.reconnect_count],
+    ['Difficulty', fmtDiff(d.difficulty)],
+    ['Hashrate', fmtKHs(d.hashrate_khs)],
+    ['Shares', d.shares_accepted + ' acc / ' + d.shares_rejected + ' rej / ' + d.shares_stale + ' stale'],
+    ['Best Share', fmtDiff(d.best_share)],
+    ['Watts', d.watts_estimate > 0 ? d.watts_estimate.toFixed(0) + ' W' : '—'],
+  ];
+  meta.innerHTML = rows.map(function(r){ return '<div><span style="color:#666">'+r[0]+'</span><br><span style="color:#dde">'+r[1]+'</span></div>'; }).join('');
+  // Diff chart
+  drawLineChart('wm-diff-chart', (d.diff_history||[]).map(function(e){ return {x:e.at_ms, y:e.diff}; }), '#7090ff');
+  // Share sparkline
+  drawBarChart('wm-share-chart', d.share_sparkline||[], '#5fa');
+  // ASIC
+  var asicDiv = document.getElementById('wm-asic');
+  if (d.asic_temp_c > 0 || d.asic_power_w > 0) {
+    asicDiv.style.display = 'block';
+    var vals = [];
+    if (d.asic_temp_c > 0) vals.push('<span>🌡 ' + d.asic_temp_c.toFixed(1) + '°C</span>');
+    if (d.asic_fan_rpm > 0) vals.push('<span>💨 ' + d.asic_fan_rpm + ' RPM</span>');
+    if (d.asic_fan_pct > 0) vals.push('<span>Fan ' + d.asic_fan_pct + '%</span>');
+    if (d.asic_power_w > 0) vals.push('<span>⚡ ' + d.asic_power_w.toFixed(0) + ' W</span>');
+    if (d.asic_hashrate_khs > 0) vals.push('<span>⛏ ' + fmtKHs(d.asic_hashrate_khs) + '</span>');
+    document.getElementById('wm-asic-vals').innerHTML = vals.join('');
+  } else {
+    asicDiv.style.display = 'none';
+  }
+}
+function drawLineChart(canvasId, points, color) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas || !canvas.getContext) return;
+  var ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth || 640;
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!points || points.length < 2) {
+    ctx.fillStyle = '#444';
+    ctx.font = '12px monospace';
+    ctx.fillText('No data', W/2-25, H/2+4);
+    return;
+  }
+  var xs = points.map(function(p){return p.x;}), ys = points.map(function(p){return p.y;});
+  var minX = Math.min.apply(null,xs), maxX = Math.max.apply(null,xs);
+  var minY = Math.min.apply(null,ys), maxY = Math.max.apply(null,ys);
+  if (maxX===minX) maxX=minX+1;
+  if (maxY===minY) maxY=minY*2||1;
+  var pad = 4;
+  function px(x){ return pad + (x-minX)/(maxX-minX)*(W-2*pad); }
+  function py(y){ return H-pad - (y-minY)/(maxY-minY)*(H-2*pad); }
+  ctx.beginPath();
+  ctx.moveTo(px(xs[0]), py(ys[0]));
+  for (var i=1;i<points.length;i++) ctx.lineTo(px(xs[i]),py(ys[i]));
+  ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.stroke();
+  // Dots
+  ctx.fillStyle=color;
+  for (var i=0;i<points.length;i++){
+    ctx.beginPath(); ctx.arc(px(xs[i]),py(ys[i]),2,0,Math.PI*2); ctx.fill();
+  }
+  // Y-axis label
+  ctx.fillStyle='#666'; ctx.font='10px monospace';
+  ctx.fillText(fmtDiff(maxY), 2, 10);
+  ctx.fillText(fmtDiff(minY), 2, H-2);
+}
+function drawBarChart(canvasId, values, color) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas || !canvas.getContext) return;
+  var ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth || 640;
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!values || values.length === 0) return;
+  var maxV = Math.max.apply(null, values) || 1;
+  var bw = W / values.length;
+  for (var i=0;i<values.length;i++){
+    var bh = (values[i]/maxV) * (H-4);
+    ctx.fillStyle = color;
+    ctx.fillRect(i*bw+1, H-bh, bw-2, bh);
+  }
+}
+function fmtDiff(v) {
+  if (!v) return '0';
+  if (v >= 1e9) return (v/1e9).toFixed(2)+'G';
+  if (v >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (v >= 1e3) return (v/1e3).toFixed(2)+'K';
+  return v.toFixed(3);
+}
 </script>
+<!-- Worker detail modal -->
+<div id="worker-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;overflow-y:auto;">
+ <div style="background:#1a1a2e;border:1px solid #4a4a6a;border-radius:8px;max-width:700px;margin:40px auto;padding:24px;position:relative;">
+  <button onclick="closeWorkerModal()" style="position:absolute;top:12px;right:16px;background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;">✕</button>
+  <h2 id="wm-title" style="color:#e0e0ff;margin:0 0 16px;font-size:1.1rem;"></h2>
+  <div id="wm-meta" style="display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;margin-bottom:16px;font-size:.85rem;color:#aaa;"></div>
+  <div style="margin-bottom:16px;">
+   <div style="color:#aaa;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Difficulty History</div>
+   <canvas id="wm-diff-chart" height="80" style="width:100%;background:#111122;border-radius:4px;"></canvas>
+  </div>
+  <div style="margin-bottom:16px;">
+   <div style="color:#aaa;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Shares / Minute (last 30 min)</div>
+   <canvas id="wm-share-chart" height="60" style="width:100%;background:#111122;border-radius:4px;"></canvas>
+  </div>
+  <div id="wm-asic" style="display:none;margin-bottom:8px;">
+   <div style="color:#aaa;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">ASIC Health</div>
+   <div id="wm-asic-vals" style="display:flex;gap:16px;flex-wrap:wrap;font-size:.85rem;"></div>
+  </div>
+ </div>
+</div>
 </body>
 </html>`

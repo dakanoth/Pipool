@@ -75,6 +75,9 @@ type Server struct {
 	ln           net.Listener   // stored so Stop() can close the TCP port cleanly
 	wg           sync.WaitGroup // tracks active worker goroutines for graceful drain
 
+	backupRPC   *rpc.Client   // optional backup node RPC (nil if not configured)
+	usingBackup atomic.Bool   // true = currently reading templates from backup node
+
 	// Upstream proxy fallback — activated when the local node goes offline
 	upstream     *UpstreamProxy // nil = solo mode
 	proxyActive  atomic.Bool
@@ -118,6 +121,7 @@ type Worker struct {
 	lastRetargetAt      time.Time
 	sharesSinceRetarget uint64
 	fixedDiff           float64 // if > 0: skip vardiff and pin to this value
+	diffHistory  []DiffEvent  // last 100 difficulty changes (under Server.mu for writes)
 
 	// Share counters
 	sharesAccepted  uint64
@@ -147,6 +151,7 @@ type SeenWorker struct {
 	SharesStaleBase    uint64
 	BestShare        float64
 	LastDifficulty   float64    // difficulty at last disconnect — restored on next reconnect
+	DiffHistory      []DiffEvent // last 100 difficulty changes, persisted across reconnects
 	ReconnectCount   int        // number of times this worker has reconnected (0 = first session)
 	SessionStartedAt time.Time  // time of the most recent authorization
 	ConnectedAt      time.Time
@@ -200,6 +205,12 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		tag = "/PiPool/"
 	}
 
+	var backupRPC *rpc.Client
+	if coin.BackupNode != nil {
+		backupRPC = rpc.NewClient(coin.BackupNode.Host, coin.BackupNode.Port,
+			coin.BackupNode.User, coin.BackupNode.Password, coin.Symbol)
+	}
+
 	return &Server{
 		coin:         coin,
 		seenWorkers:   make(map[string]*SeenWorker),
@@ -208,6 +219,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		poolCfg:      poolCfg,
 		coinbaseTag:  tag,
 		rpcClient:    cli,
+		backupRPC:    backupRPC,
 		coordinator:  coord,
 		workers:      make(map[string]*Worker),
 		recentJobs:   make(map[string]*Job),
@@ -359,6 +371,14 @@ func (s *Server) kickAllConnected() {
 	}
 }
 
+// activeRPC returns the backup RPC client if we're currently using it, else primary.
+func (s *Server) activeRPC() *rpc.Client {
+	if s.usingBackup.Load() && s.backupRPC != nil {
+		return s.backupRPC
+	}
+	return s.rpcClient
+}
+
 // ─── Block template polling ───────────────────────────────────────────────────
 
 func (s *Server) pollBlockTemplate() {
@@ -459,7 +479,7 @@ func (s *Server) pollBlockTemplate() {
 			if daemonWasDown {
 				continue
 			}
-			hash, err := s.rpcClient.GetBestBlockHash()
+			hash, err := s.activeRPC().GetBestBlockHash()
 			if err != nil || hash == lastHash {
 				continue
 			}
@@ -477,7 +497,25 @@ func (s *Server) pollBlockTemplate() {
 			}
 			broadcastJob(false)
 		case <-ticker.C:
-			hash, err := s.rpcClient.GetBestBlockHash()
+			hash, err := s.activeRPC().GetBestBlockHash()
+			// If the active node failed, try the other one
+			if err != nil && s.backupRPC != nil {
+				if s.usingBackup.Load() {
+					// Backup failed — try primary
+					if h2, e2 := s.rpcClient.GetBestBlockHash(); e2 == nil {
+						log.Printf("[%s] backup node failed, falling back to primary", s.coin.Symbol)
+						s.usingBackup.Store(false)
+						hash, err = h2, nil
+					}
+				} else {
+					// Primary failed — try backup
+					if h2, e2 := s.backupRPC.GetBestBlockHash(); e2 == nil {
+						log.Printf("[%s] primary node unreachable, failing over to backup node", s.coin.Symbol)
+						s.usingBackup.Store(true)
+						hash, err = h2, nil
+					}
+				}
+			}
 			if err != nil {
 				if !daemonWasDown {
 					// First failure — log and fire Discord alert
@@ -542,7 +580,7 @@ func (s *Server) pollBlockTemplate() {
 }
 
 func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
-	bt, err := s.rpcClient.GetBlockTemplate([]string{"coinbasetxn", "workid"})
+	bt, err := s.activeRPC().GetBlockTemplate([]string{"coinbasetxn", "workid"})
 	if err != nil {
 		return nil, err
 	}
@@ -669,6 +707,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 					seen.BestShare = w.bestShare
 				}
 				seen.LastDifficulty = w.difficulty
+				seen.DiffHistory = w.diffHistory
 			}
 		}
 		s.mu.Unlock()
@@ -894,6 +933,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		if existing.LastDifficulty >= vd.MinDiff && existing.LastDifficulty <= vd.MaxDiff {
 			startDiff = existing.LastDifficulty
 		}
+		w.diffHistory = existing.DiffHistory
 	} else {
 		if len(s.seenWorkers) >= 500 {
 			// Evict the least-recently-seen offline worker
@@ -1569,6 +1609,11 @@ func (s *Server) adjustVardiff(w *Worker) {
 			w.prevDifficulty = w.difficulty
 		}
 		w.difficulty = newDiff
+		ev := DiffEvent{Diff: newDiff, AtMS: time.Now().UnixMilli()}
+		w.diffHistory = append(w.diffHistory, ev)
+		if len(w.diffHistory) > 100 {
+			w.diffHistory = w.diffHistory[len(w.diffHistory)-100:]
+		}
 		s.sendDifficulty(w, newDiff)
 	}
 }
@@ -1600,6 +1645,11 @@ func (s *Server) decayVardiff(w *Worker) {
 
 	w.prevDifficulty = 0
 	w.difficulty = newDiff
+	ev := DiffEvent{Diff: newDiff, AtMS: time.Now().UnixMilli()}
+	w.diffHistory = append(w.diffHistory, ev)
+	if len(w.diffHistory) > 100 {
+		w.diffHistory = w.diffHistory[len(w.diffHistory)-100:]
+	}
 	w.lastRetargetAt = time.Now()
 	w.sharesSinceRetarget = 0
 	log.Printf("[%s] vardiff decay: %s difficulty %.4g → %.4g (no accepted share in %.0fs)",
@@ -1714,6 +1764,12 @@ type BlockEntry struct {
 	MatureNotified bool   // true once the maturity Discord alert has been sent
 }
 
+// DiffEvent records a single vardiff change for a worker.
+type DiffEvent struct {
+	Diff float64 `json:"diff"`
+	AtMS int64   `json:"at_ms"`
+}
+
 // WorkerInfo is a public snapshot of a worker (online or previously seen)
 type WorkerInfo struct {
 	Name             string
@@ -1733,6 +1789,7 @@ type WorkerInfo struct {
 	LastShareAt      time.Time // time of the most recent accepted share (zero if none)
 	Online           bool
 	WattsEstimate    float64   // estimated power consumption in watts (from RouterTable or manual override)
+	DiffHistory      []DiffEvent
 }
 
 // AllWorkers returns all workers seen this session (online + offline)
@@ -1784,9 +1841,11 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			wi.Online           = true
 			wi.SessionStartedAt = w.connectedAt
 			wi.LastShareAt      = w.lastShareAt
+			wi.DiffHistory      = w.diffHistory
 		} else {
 			// Offline — use last seen time as fallback
-			wi.LastShareAt = seen.LastSeenAt
+			wi.LastShareAt   = seen.LastSeenAt
+			wi.DiffHistory   = seen.DiffHistory
 		}
 		// Get wattage: check manual override first, then device class lookup
 		watts := 0.0
@@ -1808,6 +1867,29 @@ func (s *Server) AllWorkers() []WorkerInfo {
 		out = append(out, wi)
 	}
 	return out
+}
+
+// Coin returns the coin symbol this server is mining.
+func (s *Server) Coin() string { return s.coin.Symbol }
+
+// WorkerShareSparkline returns per-minute share counts for a worker over the last 30 minutes.
+// Returns 30 integers (oldest first, newest last).
+func (s *Server) WorkerShareSparkline(name string) []int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	const buckets = 30
+	counts := make([]int, buckets)
+	now := time.Now().UnixMilli()
+	for _, ss := range s.shareSamples {
+		if ss.Worker != name || !ss.Accepted {
+			continue
+		}
+		ageMin := int((now - ss.TimeMS) / 60000)
+		if ageMin >= 0 && ageMin < buckets {
+			counts[buckets-1-ageMin]++
+		}
+	}
+	return counts
 }
 
 // ConnectedWorkers returns only currently connected workers (kept for ctl compat)

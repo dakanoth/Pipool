@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dakota/pipool/internal/asic"
 	"github.com/dakota/pipool/internal/config"
 	"github.com/dakota/pipool/internal/ctl"
 	"github.com/dakota/pipool/internal/dashboard"
@@ -375,6 +376,12 @@ func main() {
 		log.Fatal("No stratum ports could start — check for port conflicts or config errors")
 	}
 
+	// ASIC health cache — populated by the polling goroutine below
+	var (
+		asicMu     sync.RWMutex
+		asicHealth = make(map[string]*asic.Health)
+	)
+
 	// ─── Quai Network stratum servers ─────────────────────────────────────────
 	var quaiServers []*quai.Server
 	if cfg.Quai.Enabled {
@@ -438,6 +445,48 @@ func main() {
 		}
 	}
 	_ = quaiServers // used in dashboard snapshot below
+
+	// ─── ASIC health polling ──────────────────────────────────────────────────
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		asicAlertedAt := make(map[string]time.Time)
+		for range ticker.C {
+			for _, srv := range servers {
+				for _, w := range srv.AllWorkers() {
+					if !w.Online || w.DeviceName == "" {
+						continue
+					}
+					ip := w.RemoteAddr
+					if idx := strings.LastIndex(ip, ":"); idx >= 0 {
+						ip = ip[:idx]
+					}
+					h, err := asic.Poll(ip, w.DeviceName, 5*time.Second)
+					if err != nil {
+						continue
+					}
+					asicMu.Lock()
+					asicHealth[w.Name] = h
+					asicMu.Unlock()
+					// Discord alert for high ASIC temp (10-min dedup)
+					if h.TempC > 0 && cfg.Pool.TempLimitC > 0 && int(h.TempC) >= cfg.Pool.TempLimitC {
+						key := "asic:" + w.Name
+						asicMu.RLock()
+						last := asicAlertedAt[key]
+						asicMu.RUnlock()
+						if time.Since(last) > 10*time.Minute {
+							asicMu.Lock()
+							asicAlertedAt[key] = time.Now()
+							asicMu.Unlock()
+							if notifier != nil {
+								notifier.HighTemp(float64(h.TempC), cfg.Pool.TempLimitC)
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
 
 	// ─── Metrics registry ─────────────────────────────────────────────────────
 	reg := metrics.NewRegistry()
@@ -585,7 +634,7 @@ func main() {
 		// instead of allocating a new http.Client every 5 seconds
 		dash := dashboard.New(dashPort, pushInterval,
 			func() dashboard.StatsSnapshot {
-				return buildDashboardSnapshot(cfg, servers, sysmon, dashClients)
+				return buildDashboardSnapshot(cfg, servers, sysmon, dashClients, &asicMu, asicHealth)
 			},
 			func() dashboard.NotifSettings {
 				a := cfg.Discord.Alerts
@@ -694,6 +743,67 @@ func main() {
 				}
 			},
 		)
+		// Wire GetWorkerDetail callback
+		dash.GetWorkerDetail = func(coin, name string) *dashboard.WorkerDetail {
+			for _, srv := range servers {
+				if srv.Coin() != coin {
+					continue
+				}
+				workers := srv.AllWorkers()
+				for _, w := range workers {
+					if w.Name != name {
+						continue
+					}
+					ws := dashboard.WorkerStat{
+						Name:           w.Name,
+						Coin:           coin,
+						Device:         w.DeviceName,
+						Difficulty:     w.Difficulty,
+						HashrateKHs:    w.HashrateKHs,
+						SharesAccepted: w.SharesAccepted,
+						SharesRejected: w.SharesRejected,
+						SharesStale:    w.SharesStale,
+						BestShare:      w.BestShare,
+						RemoteAddr:     w.RemoteAddr,
+						Online:         w.Online,
+						ReconnectCount: w.ReconnectCount,
+						UserAgent:      w.UserAgent,
+						WattsEstimate:  w.WattsEstimate,
+					}
+					if !w.ConnectedAt.IsZero() {
+						ws.ConnectedAt = w.ConnectedAt.Format(time.RFC3339)
+					}
+					if !w.LastSeenAt.IsZero() {
+						ws.LastSeenAt = w.LastSeenAt.Format(time.RFC3339)
+					}
+					if w.Online && !w.SessionStartedAt.IsZero() {
+						ws.SessionDuration = time.Since(w.SessionStartedAt).Round(time.Second).String()
+					}
+					asicMu.RLock()
+					ah := asicHealth[w.Name]
+					asicMu.RUnlock()
+					if ah != nil {
+						ws.ASICTempC       = ah.TempC
+						ws.ASICFanRPM      = ah.FanRPM
+						ws.ASICFanPct      = ah.FanPct
+						ws.ASICPowerW      = ah.PowerW
+						ws.ASICHashrateKHs = ah.HashrateKHs
+					}
+					// Convert DiffHistory
+					dh := make([]dashboard.DiffEvent, len(w.DiffHistory))
+					for i, e := range w.DiffHistory {
+						dh[i] = dashboard.DiffEvent{Diff: e.Diff, AtMS: e.AtMS}
+					}
+					return &dashboard.WorkerDetail{
+						WorkerStat:     ws,
+						DiffHistory:    dh,
+						ShareSparkline: srv.WorkerShareSparkline(name),
+					}
+				}
+			}
+			return nil
+		}
+
 		go func() {
 			if err := dash.Start(); err != nil {
 				log.Printf("[dashboard] error: %v", err)
@@ -718,7 +828,7 @@ func main() {
 
 // ─── Stats aggregators ────────────────────────────────────────────────────────
 
-func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client) dashboard.StatsSnapshot {
+func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
 		Timestamp:   time.Now(),
 		Uptime:      fmtUptime(sysmon.Uptime()),
@@ -984,6 +1094,17 @@ collect:
 						break
 					}
 				}
+			}
+			// ASIC health
+			asicMu.RLock()
+			ah := asicHealth[w.Name]
+			asicMu.RUnlock()
+			if ah != nil {
+				ws.ASICTempC       = ah.TempC
+				ws.ASICFanRPM      = ah.FanRPM
+				ws.ASICFanPct      = ah.FanPct
+				ws.ASICPowerW      = ah.PowerW
+				ws.ASICHashrateKHs = ah.HashrateKHs
 			}
 			snap.Workers = append(snap.Workers, ws)
 		}
