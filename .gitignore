@@ -1,5 +1,5 @@
-pipool
-pipoolctl
+/pipool
+/pipoolctl
 configs/pipool.json
 /var/log/pipool/
 *.log
