@@ -73,6 +73,9 @@ type NodeConf struct {
 	Password string `json:"password"`
 	// ZMQ endpoint for instant block notifications (optional but recommended)
 	ZmqPubHashBlock string `json:"zmq_pub_hashblock"`
+	// SystemdService is the systemd unit name (e.g. "litecoind") for the watchdog
+	// auto-restart feature. Empty = watchdog disabled for this node.
+	SystemdService string `json:"systemd_service"`
 }
 
 type DiscordConfig struct {
@@ -228,6 +231,25 @@ func DefaultConfig() *PoolConfig {
 					Port: 3339,
 					Vardiff: VardiffConf{
 						MinDiff: 1, MaxDiff: 1048576,
+						TargetMs: 30000, RetargetS: 60,
+					},
+				},
+				Node: NodeConf{
+					Host: "127.0.0.1", Port: 14022,
+					User: "digibyted", Password: "changeme",
+					ZmqPubHashBlock: "tcp://127.0.0.1:28337",
+				},
+				Wallet:      "YOUR_DGB_WALLET",
+				BlockReward: 665,
+			},
+			"DGBS": {
+				Enabled:   false, // opt-in — DGB Scrypt; shares digibyted node with DGB
+				Symbol:    "DGBS",
+				Algorithm: "scrypt",
+				Stratum: StratumConf{
+					Port: 3342,
+					Vardiff: VardiffConf{
+						MinDiff: 1024, MaxDiff: 524288,
 						TargetMs: 30000, RetargetS: 60,
 					},
 				},

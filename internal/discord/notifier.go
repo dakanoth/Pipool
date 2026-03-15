@@ -276,6 +276,29 @@ func (n *Notifier) NodeBackOnline(coin string) {
 	})
 }
 
+func (n *Notifier) DaemonRestarted(coin, service string) {
+	if !n.cfg.Enabled || !n.cfg.Alerts.NodeUnreachable {
+		return
+	}
+	go n.send(webhookPayload{
+		Username: botName,
+		Embeds: []embed{{
+			Title: fmt.Sprintf("WATCHDOG RESTART — %s", coin),
+			Description: fmt.Sprintf(
+				"%s\n\n**%s** daemon was unreachable. Watchdog issued `systemctl restart %s`.",
+				lvlWarning, coin, service,
+			),
+			Color: ColorWarning,
+			Fields: []embedField{
+				{Name: "CHAIN", Value: coin, Inline: true},
+				{Name: "SERVICE", Value: service, Inline: true},
+			},
+			Footer:    &embedFooter{Text: botFooter},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
 func (n *Notifier) NodeUnreachable(coin string, err error) {
 	if !n.cfg.Enabled || !n.cfg.Alerts.NodeUnreachable {
 		return

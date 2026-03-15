@@ -108,18 +108,20 @@ type CoinStats struct {
 }
 
 type WorkerStat struct {
-	Name           string  `json:"name"`
-	Coin           string  `json:"coin"`
-	Device         string  `json:"device"`
-	Difficulty     float64 `json:"difficulty"`
-	SharesAccepted uint64  `json:"shares_accepted"`
-	SharesRejected uint64  `json:"shares_rejected"`
-	SharesStale    uint64  `json:"shares_stale"`
-	BestShare      float64 `json:"best_share"`
-	RemoteAddr     string  `json:"addr"`
-	ConnectedAt    string  `json:"connected_at"`
-	LastSeenAt     string  `json:"last_seen_at"`
-	Online         bool    `json:"online"`
+	Name            string  `json:"name"`
+	Coin            string  `json:"coin"`
+	Device          string  `json:"device"`
+	Difficulty      float64 `json:"difficulty"`
+	SharesAccepted  uint64  `json:"shares_accepted"`
+	SharesRejected  uint64  `json:"shares_rejected"`
+	SharesStale     uint64  `json:"shares_stale"`
+	BestShare       float64 `json:"best_share"`
+	RemoteAddr      string  `json:"addr"`
+	ConnectedAt     string  `json:"connected_at"`
+	LastSeenAt      string  `json:"last_seen_at"`
+	Online          bool    `json:"online"`
+	ReconnectCount  int     `json:"reconnect_count"`   // 0 = first session
+	SessionDuration string  `json:"session_duration"`  // empty if offline
 }
 
 type BlockEvent struct {
@@ -841,6 +843,8 @@ footer {
         <div id="netDiffDisplay" style="font-family:var(--vt);font-size:1.1rem;color:var(--dim);letter-spacing:1px">--</div>
       </div>
     </div>
+    <!-- Aux chain odds — dynamically populated when merge children are active -->
+    <div id="auxOddsWrap" style="margin-bottom:10px"></div>
     <!-- Legend -->
     <div style="display:flex;gap:16px;align-items:center;margin-bottom:8px;flex-wrap:wrap" id="chartLegend">
       <div style="display:flex;align-items:center;gap:6px"><div style="width:8px;height:8px;border-radius:50%;background:var(--chart-line)"></div><span style="font-family:var(--scan);font-size:.56rem;color:var(--dim)">ACCEPTED</span></div>
@@ -878,10 +882,10 @@ footer {
     <div class="section-body" style="padding:0">
       <table class="workers-table" id="workersTable">
         <thead><tr>
-          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Status</th>
+          <th>Worker</th><th>Coin</th><th>Difficulty</th><th>Total</th><th>Accepted</th><th>Stale%</th><th>Invalid%</th><th>Best Diff</th><th>Sessions</th><th>Status</th>
         </tr></thead>
         <tbody id="workersBody">
-          <tr><td colspan="8" class="no-workers">No miners connected</td></tr>
+          <tr><td colspan="10" class="no-workers">No miners connected</td></tr>
         </tbody>
       </table>
     </div>
@@ -1216,6 +1220,11 @@ function apply(s) {
       // Show merge children alongside primary coin (e.g. "LTC+DOGE", "BTC+BCH")
       var children = mergeChildren[w.coin];
       var coinLabel = children && children.length ? w.coin+'+'+children.join('+') : w.coin;
+      // Sessions cell: "N sessions" + session duration for online workers
+      var sessCount = (w.reconnect_count||0) + 1;
+      var sessLabel = sessCount === 1 ? '1 session' : sessCount+' sessions';
+      var sessHtml = '<div class="shares-val" style="font-size:.65rem">'+sessLabel+'</div>';
+      if (w.online && w.session_duration) sessHtml += '<div class="worker-device">'+w.session_duration+'</div>';
       return '<tr class="'+(w.online?'':'worker-row-offline')+'">' +
         '<td><div class="worker-name">'+workerShort+'</div><div class="worker-device">'+subLine+'</div></td>' +
         '<td><span class="coin-pill">'+coinLabel+'</span></td>' +
@@ -1225,6 +1234,7 @@ function apply(s) {
         '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
         '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
         '<td>'+bestHtml+'</td>' +
+        '<td>'+sessHtml+'</td>' +
         '<td><span class="'+statusCls+'">'+statusTxt+'</span></td>' +
         '</tr>';
     }).join('');
@@ -1552,6 +1562,31 @@ function updateTelemetryStats(coins) {
   } else {
     document.getElementById('blockOddsNow').textContent = '--';
     document.getElementById('blockExpected').textContent = '--';
+  }
+
+  // Aux chain expected time / odds rows
+  var auxWrap = document.getElementById('auxOddsWrap');
+  if (auxWrap) {
+    var auxChildren = mergeChildrenMap[filter] || [];
+    var hashPerSec2 = totalKHs * 1000;
+    var rows = auxChildren.map(function(ac) {
+      var auxNetD = coinNetDiff[ac] || 0;
+      if (auxNetD <= 0 || hashPerSec2 <= 0) return '';
+      var expSec = (auxNetD * 4294967296) / hashPerSec2;
+      var pct = (1 - Math.exp(-3600 / expSec)) * 100;
+      var pctStr = pct < 0.001 ? pct.toExponential(2)+'%' : pct.toFixed(4)+'%';
+      var col = (window.AUX_COLORS && AUX_COLORS[ac]) ? AUX_COLORS[ac] : '#aaaaaa';
+      return '<div style="display:flex;gap:10px;align-items:center;padding:6px 12px;background:var(--surf2);border:1px solid var(--bdr);margin-bottom:4px;flex-wrap:wrap">' +
+        '<span style="font-family:var(--scan);font-size:.56rem;color:'+col+';letter-spacing:2px;min-width:36px">'+ac+'</span>' +
+        '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">EXPECTED</span>' +
+        '<span style="font-family:var(--vt);font-size:.9rem;color:var(--hi);letter-spacing:1px;margin-right:8px">'+fmtSeconds(expSec)+'</span>' +
+        '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">ODDS/HR</span>' +
+        '<span style="font-family:var(--vt);font-size:.9rem;color:var(--hi);letter-spacing:1px;margin-right:8px">'+pctStr+'</span>' +
+        '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px">NET DIFF</span>' +
+        '<span style="font-family:var(--vt);font-size:.9rem;color:var(--dim);letter-spacing:1px">'+fmtDiffShort(auxNetD)+'</span>' +
+        '</div>';
+    }).join('');
+    auxWrap.innerHTML = rows;
   }
 
   var bsEl = document.getElementById('bestShareNow');

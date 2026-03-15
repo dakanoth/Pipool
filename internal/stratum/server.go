@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,8 @@ type Server struct {
 	OnMinerDisconnect func(worker string)
 	OnNodeUnreachable func(err error)
 	OnNodeOnline      func()
+	// OnNodeWatchdogRestart fires when the watchdog auto-restarts a node daemon.
+	OnNodeWatchdogRestart func(service string)
 	// Called when a block is found — provides components needed for AuxPoW submission.
 	// Only fires when there are active merge-mining children.
 	OnAuxBlockFound func(info AuxBlockInfo)
@@ -127,11 +130,13 @@ type SeenWorker struct {
 	SharesAcceptedBase uint64
 	SharesRejectedBase uint64
 	SharesStaleBase    uint64
-	BestShare      float64
-	LastDifficulty float64 // difficulty at last disconnect — restored on next reconnect
-	ConnectedAt    time.Time
-	LastSeenAt     time.Time
-	Online         bool
+	BestShare        float64
+	LastDifficulty   float64    // difficulty at last disconnect — restored on next reconnect
+	ReconnectCount   int        // number of times this worker has reconnected (0 = first session)
+	SessionStartedAt time.Time  // time of the most recent authorization
+	ConnectedAt      time.Time
+	LastSeenAt       time.Time
+	Online           bool
 }
 
 // ShareSample records a single submitted share for the difficulty chart
@@ -336,6 +341,13 @@ func (s *Server) pollBlockTemplate() {
 	retryDelay := 5 * time.Second
 	const maxRetryDelay = 60 * time.Second
 
+	// Watchdog state — tracks how long the daemon has been unreachable so we
+	// can issue a systemctl restart after a configurable quiet period.
+	var daemonDownSince time.Time
+	var lastWatchdogRestart time.Time
+	const watchdogDelay   = 2 * time.Minute
+	const watchdogCooldown = 10 * time.Minute
+
 	broadcastJob := func(cleanJobs bool) {
 		job, err := s.buildJob(cleanJobs)
 		if err != nil {
@@ -399,6 +411,24 @@ func (s *Server) pollBlockTemplate() {
 						s.OnNodeUnreachable(err)
 					}
 					daemonWasDown = true
+					daemonDownSince = time.Now()
+				}
+				// Watchdog: auto-restart via systemctl if down too long
+				svc := s.coin.Node.SystemdService
+				if svc != "" &&
+					time.Since(daemonDownSince) > watchdogDelay &&
+					time.Since(lastWatchdogRestart) > watchdogCooldown {
+					lastWatchdogRestart = time.Now()
+					log.Printf("[%s] watchdog: restarting %s after %v offline",
+						s.coin.Symbol, svc, time.Since(daemonDownSince).Round(time.Second))
+					if out, rerr := exec.Command("sudo", "systemctl", "restart", svc).CombinedOutput(); rerr != nil {
+						log.Printf("[%s] watchdog restart %s failed: %v — %s", s.coin.Symbol, svc, rerr, out)
+					} else {
+						log.Printf("[%s] watchdog: %s restart issued", s.coin.Symbol, svc)
+						if s.OnNodeWatchdogRestart != nil {
+							s.OnNodeWatchdogRestart(svc)
+						}
+					}
 				}
 				// Exponential backoff up to maxRetryDelay
 				time.Sleep(retryDelay)
@@ -704,6 +734,7 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 
 	// Update seenWorkers under s.mu only (never while holding w.mu).
 	s.mu.Lock()
+	now := time.Now()
 	if existing, ok := s.seenWorkers[workerName]; ok {
 		// Snapshot the running total as the base for this new session so share
 		// counts accumulate across reconnects rather than resetting to zero.
@@ -711,9 +742,11 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		existing.SharesRejectedBase = existing.SharesRejected
 		existing.SharesStaleBase    = existing.SharesStale
 		existing.Online = true
-		existing.LastSeenAt = time.Now()
+		existing.LastSeenAt = now
 		existing.LastAddr = w.remoteAddr
 		existing.DeviceName = device.Name
+		existing.ReconnectCount++
+		existing.SessionStartedAt = now
 		// Restore last-known difficulty so the miner doesn't flood the pool with
 		// thousands of low-diff shares before vardiff catches up.
 		if existing.LastDifficulty >= vd.MinDiff && existing.LastDifficulty <= vd.MaxDiff {
@@ -735,13 +768,14 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 			}
 		}
 		s.seenWorkers[workerName] = &SeenWorker{
-			Name:        workerName,
-			DeviceName:  device.Name,
-			LastAddr:    w.remoteAddr,
-			Coin:        s.coin.Symbol,
-			ConnectedAt: time.Now(),
-			LastSeenAt:  time.Now(),
-			Online:      true,
+			Name:             workerName,
+			DeviceName:       device.Name,
+			LastAddr:         w.remoteAddr,
+			Coin:             s.coin.Symbol,
+			ConnectedAt:      now,
+			LastSeenAt:       now,
+			SessionStartedAt: now,
+			Online:           true,
 		}
 	}
 	s.mu.Unlock()
@@ -1441,17 +1475,19 @@ type BlockEntry struct {
 
 // WorkerInfo is a public snapshot of a worker (online or previously seen)
 type WorkerInfo struct {
-	Name           string
-	DeviceName     string
-	Difficulty     float64
-	SharesAccepted uint64
-	SharesRejected uint64
-	SharesStale    uint64
-	BestShare      float64
-	RemoteAddr     string
-	ConnectedAt    time.Time
-	LastSeenAt     time.Time
-	Online         bool
+	Name             string
+	DeviceName       string
+	Difficulty       float64
+	SharesAccepted   uint64
+	SharesRejected   uint64
+	SharesStale      uint64
+	BestShare        float64
+	RemoteAddr       string
+	ReconnectCount   int       // 0 = first session; N = Nth reconnect
+	SessionStartedAt time.Time // time of the current session start (zero if offline)
+	ConnectedAt      time.Time
+	LastSeenAt       time.Time
+	Online           bool
 }
 
 // AllWorkers returns all workers seen this session (online + offline)
@@ -1477,15 +1513,17 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			SharesStale:    seen.SharesStale,
 			BestShare:      seen.BestShare,
 			RemoteAddr:     seen.LastAddr,
+			ReconnectCount: seen.ReconnectCount,
 			ConnectedAt:    seen.ConnectedAt,
 			LastSeenAt:     seen.LastSeenAt,
 			Online:         seen.Online,
 		}
-		// Use live difficulty from the connected Worker; share counts come from
-		// seen.Shares* which updateSeenWorkerShares keeps current (base + session).
+		// Use live difficulty and session start from the connected Worker;
+		// share counts come from seen.Shares* which updateSeenWorkerShares keeps current.
 		if w, ok := onlineByName[name]; ok {
-			wi.Difficulty = w.difficulty
-			wi.Online     = true
+			wi.Difficulty       = w.difficulty
+			wi.Online           = true
+			wi.SessionStartedAt = w.connectedAt
 		}
 		out = append(out, wi)
 	}

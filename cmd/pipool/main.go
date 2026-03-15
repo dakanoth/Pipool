@@ -44,6 +44,7 @@ var geckoIDs = map[string]string{
 	"DOGE": "dogecoin",
 	"BCH":  "bitcoin-cash",
 	"DGB":  "digibyte",
+	"DGBS": "digibyte", // DGB Scrypt — same underlying coin, different algo port
 }
 
 func coinPrice(symbol string) float64 {
@@ -111,6 +112,9 @@ func fmtUptime(d time.Duration) string {
 	}
 	return fmt.Sprintf("%dm %ds", mins, secs)
 }
+
+// fmtWorkerUptime formats a session duration for the worker table.
+func fmtWorkerUptime(d time.Duration) string { return fmtUptime(d) }
 
 func main() {
 	// ─── Flags ────────────────────────────────────────────────────────────────
@@ -220,6 +224,9 @@ func main() {
 		}
 		srv.OnNodeOnline = func() {
 			notifier.NodeBackOnline(coin.Symbol)
+		}
+		srv.OnNodeWatchdogRestart = func(service string) {
+			notifier.DaemonRestarted(coin.Symbol, service)
 		}
 		srv.OnBlockFound = func(sym, hash string, reward float64) {
 			notifier.BlockFound(sym, hash, 0, reward, "unknown")
@@ -725,12 +732,16 @@ collect:
 				BestShare:      w.BestShare,
 				RemoteAddr:     w.RemoteAddr,
 				Online:         w.Online,
+				ReconnectCount: w.ReconnectCount,
 			}
 			if !w.ConnectedAt.IsZero() {
 				ws.ConnectedAt = w.ConnectedAt.Format("Jan 2 15:04")
 			}
 			if !w.LastSeenAt.IsZero() {
 				ws.LastSeenAt = w.LastSeenAt.Format("Jan 2 15:04:05")
+			}
+			if w.Online && !w.SessionStartedAt.IsZero() {
+				ws.SessionDuration = fmtWorkerUptime(time.Since(w.SessionStartedAt))
 			}
 			snap.Workers = append(snap.Workers, ws)
 		}
@@ -813,7 +824,7 @@ collect:
 		jobAgeWarnSec := map[string]int64{
 			"BTC": 2400, "BCH": 2400,
 			"LTC": 600,
-			"DGB": 60,
+			"DGB": 300, "DGBS": 300, // DGB per-algo block ~75s; 4× = 300s
 			"DOGE": 300, "PEP": 300,
 		}
 		warnSec, ok := jobAgeWarnSec[d.Symbol]
