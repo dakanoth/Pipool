@@ -34,15 +34,18 @@ By downloading, installing, or running this software you agree to the following:
 | **Merge Mining** | AuxPoW for LTC+DOGE and BTC+BCH — one sync, two rewards |
 | **Stratum** | Full Stratum V1 — vardiff, per-worker extranonce, clean job broadcast |
 | **ASIC Support** | 65 device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, …) |
+| **ASIC Health** | HTTP polls each miner's API (Hammer/Bitaxe/Goldshell/Elphapex) for live temp, fan, power, hashrate — shown in dashboard and Discord alerts |
 | **TLS** | Optional TLS stratum listener per coin (auto-generates self-signed cert) |
 | **Vardiff** | Per-worker vardiff with fixed-diff override, `mining.suggest_difficulty` support |
 | **ZMQ** | Instant block notifications via ZMQ — sub-second job broadcasts |
 | **Node Watchdog** | Auto-restarts unresponsive coin daemons via `systemctl` |
+| **Multi-node Failover** | Optional `backup_node` per coin — seamlessly switches RPC source when primary goes down, no miner interruption |
 | **Proxy Fallback** | When local node is offline, transparently proxies miners to a configured upstream pool |
 | **Block Log** | Persisted block log with confirmations, luck %, and maturity tracking |
 | **State Persistence** | Worker difficulty and best share persist across restarts |
 | **Discord** | Block found/matured, miner events, high temp, hashrate reports, node down, worker silent |
 | **Dashboard** | SSE-powered web UI — live hashrate, workers, coin cards, block log, share chart |
+| **Worker Detail Modal** | Click any worker row for vardiff timeline chart, 30-min share sparkline, full session metadata, and ASIC health |
 | **Config Editor** | Edit wallets, vardiff, Discord webhook, auto-kick, fixed diffs, kWh rate — live from browser |
 | **Worker Groups** | Tag workers into named groups; see per-group hashrate and profit |
 | **Profit Tracker** | Per-worker cost/day and profit/day based on device wattage and electricity rate |
@@ -152,6 +155,10 @@ pipoolctl fixdiff wallet.miner1 256
         "zmq_pub_hashblock": "tcp://127.0.0.1:28332",
         "systemd_service": "litecoind"
       },
+      "backup_node": {
+        "host": "192.168.1.50", "port": 9332,
+        "user": "litecoind", "password": "changeme"
+      },
       "upstream_pool": {
         "enabled": false,
         "host": "stratum.litecoinpool.org",
@@ -227,7 +234,8 @@ Open `http://<pi-ip>:8080` in any browser on your network.
 | **Header metrics** | Scrypt hashrate, SHA-256d hashrate, blocks found, uptime |
 | **System** | CPU %, RAM, core temp with live bars |
 | **Coin cards** | Per-coin: hashrate, miners, difficulty, price, expected block time, session effort, wallet balance (confirmed + maturing), difficulty retarget countdown (BTC/LTC), share histogram |
-| **Workers table** | All seen workers (online + offline history): hashrate, difficulty, shares, best share, profit/day, device, user-agent tooltip |
+| **Workers table** | All seen workers (online + offline history): hashrate, difficulty, shares, best share, profit/day, device, user-agent tooltip, ASIC temp badge |
+| **Worker detail modal** | Click any row — vardiff timeline chart, 30-min share-rate sparkline, ASIC health (temp/fan/power), full session metadata |
 | **Groups** | Per-group aggregate hashrate, online count, profit/day (when `worker_groups` configured) |
 | **Share chart** | Rolling scatter plot of submitted share difficulties with network diff overlay and block markers |
 | **Hashrate chart** | 24-hour area chart per coin |
@@ -248,6 +256,36 @@ The dashboard worker table then shows:
 - **WATTS** — estimated draw for that device
 - **COST/DAY** — electricity cost in USD
 - **PROFIT/DAY** — revenue share minus electricity cost (green = profit, red = loss)
+
+---
+
+## ASIC Health Polling
+
+PiPool polls each miner's HTTP API every 30 seconds for live hardware stats using the same endpoints as the miner's own web UI:
+
+| Miner Type | Endpoint | Data |
+|---|---|---|
+| Hammer / Bitaxe | `GET /api/system/info` | temp, fan RPM/%, power W, hashrate, uptime |
+| Elphapex DG Home | `GET /cgi-bin/summary.cgi` | temp, fan RPM, hashrate |
+| Goldshell | `GET /mcb/cgminer` + `/mcb/status` | temp, hashrate, power W |
+| Generic | `GET /api/system/info` (fallback) | temp, fan, hashrate |
+
+The miner type is inferred from the device class auto-detected during stratum authorization — no extra config needed. Health data is shown in the worker table (temp badge) and in the worker detail modal. A Discord alert fires if the ASIC temperature reaches `temp_limit_c`.
+
+---
+
+## Multi-node Failover
+
+Add a `backup_node` to any coin's config to enable automatic failover:
+
+```json
+"LTC": {
+  "node": { "host": "127.0.0.1", "port": 9332, "user": "litecoind", "password": "changeme" },
+  "backup_node": { "host": "192.168.1.50", "port": 9332, "user": "litecoind", "password": "changeme" }
+}
+```
+
+When the primary node fails an RPC call, PiPool instantly switches to the backup and continues mining without interrupting connected miners. If the backup also fails, the existing upstream proxy fallback activates. When the primary recovers, PiPool switches back automatically.
 
 ---
 
@@ -307,10 +345,11 @@ internal/
   stratum/proxy.go              — Upstream proxy fallback (when node offline)
   stratum/router.go             — ASIC fingerprinting — 65 device classes
   stratum/tls.go                — Optional TLS listener
+  asic/poller.go                — ASIC HTTP health polling (temp, fan, power)
   merge/auxpow.go               — AuxPoW merge mining coordinator
   mining/monitor.go             — CPU temp, RAM, uptime monitor
   discord/notifier.go           — Discord webhook notifications
-  dashboard/server.go           — HTTP dashboard + SSE push + config editor
+  dashboard/server.go           — HTTP dashboard + SSE push + config editor + worker detail modal
   metrics/prometheus.go         — Prometheus text-format metrics registry
   ctl/server.go                 — pipoolctl Unix socket server
   quai/rpc.go                   — Quai Network WebSocket node client
