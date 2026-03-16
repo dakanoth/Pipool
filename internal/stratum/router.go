@@ -27,14 +27,14 @@ var RouterTable = []deviceSignature{
 
 	// ── BitAxe / ESP-Miner family (ESP32-based open source ASIC boards) ─────
 	// SHA-256d ~200–500 GH/s depending on chip
-	{"bitaxeultra", DeviceClass{"BitAxe Ultra", "sha256d", 1024, 8192, "BitAxe Ultra BM1366 ~500 GH/s", 15}},
-	{"bitaxegamma", DeviceClass{"BitAxe Gamma", "sha256d", 2048, 16384, "BitAxe Gamma BM1370 ~1.2 TH/s", 20}},
-	{"bitaxe", DeviceClass{"BitAxe", "sha256d", 512, 4096, "BitAxe ESP32 ASIC ~200-500 GH/s", 15}},
-	{"nerdoctaxe", DeviceClass{"NerdOCTAXE", "sha256d", 1024, 8192, "NerdOCTAXE 8-ASIC ESP32 board ~1-4 TH/s", 60}},
-	{"octaxe", DeviceClass{"Octaxe", "sha256d", 1024, 8192, "Octaxe 8-ASIC ESP32 board ~1-4 TH/s", 60}},
-	{"luckyminer", DeviceClass{"LuckyMiner", "sha256d", 512, 4096, "LuckyMiner BM1366 ~500 GH/s", 15}},
-	{"nerdaxe", DeviceClass{"NerdAxe", "sha256d", 256, 2048, "NerdAxe ~200 GH/s", 10}},
-	{"nerdqaxe", DeviceClass{"NerdQAxe", "sha256d", 1024, 8192, "NerdQAxe quad ~800 GH/s", 40}},
+	{"bitaxeultra", DeviceClass{"BitAxe Ultra", "sha256d", 4096, 16384, "BitAxe Ultra BM1366 ~500 GH/s", 15}},
+	{"bitaxegamma", DeviceClass{"BitAxe Gamma", "sha256d", 8192, 32768, "BitAxe Gamma BM1370 ~1.2 TH/s", 20}},
+	{"bitaxe", DeviceClass{"BitAxe", "sha256d", 2048, 16384, "BitAxe ESP32 ASIC ~200 GH/s - 1 TH/s", 15}},
+	{"nerdoctaxe", DeviceClass{"NerdOCTAXE", "sha256d", 4096, 32768, "NerdOCTAXE 8-ASIC ESP32 board ~1-4 TH/s", 60}},
+	{"octaxe", DeviceClass{"Octaxe", "sha256d", 4096, 32768, "Octaxe 8-ASIC ESP32 board ~1-4 TH/s", 60}},
+	{"luckyminer", DeviceClass{"LuckyMiner", "sha256d", 4096, 16384, "LuckyMiner ~1 TH/s", 15}},
+	{"nerdaxe", DeviceClass{"NerdAxe", "sha256d", 512, 4096, "NerdAxe ~200 GH/s", 10}},
+	{"nerdqaxe", DeviceClass{"NerdQAxe", "sha256d", 2048, 16384, "NerdQAxe quad ~800 GH/s", 40}},
 	{"esp-miner", DeviceClass{"ESP-Miner", "sha256d", 512, 4096, "ESP-Miner firmware (generic)", 15}},
 	// ── Plexsource (Scrypt) ──────────────────────────────────────────────────
 	{"volc/msbt", DeviceClass{"Plexsource PM120", "scrypt", 256, 4096, "Plexsource PM120 ~120 MH/s", 30}},
