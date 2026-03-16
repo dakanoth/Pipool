@@ -131,6 +131,10 @@ type Worker struct {
 	bestShare       float64  // highest difficulty share submitted this session
 	suggestedMinDiff float64 // floor set by mining.suggest_difficulty
 
+	// Stale-job kick: disconnect miners that ignore clean_jobs and keep mining old work
+	lastStaleJobID  string // job ID of the most recent stale submission
+	staleJobStreak  int    // consecutive stales for the same old job
+
 	// Extranonce assigned to this worker
 	extranonce1  string
 }
@@ -1050,6 +1054,21 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	if !jobFound {
 		w.sharesStale++
 		s.updateSeenWorkerShares(w)
+		// Track consecutive stales on the same old job (firmware ignoring clean_jobs).
+		// After 5 stales for the same job, kick the worker so it reconnects and gets fresh work.
+		if submittedJobID == w.lastStaleJobID {
+			w.staleJobStreak++
+		} else {
+			w.lastStaleJobID = submittedJobID
+			w.staleJobStreak = 1
+		}
+		if w.staleJobStreak >= 5 {
+			log.Printf("[%s] kicking %s: %d consecutive stale shares for job %s (firmware ignoring clean_jobs)",
+				s.coin.Symbol, w.workerName, w.staleJobStreak, submittedJobID)
+			s.reply(w, msg.ID, false, []any{21, "Stale share", nil})
+			w.conn.Close()
+			return nil
+		}
 		log.Printf("[%s] stale share from %s (job %s not in recent window)", s.coin.Symbol, w.workerName, submittedJobID)
 		return s.reply(w, msg.ID, false, []any{21, "Stale share", nil})
 	}
@@ -1119,6 +1138,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	w.sharesAccepted++
 	w.lastShareAt = time.Now()
 	w.lastAcceptedAt = time.Now()
+	w.staleJobStreak = 0 // reset stale-kick counter on good share
 	s.validShares.Add(1)
 	// Track best share per worker and all-time
 	if validationDiff > w.bestShare {
