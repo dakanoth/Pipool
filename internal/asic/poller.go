@@ -115,29 +115,26 @@ func pollBitaxeHammer(client *http.Client, ip string, isGHs bool) (*Health, erro
 }
 
 // ── Elphapex ─────────────────────────────────────────────────────────────────
+// API: GET /cgi-bin/stats.cgi
+// temp_chip values are in millidegrees (53875 = 53.875 °C); temp_pcb in whole degrees.
+// No power field — caller uses static WattsEstimate from RouterTable.
 
-type elphapexSummaryResp struct {
-	Summary struct {
-		Ghs5s   float64 `json:"ghs5s"`
-		Ghsav   float64 `json:"ghsav"`
-		Mhs5s   float64 `json:"mhs5s"`
-		Mhsav   float64 `json:"mhsav"`
-		Elapsed int64   `json:"elapsed"`
-	} `json:"summary"`
-	Devs []struct {
-		Temp  float64 `json:"temp"`
-		Temp1 float64 `json:"temp1"`
-		Temp2 float64 `json:"temp2"`
-		Temp3 float64 `json:"temp3"`
-		Fan1  float64 `json:"fan1"`
-		Fan2  float64 `json:"fan2"`
-		Fan3  float64 `json:"fan3"`
-		Fan4  float64 `json:"fan4"`
-	} `json:"devs"`
+type elphapexStatsResp struct {
+	STATS []struct {
+		Elapsed  int64   `json:"elapsed"`
+		Rate15m  float64 `json:"rate_15m"`
+		RateAvg  float64 `json:"rate_avg"`
+		RateUnit string  `json:"rate_unit"`
+		Fan      []json.RawMessage `json:"fan"`
+		Chain    []struct {
+			TempChip []json.RawMessage `json:"temp_chip"` // millidegrees as strings or numbers
+			TempPCB  []float64         `json:"temp_pcb"`  // degrees C
+		} `json:"chain"`
+	} `json:"STATS"`
 }
 
 func pollElphapex(client *http.Client, ip string) (*Health, error) {
-	resp, err := client.Get("http://" + ip + "/cgi-bin/summary.cgi")
+	resp, err := client.Get("http://" + ip + "/cgi-bin/stats.cgi")
 	if err != nil {
 		return nil, err
 	}
@@ -146,36 +143,74 @@ func pollElphapex(client *http.Client, ip string) (*Health, error) {
 	if err != nil {
 		return nil, err
 	}
-	var info elphapexSummaryResp
+	var info elphapexStatsResp
 	if err := json.Unmarshal(b, &info); err != nil {
 		return nil, err
 	}
-	h := &Health{FetchedAt: time.Now(), UptimeSec: info.Summary.Elapsed}
-	switch {
-	case info.Summary.Ghs5s > 0:
-		h.HashrateKHs = info.Summary.Ghs5s * 1_000_000
-	case info.Summary.Ghsav > 0:
-		h.HashrateKHs = info.Summary.Ghsav * 1_000_000
-	case info.Summary.Mhs5s > 0:
-		h.HashrateKHs = info.Summary.Mhs5s * 1_000
-	case info.Summary.Mhsav > 0:
-		h.HashrateKHs = info.Summary.Mhsav * 1_000
+	if len(info.STATS) == 0 {
+		return nil, fmt.Errorf("empty stats from elphapex %s", ip)
 	}
-	maxTemp, maxFan := 0.0, 0.0
-	for _, dev := range info.Devs {
-		for _, t := range []float64{dev.Temp, dev.Temp1, dev.Temp2, dev.Temp3} {
+	st := info.STATS[0]
+	h := &Health{FetchedAt: time.Now(), UptimeSec: st.Elapsed}
+
+	// Hashrate: prefer 15m average, fall back to overall average
+	mhs := st.Rate15m
+	if mhs == 0 {
+		mhs = st.RateAvg
+	}
+	h.HashrateKHs = mhs * 1_000 // MH/s → KH/s
+
+	// Temperature: max of all chip temps (millidegrees) and PCB temps (degrees)
+	maxTemp := 0.0
+	for _, chain := range st.Chain {
+		for _, raw := range chain.TempChip {
+			// temp_chip values come as either a quoted string ("53875") or number
+			var fv float64
+			if json.Unmarshal(raw, &fv) == nil && fv > 0 {
+				if c := fv / 1000.0; c > maxTemp {
+					maxTemp = c
+				}
+				continue
+			}
+			var sv string
+			if json.Unmarshal(raw, &sv) == nil && sv != "" {
+				var f float64
+				if _, err := fmt.Sscanf(sv, "%f", &f); err == nil && f > 0 {
+					if c := f / 1000.0; c > maxTemp {
+						maxTemp = c
+					}
+				}
+			}
+		}
+		for _, t := range chain.TempPCB {
 			if t > maxTemp {
 				maxTemp = t
 			}
 		}
-		for _, f := range []float64{dev.Fan1, dev.Fan2, dev.Fan3, dev.Fan4} {
-			if f > maxFan {
-				maxFan = f
+	}
+	h.TempC = maxTemp
+
+	// Fan: values come as strings ("3300") or numbers
+	maxFan := 0
+	for _, raw := range st.Fan {
+		var fv float64
+		if json.Unmarshal(raw, &fv) == nil {
+			if int(fv) > maxFan {
+				maxFan = int(fv)
+			}
+			continue
+		}
+		var sv string
+		if json.Unmarshal(raw, &sv) == nil {
+			var f float64
+			if _, err := fmt.Sscanf(sv, "%f", &f); err == nil {
+				if int(f) > maxFan {
+					maxFan = int(f)
+				}
 			}
 		}
 	}
-	h.TempC = maxTemp
-	h.FanRPM = int(maxFan)
+	h.FanRPM = maxFan
 	return h, nil
 }
 
