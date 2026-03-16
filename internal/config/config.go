@@ -293,7 +293,7 @@ func DefaultConfig() *PoolConfig {
 					Vardiff: VardiffConf{
 						// DGB Scrypt blocks every ~15s — use 5s share target to minimize stales
 						MinDiff: 64, MaxDiff: 524288,
-						TargetMs: 5000, RetargetS: 10,
+						TargetMs: 5000, RetargetS: 30,
 					},
 				},
 				Node: NodeConf{
