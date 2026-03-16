@@ -93,7 +93,7 @@ var RouterTable = []deviceSignature{
 
 	// ── Elphapex (Scrypt) ─────────────────────────────────────────────────────
 	// DG Home 1 ~2 GH/s → diff for 30s shares ≈ 64. StartDiff 64, MaxDiff 1024.
-	{"elphapex dg home 1", DeviceClass{"Elphapex DG Home 1", "scrypt", 128, 2048, "Elphapex DG Home 1 ~2 GH/s", 1200}},
+	{"elphapex dg home 1", DeviceClass{"Elphapex DG Home 1", "scrypt", 128, 2048, "Elphapex DG Home 1 ~2 GH/s", 630}},
 	// DG1 / DG1+ ~11 GH/s → diff for 30s shares ≈ 350. StartDiff 256, MaxDiff 4096.
 	{"elphapex dg1+", DeviceClass{"Elphapex DG1+", "scrypt", 256, 4096, "Elphapex DG1+ ~11 GH/s", 3300}},
 	{"elphapex dg1", DeviceClass{"Elphapex DG1", "scrypt", 256, 4096, "Elphapex DG1 ~11 GH/s", 3300}},

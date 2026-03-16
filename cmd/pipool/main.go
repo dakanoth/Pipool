@@ -1243,16 +1243,19 @@ collect:
 		}
 	}
 
-	// After workers loop, compute totals for cost/profit (online workers only)
+	// After workers loop, compute totals and per-coin electrical cost (online workers only)
 	{
+		coinCost := make(map[string]float64)
 		var totalCost, totalRevenue float64
 		for _, ws := range snap.Workers {
 			if ws.Online {
 				totalCost += ws.CostPerDayUSD
+				coinCost[ws.Coin] += ws.CostPerDayUSD
 			}
 		}
-		for _, cs := range snap.Coins {
-			totalRevenue += cs.EarningsPerDayUSD
+		for i := range snap.Coins {
+			snap.Coins[i].CostPerDayUSD = coinCost[snap.Coins[i].Symbol]
+			totalRevenue += snap.Coins[i].EarningsPerDayUSD
 		}
 		snap.TotalCostPerDayUSD = totalCost
 		snap.TotalProfitPerDayUSD = totalRevenue - totalCost

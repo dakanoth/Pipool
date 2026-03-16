@@ -108,6 +108,7 @@ type CoinStats struct {
 	PriceUSD         float64 `json:"price_usd"`          // 0 = unknown
 	BlockReward      float64 `json:"block_reward"`        // in whole coins
 	EarningsPerDayUSD float64 `json:"earnings_day_usd"`   // estimated daily earnings at current hashrate
+	CostPerDayUSD     float64 `json:"cost_per_day_usd"`   // electrical cost of online miners on this coin
 	IsMergeAux       bool    `json:"is_merge_aux"`
 	MergeParent      string  `json:"merge_parent,omitempty"`
 	SessionEffortPct float64 `json:"session_effort_pct"` // validWork/networkDiff*100; 0=unknown
@@ -1624,7 +1625,7 @@ function apply(s) {
             var rewardUsd = (c.block_reward > 0 && c.price_usd > 0) ? ' ($'+( c.block_reward * c.price_usd ).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+')' : '';
             return '<div><div class="cs-l">Reward</div><div class="cs-v">'+(c.block_reward > 0 ? c.block_reward+' '+c.symbol+rewardUsd : '--')+'</div></div>';
           })() +
-          '<div><div class="cs-l">Est. Day</div><div class="cs-v">'+(c.earnings_day_usd > 0 ? '$'+c.earnings_day_usd.toFixed(4) : '--')+'</div></div>' +
+          (c.cost_per_day_usd > 0 ? '<div><div class="cs-l">Elec/Day</div><div class="cs-v" style="color:var(--red)">'+fmtCurrency(c.cost_per_day_usd)+'</div></div>' : '') +
           (function(){
             if (!c.session_effort_pct || c.session_effort_pct <= 0) return '';
             var eff = c.session_effort_pct;
