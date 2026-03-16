@@ -33,8 +33,8 @@ By downloading, installing, or running this software you agree to the following:
 | **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt-N), DGB, DGBS, Quai Network ⚠️ *(EXPERIMENTAL — see warning below)* |
 | **Merge Mining** | AuxPoW for LTC+DOGE and BTC+BCH — one sync, two rewards |
 | **Stratum** | Full Stratum V1 — vardiff, per-worker extranonce, clean job broadcast |
-| **ASIC Support** | 65 device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, …) |
-| **ASIC Health** | HTTP polls each miner's API (Hammer/Bitaxe/Goldshell/Elphapex) for live temp, fan, power, hashrate — shown in dashboard and Discord alerts |
+| **ASIC Support** | 65+ device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, Elphapex, Plexsource, …) |
+| **ASIC Health** | HTTP polls each miner's API (Bitaxe/Hammer/Goldshell/Elphapex) for live temp, fan, power, hashrate — shown in dashboard and Discord alerts |
 | **TLS** | Optional TLS stratum listener per coin (auto-generates self-signed cert) |
 | **Vardiff** | Per-worker vardiff with fixed-diff override, `mining.suggest_difficulty` support |
 | **ZMQ** | Instant block notifications via ZMQ — sub-second job broadcasts |
@@ -48,7 +48,8 @@ By downloading, installing, or running this software you agree to the following:
 | **Worker Detail Modal** | Click any worker row for vardiff timeline chart, 30-min share sparkline, full session metadata, and ASIC health |
 | **Config Editor** | Edit wallets, vardiff, Discord webhook, auto-kick, fixed diffs, kWh rate — live from browser |
 | **Worker Groups** | Tag workers into named groups; see per-group hashrate and profit |
-| **Profit Tracker** | Per-worker cost/day and profit/day based on device wattage and electricity rate |
+| **Electricity Cost** | Per-worker and per-coin electrical cost based on device wattage and kWh rate — live wattage polled from miner API where available |
+| **Stale Kick** | Automatically disconnects miners that ignore `clean_jobs=true` after 5 consecutive stale shares for the same job — forces reconnect and fresh work |
 | **Diff Countdown** | BTC/LTC epoch progress bar and projected next difficulty change % |
 | **Prometheus** | `/metrics` endpoint exposing hashrate, miners, temp, wallet balance, worker hashrate, and more |
 | **pipoolctl** | Unix-socket CLI for live status, worker management, and config changes |
@@ -66,7 +67,7 @@ By downloading, installing, or running this software you agree to the following:
 | BCH | 3336 | SHA-256d / AuxPoW | Merged via BTC — no separate miner needed |
 | PEP | 3337 | Scrypt-N (N=2048) | Optional — enable in config |
 | DGB | 3339 | SHA-256d | Optional DigiByte SHA-256d |
-| DGBS | 3342 | Scrypt | Optional DigiByte Scrypt |
+| DGBS | 3342 | Scrypt | Optional DigiByte Scrypt — uses 5s share target (fast blocks) |
 | QUAI (SHA-256d) | 3340 | SHA-256d | ⚠️ **EXPERIMENTAL** — Quai Network (see warning below) |
 | QUAI (Scrypt) | 3341 | Scrypt | ⚠️ **EXPERIMENTAL** — Quai Network (see warning below) |
 
@@ -247,8 +248,8 @@ Open `http://<pi-ip>:8080` in any browser on your network.
 | **Status bar** | Pool name, live/reconnecting, last update time |
 | **Header metrics** | Scrypt hashrate, SHA-256d hashrate, blocks found, uptime |
 | **System** | CPU %, RAM, core temp with live bars |
-| **Coin cards** | Per-coin: hashrate, miners, difficulty, price, expected block time, session effort, wallet balance (confirmed + maturing), difficulty retarget countdown (BTC/LTC), share histogram |
-| **Workers table** | All seen workers (online + offline history): hashrate, difficulty, shares, best share, profit/day, device, user-agent tooltip, ASIC temp badge |
+| **Coin cards** | Per-coin: hashrate, miners, difficulty, price, expected block time, session effort, elec cost/day, wallet balance (confirmed + maturing), difficulty retarget countdown (BTC/LTC), share histogram |
+| **Workers table** | All seen workers (online + offline history): hashrate, difficulty, shares, best share, elec cost/day, device, user-agent tooltip, ASIC temp badge |
 | **Worker detail modal** | Click any row — vardiff timeline chart, 30-min share-rate sparkline, ASIC health (temp/fan/power), full session metadata |
 | **Groups** | Per-group aggregate hashrate, online count, profit/day (when `worker_groups` configured) |
 | **Share chart** | Rolling scatter plot of submitted share difficulties with network diff overlay and block markers |
@@ -262,14 +263,15 @@ Open `http://<pi-ip>:8080` in any browser on your network.
 
 ---
 
-## Profit Tracking
+## Electricity Cost Tracking
 
-Set `kwh_rate_usd` in config (e.g. `0.12` for 12¢/kWh). PiPool looks up estimated wattage for each connected ASIC from its built-in device table (65 models). You can override per-worker with `worker_fixed_watts`.
+Set `kwh_rate_usd` in config (e.g. `0.12` for 12¢/kWh). PiPool looks up wattage for each connected ASIC from its built-in device table (65+ models), live-polled from the miner's HTTP API where available. You can override per-worker with `worker_fixed_watts`.
 
-The dashboard worker table then shows:
-- **WATTS** — estimated draw for that device
-- **COST/DAY** — electricity cost in USD
-- **PROFIT/DAY** — revenue share minus electricity cost (green = profit, red = loss)
+The dashboard then shows:
+- **Workers table** — WATTS and $/Day (electrical cost) per worker
+- **Coin cards** — Elec/Day: summed electrical cost of all online miners on that coin
+
+> Some miners report an unusual user-agent (e.g. Elphapex DG Home reports `cpuminer/2.5.1`). Use `worker_fixed_watts` to pin the correct wattage for those workers.
 
 ---
 
@@ -279,12 +281,22 @@ PiPool polls each miner's HTTP API every 30 seconds for live hardware stats usin
 
 | Miner Type | Endpoint | Data |
 |---|---|---|
-| Hammer / Bitaxe | `GET /api/system/info` | temp, fan RPM/%, power W, hashrate, uptime |
-| Elphapex DG Home | `GET /cgi-bin/summary.cgi` | temp, fan RPM, hashrate |
+| Bitaxe / ESP-Miner / Plexsource | `GET /api/system/info` | temp, fan RPM/%, power W, hashrate, uptime |
+| Elphapex DG Home / DG1 | `GET /cgi-bin/stats.cgi` | temp (chip + PCB), fan RPM, hashrate |
 | Goldshell | `GET /mcb/cgminer` + `/mcb/status` | temp, hashrate, power W |
 | Generic | `GET /api/system/info` (fallback) | temp, fan, hashrate |
 
 The miner type is inferred from the device class auto-detected during stratum authorization — no extra config needed. Health data is shown in the worker table (temp badge) and in the worker detail modal. A Discord alert fires if the ASIC temperature reaches `temp_limit_c`.
+
+---
+
+## Stale Share Handling
+
+PiPool tracks the job ID of every stale submission per worker. If a worker submits **5 consecutive stale shares for the same old job**, the pool disconnects it. This targets firmware that ignores `mining.notify` with `clean_jobs=true` and instead rolls the `ntime` field on an expired job indefinitely — a known behaviour in some ASIC and open-source miner firmware. On reconnect the miner receives a fresh job and resumes useful work.
+
+One-off stale shares (new block arrived mid-search) are normal and do not trigger a kick. The streak resets to zero on any accepted share.
+
+For coins with fast block times (DGB Scrypt: ~15s), PiPool uses a shorter vardiff target (5 seconds) so shares are submitted frequently enough that most are still valid when they arrive.
 
 ---
 
