@@ -291,8 +291,9 @@ func DefaultConfig() *PoolConfig {
 				Stratum: StratumConf{
 					Port: 3342,
 					Vardiff: VardiffConf{
-						MinDiff: 1024, MaxDiff: 524288,
-						TargetMs: 30000, RetargetS: 60,
+						// DGB Scrypt blocks every ~15s — use 5s share target to minimize stales
+						MinDiff: 64, MaxDiff: 524288,
+						TargetMs: 5000, RetargetS: 10,
 					},
 				},
 				Node: NodeConf{
