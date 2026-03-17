@@ -1437,16 +1437,6 @@ footer {
           Change which node PiPool connects to. After saving, click APPLY &amp; RESTART to reconnect.
         </div>
         <div id="cfgNodes"></div>
-        <div id="cfgQuaiNode" style="margin-top:12px">
-          <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px;margin-bottom:6px">QUAI NETWORK NODE</div>
-          <div class="node-cfg-row">
-            <div class="node-cfg-label">NODE HOST</div>
-            <input class="node-cfg-host" id="cfgQuaiHost" placeholder="e.g. 192.168.1.100" value="">
-            <span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>
-            <input class="node-cfg-port" id="cfgQuaiPort" type="number" placeholder="9001" value="9001">
-            <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2);padding-left:6px">HTTP RPC PORT</span>
-          </div>
-        </div>
       </div>
 
     </div>
@@ -2825,15 +2815,22 @@ function applyCfg(c) {
         '</div>';
       nodesDiv.appendChild(div);
     });
-  }
 
-  // Quai node settings
-  var quaiDiv = document.getElementById('cfgQuaiNode');
-  if (quaiDiv) {
-    var qHost = document.getElementById('cfgQuaiHost');
-    var qPort = document.getElementById('cfgQuaiPort');
-    if (qHost) qHost.value = c.quai_node_host || '';
-    if (qPort) qPort.value = c.quai_node_port || 9001;
+    // Quai node (shared for QUAI + QUAIS)
+    if (c.quai_node_host !== undefined || c.quai_node_port !== undefined) {
+      var quaiDiv = document.createElement('div');
+      quaiDiv.className = 'node-cfg-coin';
+      quaiDiv.innerHTML =
+        '<div class="node-cfg-coin-title">QUAI NETWORK (QUAI + QUAIS)</div>'+
+        '<div class="node-cfg-row">'+
+          '<div class="node-cfg-label">NODE HOST</div>'+
+          '<input class="node-cfg-host" id="cfgQuaiHost" placeholder="e.g. 192.168.1.100" value="'+(c.quai_node_host||'')+'">'+
+          '<span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>'+
+          '<input class="node-cfg-port" id="cfgQuaiPort" type="number" placeholder="9001" value="'+(c.quai_node_port||9001)+'">'+
+          '<span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2);padding-left:6px">HTTP RPC PORT</span>'+
+        '</div>';
+      nodesDiv.appendChild(quaiDiv);
+    }
   }
 }
 
