@@ -443,6 +443,25 @@ func (n *Notifier) PoolStarted(coins []string) {
 	})
 }
 
+func (n *Notifier) StaleKick(coin, workerName string, kickCount int) {
+	if !n.cfg.Enabled || n.cfg.Alerts.StaleKickAlertCount <= 0 {
+		return
+	}
+	if kickCount < n.cfg.Alerts.StaleKickAlertCount {
+		return
+	}
+	go n.send(webhookPayload{
+		Username:  n.cfg.BotName,
+		AvatarURL: n.cfg.AvatarURL,
+		Embeds: []embed{{
+			Title:       "Worker Stale-Kick Loop",
+			Description: fmt.Sprintf("**%s** on **%s** has been kicked **%d times** in the last hour for submitting stale shares (firmware ignoring clean_jobs).", workerName, coin, kickCount),
+			Color:       0xFF6600,
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 func (n *Notifier) send(payload webhookPayload) {

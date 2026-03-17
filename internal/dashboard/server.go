@@ -182,14 +182,15 @@ type WorkerDetail struct {
 }
 
 type BlockEvent struct {
-	Coin      string  `json:"coin"`
-	Height    int64   `json:"height"`
-	Hash      string  `json:"hash"`
-	Reward    string  `json:"reward"`
-	Worker    string  `json:"worker"`
-	FoundAt   string  `json:"found_at"`
-	FoundAtMS int64   `json:"found_at_ms"` // epoch ms for chart positioning
-	Luck      float64 `json:"luck"`        // luck %; -1 = N/A (aux chain)
+	Coin        string  `json:"coin"`
+	Height      int64   `json:"height"`
+	Hash        string  `json:"hash"`
+	Reward      string  `json:"reward"`
+	Worker      string  `json:"worker"`
+	FoundAt     string  `json:"found_at"`
+	FoundAtMS   int64   `json:"found_at_ms"` // epoch ms for chart positioning
+	Luck        float64 `json:"luck"`        // luck %; -1 = N/A (aux chain)
+	ExplorerURL string  `json:"explorer_url,omitempty"` // base URL + hash link
 }
 
 // HistoBucket is one bin of the share difficulty histogram
@@ -1696,9 +1697,12 @@ function apply(s) {
         var luckColor = b.luck >= 100 ? 'var(--hi)' : (b.luck >= 50 ? 'var(--hi2)' : '#ff6600');
         luckStr = ' · <span style="color:'+luckColor+'">LUCK '+b.luck.toFixed(1)+'%</span>';
       }
+      var hashDisplay = b.explorer_url
+        ? '<a href="'+b.explorer_url+b.hash+'" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted;word-break:break-all">'+b.hash.slice(0,16)+'…</a>'
+        : b.hash.slice(0,16)+'…';
       return '<div class="block-entry">' +
         '<div class="block-trophy">***</div>' +
-        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+b.hash+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+luckStr+'</div></div>' +
+        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+hashDisplay+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+luckStr+'</div></div>' +
         '<div class="block-meta"><div class="block-reward">'+b.reward+'</div><div class="block-time">'+b.found_at+'</div></div>' +
         '</div>';
     }).join('')+'</div>';
@@ -2038,10 +2042,17 @@ function renderWorkersTab(s) {
   tbody.innerHTML = '';
   workers.forEach(function(w) {
     var total = (w.shares_accepted||0)+(w.shares_rejected||0)+(w.shares_stale||0);
-    var stalePct = total>0 ? ((w.shares_stale||0)/total*100).toFixed(2)+'%' : '0.00%';
+    var staleRate = total>0 ? (w.shares_stale||0)/total : 0;
+    var stalePct = (staleRate*100).toFixed(2)+'%';
     var invPct   = total>0 ? ((w.shares_rejected||0)/total*100).toFixed(2)+'%' : '0.00%';
     var staleHigh = parseFloat(stalePct) >= 3;
     var invHigh   = parseFloat(invPct)   >= 1;
+    var staleBadge = '';
+    if (staleRate >= 0.25) {
+      staleBadge = '<span style="background:#c0392b;color:#fff;border-radius:3px;padding:1px 4px;font-size:10px;margin-left:3px">'+Math.round(staleRate*100)+'%</span>';
+    } else if (staleRate >= 0.10) {
+      staleBadge = '<span style="background:#f39c12;color:#fff;border-radius:3px;padding:1px 4px;font-size:10px;margin-left:3px">'+Math.round(staleRate*100)+'%</span>';
+    }
     var statusCls = w.online ? 'worker-status-on' : 'worker-status-off';
     var statusTxt = w.online ? 'ONLINE' : (w.last_seen_at||'OFFLINE');
     var diffHtml = w.online ? '<span class="shares-val">'+fmtDiffShort(w.difficulty||0)+'</span>' : '<span class="worker-device">--</span>';
@@ -2081,7 +2092,7 @@ function renderWorkersTab(s) {
       '<td>'+hrHtml+'</td>' +
       '<td><span class="shares-val">'+((w.shares_accepted||0).toLocaleString())+'</span></td>' +
       '<td><span class="'+(staleHigh?'shares-rej':'shares-val')+'">'+stalePct+'</span></td>' +
-      '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span></td>' +
+      '<td><span class="'+(invHigh?'shares-rej':'shares-val')+'">'+invPct+'</span>'+staleBadge+'</td>' +
       '<td>'+bestHtml+'</td>' +
       '<td>'+sessHtml+'</td>' +
       '<td><span class="shares-val">'+wattsStr+'</span></td>' +
@@ -2873,7 +2884,9 @@ function renderWorkerModal(d) {
     ['Watts', d.watts_estimate > 0 ? d.watts_estimate.toFixed(0) + ' W' : '—'],
   ];
   meta.innerHTML = rows.map(function(r){ return '<div><span style="color:#666">'+r[0]+'</span><br><span style="color:#dde">'+r[1]+'</span></div>'; }).join('');
-  // Diff chart
+  // Step-line diff chart (new canvas-based)
+  renderWorkerChart(d);
+  // Legacy line chart (same data, smaller canvas below)
   drawLineChart('wm-diff-chart', (d.diff_history||[]).map(function(e){ return {x:e.at_ms, y:e.diff}; }), '#7090ff');
   // Share sparkline
   drawBarChart('wm-share-chart', d.share_sparkline||[], '#5fa');
@@ -2943,6 +2956,56 @@ function drawBarChart(canvasId, values, color) {
     ctx.fillRect(i*bw+1, H-bh, bw-2, bh);
   }
 }
+function renderWorkerChart(detail) {
+  var canvas = document.getElementById('workerChart');
+  if (!canvas || !detail.diff_history || detail.diff_history.length < 2) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width = canvas.offsetWidth;
+  var H = canvas.height = 160;
+  ctx.clearRect(0, 0, W, H);
+  var hist = detail.diff_history;
+  var now = Date.now();
+  var minT = hist[0].at_ms, maxT = now;
+  if (maxT <= minT) maxT = minT + 1;
+  var diffs = hist.map(function(h){ return h.diff; });
+  var minD = Math.min.apply(null, diffs), maxD = Math.max.apply(null, diffs);
+  var logMin = Math.log10(Math.max(1, minD * 0.5));
+  var logMax = Math.log10(maxD * 2);
+  if (logMax <= logMin) logMax = logMin + 1;
+  function xPos(t){ return (t - minT) / (maxT - minT) * (W - 40) + 20; }
+  function yPos(d){ return H - 20 - (Math.log10(Math.max(1,d)) - logMin) / (logMax - logMin) * (H - 40); }
+  ctx.strokeStyle = '#3498db';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (var i=0; i<hist.length; i++) {
+    var x = xPos(hist[i].at_ms), y = yPos(hist[i].diff);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    if (i < hist.length - 1) ctx.lineTo(xPos(hist[i+1].at_ms), y);
+  }
+  if (hist.length > 0) ctx.lineTo(xPos(now), yPos(hist[hist.length-1].diff));
+  ctx.stroke();
+  ctx.fillStyle = '#3498db';
+  for (var i=0; i<hist.length; i++) {
+    ctx.beginPath();
+    ctx.arc(xPos(hist[i].at_ms), yPos(hist[i].diff), 3, 0, 2*Math.PI);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#999';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'right';
+  for (var p=Math.ceil(logMin); p<=Math.floor(logMax); p++) {
+    var d = Math.pow(10, p);
+    var y = yPos(d);
+    if (y > 10 && y < H - 10) {
+      ctx.fillText(d >= 1e6 ? (d/1e6).toFixed(0)+'M' : d >= 1e3 ? (d/1e3).toFixed(0)+'K' : d, 18, y+3);
+      ctx.strokeStyle = '#333';
+      ctx.setLineDash([2,4]);
+      ctx.beginPath(); ctx.moveTo(20, y); ctx.lineTo(W, y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  ctx.textAlign = 'left';
+}
 
 </script>
 <!-- Worker detail modal -->
@@ -2953,7 +3016,8 @@ function drawBarChart(canvasId, values, color) {
   <div id="wm-meta" style="display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;margin-bottom:16px;font-size:.85rem;color:#aaa;"></div>
   <div style="margin-bottom:16px;">
    <div style="color:#aaa;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Difficulty History</div>
-   <canvas id="wm-diff-chart" height="80" style="width:100%;background:#111122;border-radius:4px;"></canvas>
+   <canvas id="workerChart" height="160" style="width:100%;background:#111122;border-radius:4px;display:block;"></canvas>
+   <canvas id="wm-diff-chart" height="80" style="width:100%;background:#111122;border-radius:4px;margin-top:4px;"></canvas>
   </div>
   <div style="margin-bottom:16px;">
    <div style="color:#aaa;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Shares / Minute (last 30 min)</div>

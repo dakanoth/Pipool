@@ -315,6 +315,9 @@ func main() {
 		srv.OnBlockMature = func(coin, hash string, height int64, reward string) {
 			notifier.BlockMatured(coin, hash, height, reward)
 		}
+		srv.OnStaleKick = func(workerName string, kickCount int) {
+			notifier.StaleKick(coin.Symbol, workerName, kickCount)
+		}
 		srv.OnAuxBlockFound = func(info stratum.AuxBlockInfo) {
 			// Build the allHashes slice in sorted symbol order (same order used when
 			// building the coinbase commitment so the merkle tree is identical).
@@ -950,6 +953,26 @@ func main() {
 
 // ─── Stats aggregators ────────────────────────────────────────────────────────
 
+// defaultExplorers maps coin symbols to block explorer base URLs.
+// The block hash is appended directly after the base URL.
+var defaultExplorers = map[string]string{
+	"BTC":  "https://blockchair.com/bitcoin/block/",
+	"BCH":  "https://blockchair.com/bitcoin-cash/block/",
+	"LTC":  "https://blockchair.com/litecoin/block/",
+	"DOGE": "https://blockchair.com/dogecoin/block/",
+	"DGB":  "https://digiexplorer.info/block/",
+	"DGBS": "https://digiexplorer.info/block/",
+	"PEP":  "https://pepenomics.com/explorer/block/",
+}
+
+// explorerURL returns the block explorer base URL for a coin, checking coin config first.
+func explorerURL(cfg *config.PoolConfig, symbol string) string {
+	if coinCfg, ok := cfg.Coins[symbol]; ok && coinCfg.BlockExplorer != "" {
+		return coinCfg.BlockExplorer
+	}
+	return defaultExplorers[symbol]
+}
+
 func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
 		Timestamp:   time.Now(),
@@ -1296,14 +1319,15 @@ collect:
 	for _, srv := range servers {
 		for _, b := range srv.BlockLog() {
 			snap.BlockLog = append(snap.BlockLog, dashboard.BlockEvent{
-				Coin:      b.Coin,
-				Height:    b.Height,
-				Hash:      b.Hash,
-				Reward:    b.Reward,
-				Worker:    b.Worker,
-				FoundAt:   b.FoundAt.Format("Jan 2 15:04:05"),
-				FoundAtMS: b.FoundAt.UnixMilli(),
-				Luck:      b.BlockLuck,
+				Coin:        b.Coin,
+				Height:      b.Height,
+				Hash:        b.Hash,
+				Reward:      b.Reward,
+				Worker:      b.Worker,
+				FoundAt:     b.FoundAt.Format("Jan 2 15:04:05"),
+				FoundAtMS:   b.FoundAt.UnixMilli(),
+				Luck:        b.BlockLuck,
+				ExplorerURL: explorerURL(cfg, b.Coin),
 			})
 		}
 	}

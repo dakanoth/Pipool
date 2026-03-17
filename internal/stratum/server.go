@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -99,6 +100,11 @@ type Server struct {
 	OnBlockOrphaned func(coin, hash string, height int64)
 	// Callback fired when a block crosses the maturity threshold (confirmations become spendable)
 	OnBlockMature func(coin, hash string, height int64, reward string)
+	// OnStaleKick fires when a worker's hourly stale-kick count crosses the threshold.
+	OnStaleKick func(workerName string, kickCount int)
+
+	// workerKickTimes tracks rolling 1-hour stale kick timestamps per worker (under mu).
+	workerKickTimes map[string][]time.Time
 }
 
 // Worker represents a connected miner
@@ -218,19 +224,20 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 	}
 
 	return &Server{
-		coin:         coin,
-		seenWorkers:   make(map[string]*SeenWorker),
+		coin:            coin,
+		seenWorkers:     make(map[string]*SeenWorker),
 		shareSamples:    make([]ShareSample, 0, 200),
 		hashrateSamples: make([]HashrateSample, 0, 288),
-		poolCfg:      poolCfg,
-		coinbaseTag:  tag,
-		rpcClient:    cli,
-		backupRPC:    backupRPC,
-		coordinator:  coord,
-		workers:      make(map[string]*Worker),
-		recentJobs:   make(map[string]*Job),
-		jobBroadcast: make(chan *Job, 16),
-		stopCh:       make(chan struct{}),
+		poolCfg:         poolCfg,
+		coinbaseTag:     tag,
+		rpcClient:       cli,
+		backupRPC:       backupRPC,
+		coordinator:     coord,
+		workers:         make(map[string]*Worker),
+		recentJobs:      make(map[string]*Job),
+		jobBroadcast:    make(chan *Job, 16),
+		stopCh:          make(chan struct{}),
+		workerKickTimes: make(map[string][]time.Time),
 	}
 }
 
@@ -251,6 +258,33 @@ func (s *Server) Start() error {
 
 	log.Printf("[%s] Stratum server listening on %s (pool addr %s)", s.coin.Symbol, listenAddr, s.poolCfg.Pool.Host)
 
+	// TLS listener (optional — only if enabled in coin config)
+	if s.coin.Stratum.TLS.Enabled {
+		tlsPort := s.coin.Stratum.TLS.Port
+		if tlsPort == 0 {
+			tlsPort = defaultTLSPort(s.coin.Stratum.Port)
+		}
+		tlsCfg, tlsErr := buildTLSConfig(TLSConfig{
+			Enabled:  s.coin.Stratum.TLS.Enabled,
+			Port:     s.coin.Stratum.TLS.Port,
+			CertFile: s.coin.Stratum.TLS.CertFile,
+			KeyFile:  s.coin.Stratum.TLS.KeyFile,
+		}, s.coin.Symbol)
+		if tlsErr != nil {
+			log.Printf("[%s] TLS setup failed: %v — TLS disabled", s.coin.Symbol, tlsErr)
+		} else {
+			tlsAddr := fmt.Sprintf("0.0.0.0:%d", tlsPort)
+			tlsLn, tlsErr := net.Listen("tcp", tlsAddr)
+			if tlsErr != nil {
+				log.Printf("[%s] TLS stratum listen on %s failed: %v — TLS disabled", s.coin.Symbol, tlsAddr, tlsErr)
+			} else {
+				tlsLn = tls.NewListener(tlsLn, tlsCfg)
+				log.Printf("[%s] TLS stratum listening on %s (auto-cert)", s.coin.Symbol, tlsAddr)
+				go s.acceptLoop(tlsLn)
+			}
+		}
+	}
+
 	// Start block template poller — recovers from panics internally
 	go s.pollBlockTemplate()
 
@@ -259,38 +293,8 @@ func (s *Server) Start() error {
 	// on share submissions, so without this such miners would be stuck forever).
 	go s.idleVardiffDecay()
 
-	// Accept miner connections
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				select {
-				case <-s.stopCh:
-					return // clean shutdown
-				default:
-					log.Printf("[%s] accept error: %v", s.coin.Symbol, err)
-					continue
-				}
-			}
-
-			// IP allowlist check
-			if len(s.poolCfg.Pool.IPAllowlist) > 0 && !isAllowedIP(conn.RemoteAddr().String(), s.poolCfg.Pool.IPAllowlist) {
-				log.Printf("[%s] connection rejected (not in allowlist): %s", s.coin.Symbol, conn.RemoteAddr())
-				conn.Close()
-				continue
-			}
-
-			// Enforce connection cap for RAM safety
-			if int(s.connectedMiners.Load()) >= s.poolCfg.Pool.MaxConnections {
-				log.Printf("[%s] connection limit reached, rejecting %s", s.coin.Symbol, conn.RemoteAddr())
-				conn.Close()
-				continue
-			}
-
-			s.wg.Add(1)
-			go s.handleWorker(conn)
-		}
-	}()
+	// Accept miner connections on the plain TCP listener
+	go s.acceptLoop(ln)
 
 	// Broadcast new jobs as they arrive — recovers from panics internally
 	go s.broadcastJobs()
@@ -379,6 +383,97 @@ func (s *Server) kickAllConnected() {
 	defer s.mu.RUnlock()
 	for _, w := range s.workers {
 		w.conn.Close()
+	}
+}
+
+// kickStaleStreakWorkers disconnects any worker that currently has a non-zero
+// stale streak (i.e. they have already submitted at least one stale share for
+// an aged-out job). Called on every genuine new-block broadcast so that
+// firmware which ignores clean_jobs=true is kicked at the next block boundary
+// rather than waiting for N more stale submissions.
+func (s *Server) kickStaleStreakWorkers() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, w := range s.workers {
+		if w.staleJobStreak > 0 {
+			log.Printf("[%s] new block: kicking %s (stale streak %d, job %s ignores clean_jobs)",
+				s.coin.Symbol, w.workerName, w.staleJobStreak, w.lastStaleJobID)
+			s.recordStaleKick(w.workerName)
+			w.conn.Close()
+		}
+	}
+}
+
+// coinFixedDiff returns the effective fixed difficulty for a worker name,
+// checking coin-level config first, then global pool config. Returns 0 if none set.
+func (s *Server) coinFixedDiff(workerName string) float64 {
+	if s.coin.WorkerFixedDiff != nil {
+		if fd, ok := s.coin.WorkerFixedDiff[workerName]; ok && fd > 0 {
+			return fd
+		}
+	}
+	if s.poolCfg.Pool.WorkerFixedDiff != nil {
+		if fd, ok := s.poolCfg.Pool.WorkerFixedDiff[workerName]; ok && fd > 0 {
+			return fd
+		}
+	}
+	return 0
+}
+
+// recordStaleKick records a kick for the worker and fires OnStaleKick if the
+// 1-hour kick count exceeds the configured threshold.
+func (s *Server) recordStaleKick(workerName string) {
+	s.mu.Lock()
+	now := time.Now()
+	cutoff := now.Add(-time.Hour)
+	kicks := s.workerKickTimes[workerName]
+	pruned := kicks[:0]
+	for _, t := range kicks {
+		if t.After(cutoff) {
+			pruned = append(pruned, t)
+		}
+	}
+	pruned = append(pruned, now)
+	s.workerKickTimes[workerName] = pruned
+	count := len(pruned)
+	s.mu.Unlock()
+
+	const threshold = 3
+	if count >= threshold && count%threshold == 0 {
+		if s.OnStaleKick != nil {
+			s.OnStaleKick(workerName, count)
+		}
+	}
+}
+
+// acceptLoop accepts connections on ln and spawns a goroutine for each.
+func (s *Server) acceptLoop(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.stopCh:
+				return
+			default:
+				log.Printf("[%s] accept error: %v", s.coin.Symbol, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+		// IP allowlist check
+		if len(s.poolCfg.Pool.IPAllowlist) > 0 && !isAllowedIP(conn.RemoteAddr().String(), s.poolCfg.Pool.IPAllowlist) {
+			log.Printf("[%s] connection rejected (not in allowlist): %s", s.coin.Symbol, conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		// Enforce connection cap for RAM safety
+		if int(s.connectedMiners.Load()) >= s.poolCfg.Pool.MaxConnections {
+			log.Printf("[%s] connection limit reached, rejecting %s", s.coin.Symbol, conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		s.wg.Add(1)
+		go s.handleWorker(conn)
 	}
 }
 
@@ -478,6 +573,15 @@ func (s *Server) pollBlockTemplate() {
 		select {
 		case s.jobBroadcast <- job:
 		default:
+		}
+		// On a real new block (clean_jobs=true), immediately kick any worker that
+		// is already in a stale streak — they are confirmed to be ignoring clean_jobs
+		// and mining old work. Kicking at block notification time (rather than waiting
+		// for N more stale submissions) caps the stale/reconnect window to at most
+		// one block interval. This is especially important for fast-block coins like
+		// DGBS (~15s blocks) where DG1Home firmware never self-reconnects.
+		if cleanJobs {
+			s.kickStaleStreakWorkers()
 		}
 	}
 
@@ -974,13 +1078,10 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 	}
 	s.mu.Unlock()
 
-	// Check for a fixed difficulty override from config
-	fixedDiff := 0.0
-	if s.poolCfg.Pool.WorkerFixedDiff != nil {
-		if fd, ok := s.poolCfg.Pool.WorkerFixedDiff[workerName]; ok && fd > 0 {
-			fixedDiff = fd
-			startDiff = fd
-		}
+	// Check for a fixed difficulty override from config (coin-level takes priority over global)
+	fixedDiff := s.coinFixedDiff(workerName)
+	if fixedDiff > 0 {
+		startDiff = fixedDiff
 	}
 
 	// Update worker fields under w.mu only (never while holding s.mu).
@@ -1055,17 +1156,24 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 		w.sharesStale++
 		s.updateSeenWorkerShares(w)
 		// Track consecutive stales on the same old job (firmware ignoring clean_jobs).
-		// After 5 stales for the same job, kick the worker so it reconnects and gets fresh work.
+		// Kick threshold is configurable per coin (stale_kick_count in stratum config).
+		// Default 5; set lower (e.g. 2) for fast-block coins like DGBS to reduce
+		// the stale/reconnect overhead window.
+		kickAt := s.coin.Stratum.StaleKickCount
+		if kickAt <= 0 {
+			kickAt = 5
+		}
 		if submittedJobID == w.lastStaleJobID {
 			w.staleJobStreak++
 		} else {
 			w.lastStaleJobID = submittedJobID
 			w.staleJobStreak = 1
 		}
-		if w.staleJobStreak >= 5 {
+		if w.staleJobStreak >= kickAt {
 			log.Printf("[%s] kicking %s: %d consecutive stale shares for job %s (firmware ignoring clean_jobs)",
 				s.coin.Symbol, w.workerName, w.staleJobStreak, submittedJobID)
 			s.reply(w, msg.ID, false, []any{21, "Stale share", nil})
+			s.recordStaleKick(w.workerName)
 			w.conn.Close()
 			return nil
 		}
@@ -1575,15 +1683,14 @@ var _ = binary.LittleEndian // ensure encoding/binary stays imported
 func (s *Server) adjustVardiff(w *Worker) {
 	// If the worker has a pinned fixed difficulty, re-apply it and skip auto-adjustment.
 	// Re-read from config each time so live config changes take effect.
-	if s.poolCfg.Pool.WorkerFixedDiff != nil {
-		if fd, ok := s.poolCfg.Pool.WorkerFixedDiff[w.workerName]; ok && fd > 0 {
-			if w.difficulty != fd {
-				w.fixedDiff = fd
-				w.difficulty = fd
-				s.sendDifficulty(w, fd)
-			}
-			return
+	// Coin-level WorkerFixedDiff takes priority over global pool config.
+	if fd := s.coinFixedDiff(w.workerName); fd > 0 {
+		if w.difficulty != fd {
+			w.fixedDiff = fd
+			w.difficulty = fd
+			s.sendDifficulty(w, fd)
 		}
+		return
 	}
 	if w.fixedDiff > 0 {
 		if w.difficulty != w.fixedDiff {

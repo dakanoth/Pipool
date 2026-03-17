@@ -75,12 +75,25 @@ type CoinConfig struct {
 	TxFeeTarget  float64       `json:"tx_fee_target"`
 	BackupNode   *NodeConf     `json:"backup_node,omitempty"`
 	UpstreamPool UpstreamConf  `json:"upstream_pool"`
+	// WorkerFixedDiff pins specific workers on this coin to a fixed difficulty,
+	// overriding the global pool.worker_fixed_diff for this coin only.
+	// Key is full worker name (e.g. "wallet.workerName"). 0 or absent = use global or vardiff.
+	WorkerFixedDiff map[string]float64 `json:"worker_fixed_diff,omitempty"`
+	// BlockExplorer is the base URL for viewing blocks on a public explorer.
+	// The block hash is appended directly: BlockExplorer + hash
+	// Example: "https://blockchair.com/litecoin/block/"
+	BlockExplorer string `json:"block_explorer,omitempty"`
 }
 
 type StratumConf struct {
 	Port    int         `json:"port"`
 	Vardiff VardiffConf `json:"vardiff"`
 	TLS     TLSConf     `json:"tls"`
+	// StaleKickCount is how many consecutive stale submissions for the same aged-out
+	// job before the worker is forcibly disconnected to obtain fresh work.
+	// 0 = use default (5). For fast-block coins like DGBS (~15s blocks), set to 2
+	// so the reconnect cycle fires after ~10s of stale work instead of ~25s.
+	StaleKickCount int `json:"stale_kick_count,omitempty"`
 }
 
 type TLSConf struct {
@@ -129,6 +142,9 @@ type DiscordAlerts struct {
 	// Minimum hashrate drop % before alerting (0 = off)
 	HashrateDropPct int `json:"hashrate_drop_pct"`
 	NodeUnreachable bool `json:"node_unreachable"`
+	// StaleKickAlertCount fires a Discord alert when a worker is kicked for stale shares
+	// this many times within a 1-hour rolling window. 0 = disabled.
+	StaleKickAlertCount int `json:"stale_kick_alert_count,omitempty"`
 }
 
 type DashboardConfig struct {
