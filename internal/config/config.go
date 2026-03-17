@@ -416,16 +416,17 @@ type QuaiConfig struct {
 	Scrypt  QuaiStratumConf `json:"scrypt"`  // for Scrypt ASICs
 }
 
-// QuaiNodeConf points to the go-quai node WebSocket endpoint.
+// QuaiNodeConf points to the go-quai zone node HTTP JSON-RPC endpoint.
 type QuaiNodeConf struct {
-	Host   string `json:"host"`   // e.g. "192.168.1.92"
-	WSPort int    `json:"ws_port"` // zone WebSocket port, e.g. 8548 (zone Cyprus-1)
+	Host     string `json:"host"`      // e.g. "192.168.1.92"
+	HTTPPort int    `json:"http_port"` // zone HTTP port, e.g. 9200 (zone-0-0)
 }
 
 // QuaiStratumConf configures one stratum listener (SHA-256 or Scrypt).
 type QuaiStratumConf struct {
 	Enabled    bool    `json:"enabled"`
 	Port       int     `json:"port"`        // e.g. 3340 (SHA-256), 3341 (Scrypt)
+	Wallet     string  `json:"wallet"`      // Quai wallet address (0x...) for block rewards
 	MinDiff    float64 `json:"min_diff"`    // vardiff floor
 	MaxDiff    float64 `json:"max_diff"`    // vardiff ceiling
 	TargetTime float64 `json:"target_time"` // seconds per share (default 15)

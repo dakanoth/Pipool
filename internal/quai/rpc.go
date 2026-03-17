@@ -1,25 +1,23 @@
 // Package quai implements a Quai Network stratum pool for SHA-256 and Scrypt ASICs.
 //
 // Architecture:
-//   - NodeClient connects to the go-quai node via WebSocket JSON-RPC
-//   - It polls quai_getPendingHeader every second for fresh work
-//   - Valid workshares are submitted via quai_receiveMinedHeader
+//   - NodeClient connects to the go-quai node via HTTP JSON-RPC
+//   - Each Server polls quai_getBlockTemplate every second for fresh work
+//   - Valid shares (workshares and full blocks) are submitted via
+//     quai_submitShaBlock or quai_submitScryptBlock with the full serialized block
 //   - The Server presents standard Stratum v1 to miners (same protocol as Bitcoin)
 package quai
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/big"
-	"net/url"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/websocket"
 )
 
 // ─── RPC types ────────────────────────────────────────────────────────────────
@@ -43,208 +41,134 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-// PendingHeader is the work unit returned by quai_getPendingHeader.
-// Fields follow go-quai's JSON encoding of a Quai block header.
-type PendingHeader struct {
-	// WorkShare fields
-	ParentHash    []string `json:"parentHash"`    // [prime, region, zone]
-	Number        []string `json:"number"`        // [prime, region, zone] hex
-	Difficulty    string   `json:"difficulty"`    // hex big.Int
-	PrimeTerminus string   `json:"primeTerminus"` // hash hex
-	// Seal fields (what miners work on)
-	MixHash string `json:"mixHash"` // 32-byte hex (seed for the job)
-	Nonce   string `json:"nonce"`   // 8-byte hex
-	// Workshare difficulty (may differ from block difficulty)
-	WorkShareThreshold string `json:"workShareThreshold"` // hex big.Int
-	// Raw header for resubmission
-	raw json.RawMessage
+// BlockTemplate is the work unit returned by quai_getBlockTemplate.
+type BlockTemplate struct {
+	Bits         string   `json:"bits"`
+	Coinb1       string   `json:"coinb1"`
+	Coinb2       string   `json:"coinb2"`
+	MerkleBranch []string `json:"merklebranch"`
+	PrevHash     string   `json:"previousblockhash"`
+	Target       string   `json:"target"`
+	Version      uint32   `json:"version"`
+	Height       uint64   `json:"height"`
+	CurTime      uint32   `json:"curtime"`
+	QuaiRoot     string   `json:"quairoot"` // first 6 bytes of sealhash — change detector
+
+	EN2Length int `json:"extranonce2Length"` // should be 8
+
+	// Parsed target (big-endian big.Int for comparison). Filled by GetBlockTemplate.
+	TargetInt *big.Int `json:"-"`
 }
 
-// SealHash returns the 32-byte hash miners should work on.
-// For SHA-256 and Scrypt miners we encode this into a Bitcoin-style 80-byte header.
-func (p *PendingHeader) SealHash() []byte {
-	h, _ := hex.DecodeString(strings.TrimPrefix(p.MixHash, "0x"))
-	return h
+// getBlockTemplateParams is sent as the single element of the params array.
+type getBlockTemplateParams struct {
+	Rules       []string `json:"rules"`
+	ExtraNonce1 string   `json:"extranonce1"`
+	ExtraNonce2 string   `json:"extranonce2"`
+	ExtraData   string   `json:"extradata"`
+	Coinbase    string   `json:"coinbase"`
 }
 
-// WorkDifficulty returns the workshare difficulty as a big.Int.
-func (p *PendingHeader) WorkDifficulty() *big.Int {
-	d := new(big.Int)
-	if p.WorkShareThreshold != "" {
-		d.SetString(strings.TrimPrefix(p.WorkShareThreshold, "0x"), 16)
-	} else if p.Difficulty != "" {
-		d.SetString(strings.TrimPrefix(p.Difficulty, "0x"), 16)
-	}
-	return d
-}
-
-// BlockDifficulty returns the full block difficulty.
-func (p *PendingHeader) BlockDifficulty() *big.Int {
-	d := new(big.Int)
-	d.SetString(strings.TrimPrefix(p.Difficulty, "0x"), 16)
-	return d
-}
-
-// ZoneNumber returns the zone block number (index 2).
-func (p *PendingHeader) ZoneNumber() uint64 {
-	if len(p.Number) < 3 {
-		return 0
-	}
-	n := new(big.Int)
-	n.SetString(strings.TrimPrefix(p.Number[2], "0x"), 16)
-	return n.Uint64()
+// SubmitResult is the response from quai_submitShaBlock / quai_submitScryptBlock.
+type SubmitResult struct {
+	Hash   string `json:"hash"`
+	Number string `json:"number"`
+	// "0x0" = workshare, "0x1" = valid block, "0x2" = canonical block
+	Status string `json:"status"`
 }
 
 // ─── NodeClient ───────────────────────────────────────────────────────────────
 
-// NodeClient maintains a persistent WebSocket connection to a go-quai node
-// and provides methods for fetching work and submitting solutions.
+// NodeClient sends HTTP JSON-RPC requests to a go-quai zone node.
 type NodeClient struct {
-	wsURL  string
-	mu     sync.Mutex
-	ws     *websocket.Conn
-	idSeq  int
-	closed bool
-
-	// Pending header polling
-	onNewWork func(*PendingHeader)
-	pollStop  chan struct{}
+	httpURL string
+	client  *http.Client
+	mu      sync.Mutex
+	idSeq   int
 }
 
-// NewNodeClient creates a NodeClient connected to the Quai node at host:wsPort.
-// The WebSocket port for a zone node is typically 8546 (zone WS) or a configured zone WS port.
-func NewNodeClient(host string, wsPort int) *NodeClient {
-	u := url.URL{Scheme: "ws", Host: fmt.Sprintf("%s:%d", host, wsPort), Path: "/"}
+// NewNodeClient creates a NodeClient pointed at host:httpPort.
+// The HTTP port for zone-0-0 is 9200 (base 9001 + 199 + zone-index).
+func NewNodeClient(host string, httpPort int) *NodeClient {
 	return &NodeClient{
-		wsURL:    u.String(),
-		pollStop: make(chan struct{}),
+		httpURL: fmt.Sprintf("http://%s:%d", host, httpPort),
+		client:  &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-// Connect establishes the WebSocket connection. Retries indefinitely on failure.
-func (c *NodeClient) Connect(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		ws, err := websocket.Dial(c.wsURL, "", "http://localhost/")
-		if err != nil {
-			log.Printf("[quai-rpc] connect failed (%s): %v — retrying in 5s", c.wsURL, err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		c.mu.Lock()
-		c.ws = ws
-		c.mu.Unlock()
-		log.Printf("[quai-rpc] connected to %s", c.wsURL)
-		return nil
-	}
-}
+// Connect is a no-op for HTTP; kept so callers compiled against the old API still build.
+func (c *NodeClient) Connect(_ context.Context) error { return nil }
 
-// Close shuts down the client.
-func (c *NodeClient) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.closed = true
-	if c.ws != nil {
-		c.ws.Close()
-	}
-}
+// Close is a no-op for HTTP.
+func (c *NodeClient) Close() {}
 
 func (c *NodeClient) call(method string, params []interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
-	if c.ws == nil {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("not connected")
-	}
 	c.idSeq++
 	id := c.idSeq
-	ws := c.ws
 	c.mu.Unlock()
 
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
-		ID:      id,
-	}
-
-	// Set a 10s deadline so we don't hang forever if the node stops responding
-	ws.SetDeadline(time.Now().Add(10 * time.Second))
-	defer ws.SetDeadline(time.Time{}) // clear after call
-
-	if err := websocket.JSON.Send(ws, req); err != nil {
-		return nil, fmt.Errorf("send: %w", err)
-	}
-	var resp rpcResponse
-	if err := websocket.JSON.Receive(ws, &resp); err != nil {
-		return nil, fmt.Errorf("receive: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("rpc error %d: %s", resp.Error.Code, resp.Error.Message)
-	}
-	return resp.Result, nil
-}
-
-// GetPendingHeader fetches the current pending header from the Quai node.
-func (c *NodeClient) GetPendingHeader() (*PendingHeader, error) {
-	raw, err := c.call("quai_getPendingHeader", nil)
+	req := rpcRequest{JSONRPC: "2.0", Method: method, Params: params, ID: id}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	var h PendingHeader
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return nil, fmt.Errorf("unmarshal header: %w", err)
+	resp, err := c.client.Post(c.httpURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-	h.raw = raw
-	return &h, nil
+	defer resp.Body.Close()
+
+	var rpcResp rpcResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("rpc error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+	return rpcResp.Result, nil
 }
 
-// ReceiveMinedHeader submits a solved header (workshare) to the Quai node.
-// header is the original PendingHeader with Nonce filled in by the miner.
-func (c *NodeClient) ReceiveMinedHeader(header *PendingHeader, nonce string, mixHash string) error {
-	// Build a copy of the header with the miner's nonce and mixHash
-	var obj map[string]interface{}
-	if err := json.Unmarshal(header.raw, &obj); err != nil {
-		return fmt.Errorf("unmarshal header for submission: %w", err)
+// GetBlockTemplate fetches a fresh block template from the node.
+// algo must be "sha" (SHA-256d) or "scrypt".
+// coinbaseAddr is the Quai wallet address that receives the block reward.
+func (c *NodeClient) GetBlockTemplate(algo, coinbaseAddr string) (*BlockTemplate, error) {
+	params := getBlockTemplateParams{
+		Rules:       []string{algo},
+		ExtraNonce1: "00000000",
+		ExtraNonce2: "0000000000000000",
+		ExtraData:   "/PiPool/",
+		Coinbase:    coinbaseAddr,
 	}
-	obj["nonce"] = nonce
-	obj["mixHash"] = mixHash
-
-	_, err := c.call("quai_receiveMinedHeader", []interface{}{obj})
-	return err
+	raw, err := c.call("quai_getBlockTemplate", []interface{}{params})
+	if err != nil {
+		return nil, err
+	}
+	var t BlockTemplate
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return nil, fmt.Errorf("unmarshal template: %w", err)
+	}
+	targetHex := strings.TrimPrefix(t.Target, "0x")
+	t.TargetInt = new(big.Int)
+	t.TargetInt.SetString(targetHex, 16)
+	return &t, nil
 }
 
-// StartPolling begins polling for new work every interval, calling onWork on each new header.
-// It reconnects automatically if the WebSocket drops.
-func (c *NodeClient) StartPolling(ctx context.Context, interval time.Duration, onWork func(*PendingHeader)) {
-	c.onNewWork = onWork
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		var lastMixHash string
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			h, err := c.GetPendingHeader()
-			if err != nil {
-				log.Printf("[quai-rpc] getPendingHeader: %v", err)
-				// Try to reconnect
-				_ = c.Connect(ctx)
-				continue
-			}
-			// Only push if work changed
-			if h.MixHash != lastMixHash {
-				lastMixHash = h.MixHash
-				if c.onNewWork != nil {
-					c.onNewWork(h)
-				}
-			}
-		}
-	}()
+// SubmitBlock submits a solved block or workshare to the node.
+// rawHex is the full hex-encoded serialized block (80-byte header + varint + coinbase tx),
+// without a 0x prefix. algo must be "sha" or "scrypt".
+func (c *NodeClient) SubmitBlock(rawHex, algo string) (*SubmitResult, error) {
+	method := "quai_submitShaBlock"
+	if algo == "scrypt" {
+		method = "quai_submitScryptBlock"
+	}
+	raw, err := c.call(method, []interface{}{"0x" + rawHex})
+	if err != nil {
+		return nil, err
+	}
+	var result SubmitResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal submit result: %w", err)
+	}
+	return &result, nil
 }

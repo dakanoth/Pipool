@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,161 +20,102 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
-// ─── Job encoding ─────────────────────────────────────────────────────────────
-//
-// Quai work is encoded into a Bitcoin-style Stratum v1 job so standard
-// SHA-256d and Scrypt ASICs can hash it without any firmware changes.
-//
-// The 80-byte "fake" Bitcoin header is constructed as:
-//   version  (4B)  = 0x20000000 (BIP9 bits)
-//   prevhash (32B) = Quai sealhash (the 32-byte header hash miners work on)
-//   merkle   (32B) = Quai sealhash (same — no real txs, just needs to be stable)
-//   ntime    (4B)  = current unix time
-//   nbits    (4B)  = target packed bits derived from workshare difficulty
-//   nonce    (4B)  = miner-supplied
-//
-// The miner hashes this 80-byte blob with SHA-256d (or Scrypt for Scrypt miners).
-// When the result meets the workshare target, the pool submits it to the Quai node
-// via quai_receiveMinedHeader with the nonce filled in.
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	extranonce1Len = 4 // bytes
-	extranonce2Len = 4 // bytes
+	extranonce1Len = 4 // bytes — assigned by pool per connection
+	extranonce2Len = 8 // bytes — filled in by miner
 )
 
-// Job is a unit of mining work derived from a Quai PendingHeader.
+// diff1Target is the standard Bitcoin SHA-256d difficulty-1 target.
+var diff1Target, _ = new(big.Int).SetString(
+	"00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
+
+// ─── Observable types ─────────────────────────────────────────────────────────
+
+// ShareSample records an accepted share for hashrate estimation.
+type ShareSample struct {
+	Difficulty float64
+	TimeMS     int64
+	Accepted   bool
+}
+
+// HashrateSample is a periodic KH/s snapshot.
+type HashrateSample struct {
+	KHs    float64
+	TimeMS int64
+}
+
+// BlockInfo records a block or workshare found by the pool.
+type BlockInfo struct {
+	Height  uint64
+	Hash    string
+	Worker  string
+	FoundAt time.Time
+}
+
+// ─── Job ──────────────────────────────────────────────────────────────────────
+
+// Job is a unit of mining work derived from a BlockTemplate plus per-worker difficulty.
 type Job struct {
-	ID        string
-	Header    *PendingHeader
-	SealHash  []byte   // 32-byte header hash
-	NBits     string   // 8 hex chars, packed difficulty target
-	NTime     string   // 8 hex chars, unix timestamp
-	Target    *big.Int // full 256-bit target for share validation
-	CreatedAt time.Time
+	ID           string
+	Template     *BlockTemplate
+	WorkerTarget *big.Int  // share acceptance threshold (from vardiff)
+	CreatedAt    time.Time
 }
 
 // miningNotify builds the mining.notify params array for this job.
 // Follows standard Bitcoin Stratum v1 encoding.
 func (j *Job) miningNotify(cleanJobs bool) []interface{} {
-	sealHex := hex.EncodeToString(j.SealHash)
-	// prevhash in Stratum is sent in 32-bit chunk-reversed little-endian
-	prevhash := reverseChunks32(sealHex)
-	// Minimal coinbase: just the seal hash split in two
-	coinb1 := sealHex[:32] // 16 bytes
-	coinb2 := sealHex[32:] // 16 bytes
+	t := j.Template
+	// prevhash: chunk-reverse each 4-byte word (standard stratum convention)
+	prevBytes, _ := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	prevhash := hex.EncodeToString(reverseChunks32Bytes(prevBytes))
+	// merkle_branches are already in internal byte order
+	branches := make([]string, len(t.MerkleBranch))
+	copy(branches, t.MerkleBranch)
 	return []interface{}{
 		j.ID,
 		prevhash,
-		coinb1,
-		coinb2,
-		[]string{}, // empty merkle branch (no real txs)
-		"20000000", // version
-		j.NBits,
-		j.NTime,
+		t.Coinb1,
+		t.Coinb2,
+		branches,
+		fmt.Sprintf("%08x", t.Version),
+		t.Bits,
+		fmt.Sprintf("%08x", t.CurTime),
 		cleanJobs,
 	}
 }
 
-// reverseChunks32 reverses the byte order within each 4-byte chunk of a hex string.
-// This is the standard Bitcoin Stratum prevhash encoding.
-func reverseChunks32(hexStr string) string {
-	b, _ := hex.DecodeString(hexStr)
-	out := make([]byte, len(b))
-	for i := 0; i+4 <= len(b); i += 4 {
-		out[i], out[i+1], out[i+2], out[i+3] = b[i+3], b[i+2], b[i+1], b[i]
+// workerTargetFromDiff returns the 256-bit target for a given vardiff difficulty.
+func workerTargetFromDiff(diff float64) *big.Int {
+	if diff <= 0 {
+		return new(big.Int).Set(diff1Target)
 	}
-	return hex.EncodeToString(out)
+	diffInt := new(big.Int).SetInt64(int64(diff))
+	return new(big.Int).Div(diff1Target, diffInt)
 }
 
-// difficultyToNBits converts a big.Int difficulty (not target) into packed nBits.
-// diff1Target for Bitcoin SHA-256d is 0x00000000FFFF0000...0000 (26 zero bytes).
-// For Scrypt: same diff1 target.
-func difficultyToNBits(diff *big.Int) string {
-	if diff == nil || diff.Sign() == 0 {
-		return "1d00ffff" // genesis difficulty
-	}
-	// diff1 target = 2^224 - 1 / 256 (Bitcoin standard)
-	diff1, _ := new(big.Int).SetString("00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
-	// target = diff1 / difficulty
-	target := new(big.Int).Div(diff1, diff)
-	if target.Sign() == 0 {
-		target.SetInt64(1)
-	}
-	// Pack into nBits
-	b := target.Bytes()
-	// Strip leading zero bytes (but keep leading zero if MSB set)
-	for len(b) > 1 && b[0] == 0 {
-		b = b[1:]
-	}
-	exp := len(b)
-	var mantissa uint32
-	if exp >= 3 {
-		mantissa = uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
-	} else if exp == 2 {
-		mantissa = uint32(b[0])<<8 | uint32(b[1])
-	} else if exp == 1 {
-		mantissa = uint32(b[0])
-	}
-	if mantissa&0x800000 != 0 {
-		mantissa >>= 8
-		exp++
-	}
-	packed := (uint32(exp) << 24) | mantissa
-	return fmt.Sprintf("%08x", packed)
-}
-
-// nbitsToTarget converts packed nBits back to a full 256-bit target.
-func nbitsToTarget(nbits string) *big.Int {
-	b, _ := hex.DecodeString(nbits)
-	if len(b) < 4 {
-		return nil
-	}
-	exp := int(b[0])
-	mantissa := new(big.Int).SetBytes(b[1:4])
-	target := new(big.Int).Lsh(mantissa, uint(8*(exp-3)))
-	return target
-}
-
-// newJob creates a Job from a PendingHeader with an optional difficulty override.
-// If workerDiff is nil, the header's workshare difficulty is used.
-func newJob(h *PendingHeader, workerDiff *big.Int) *Job {
-	seal := h.SealHash()
-	if len(seal) < 32 {
-		padded := make([]byte, 32)
-		copy(padded[32-len(seal):], seal)
-		seal = padded
-	}
-	diff := workerDiff
-	if diff == nil || diff.Sign() == 0 {
-		diff = h.WorkDifficulty()
-	}
-	nbits := difficultyToNBits(diff)
-	target := nbitsToTarget(nbits)
-	// Random job ID
+func newJob(t *BlockTemplate, workerDiff float64) *Job {
 	idb := make([]byte, 4)
 	rand.Read(idb)
-	jobID := hex.EncodeToString(idb)
-
 	return &Job{
-		ID:        jobID,
-		Header:    h,
-		SealHash:  seal,
-		NBits:     nbits,
-		NTime:     fmt.Sprintf("%08x", time.Now().Unix()),
-		Target:    target,
-		CreatedAt: time.Now(),
+		ID:           hex.EncodeToString(idb),
+		Template:     t,
+		WorkerTarget: workerTargetFromDiff(workerDiff),
+		CreatedAt:    time.Now(),
 	}
 }
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
 type Worker struct {
-	conn       net.Conn
-	enc        *json.Encoder
-	mu         sync.Mutex
-	name       string
-	authorized bool
-	difficulty float64
+	conn        net.Conn
+	enc         *json.Encoder
+	mu          sync.Mutex
+	name        string
+	authorized  bool
+	difficulty  float64
 	extraNonce1 string // 4-byte hex, unique per connection
 	// Counters
 	sharesAccepted uint64
@@ -212,6 +154,7 @@ func (w *Worker) respond(id interface{}, result interface{}, errMsg interface{})
 type WorkerInfo struct {
 	Name           string
 	Difficulty     float64
+	HashrateKHs    float64
 	SharesAccepted uint64
 	SharesRejected uint64
 	SharesStale    uint64
@@ -226,16 +169,19 @@ type WorkerInfo struct {
 
 // Server is a Stratum v1 mining pool server for a single Quai zone/algorithm.
 type Server struct {
-	algo       string // "sha256d" or "scrypt"
-	listenAddr string
-	node       *NodeClient
+	algo         string // "sha256d" or "scrypt"
+	ruleAlgo     string // "sha" or "scrypt" (for quai_getBlockTemplate rules param)
+	listenAddr   string
+	coinbaseAddr string // Quai wallet address
+	node         *NodeClient
 
-	mu          sync.RWMutex
-	workers     map[string]*Worker // keyed by extranonce1
-	currentJob  *Job
-	jobHistory  map[string]*Job // recent jobs for share validation
-	blocksFound atomic.Uint64
-	validShares atomic.Uint64
+	mu              sync.RWMutex
+	workers         map[string]*Worker // keyed by extranonce1
+	currentTemplate *BlockTemplate
+	jobHistory      map[string]*Job // recent jobs for share validation
+	blocksFound     atomic.Uint64
+	validShares     atomic.Uint64
+	online          atomic.Bool
 
 	// Vardiff settings
 	minDiff    float64
@@ -249,16 +195,23 @@ type Server struct {
 	// Stats
 	connectedMiners atomic.Int32
 
+	symbol          string
+	sampleMu        sync.Mutex
+	shareSamples    []ShareSample    // ring buffer, last 1000 accepted shares
+	hashrateSamples []HashrateSample // ring buffer, last 288 snapshots (24h at 5-min interval)
+	blockLog        []BlockInfo      // ring buffer, last 50 blocks
+
 	stopCh chan struct{}
 }
 
 // ServerConfig holds the config for a Quai stratum server instance.
 type ServerConfig struct {
-	Algo       string  // "sha256d" or "scrypt"
-	ListenAddr string  // e.g. "0.0.0.0:3340"
-	MinDiff    float64 // vardiff floor (e.g. 1000 for SHA-256, 64 for Scrypt)
-	MaxDiff    float64
-	TargetTime float64 // seconds (default 15)
+	Algo         string  // "sha256d" or "scrypt"
+	ListenAddr   string  // e.g. "0.0.0.0:3340"
+	CoinbaseAddr string  // Quai wallet address (0x...)
+	MinDiff      float64 // vardiff floor
+	MaxDiff      float64
+	TargetTime   float64 // seconds (default 15)
 }
 
 // NewServer creates a Quai stratum server.
@@ -276,16 +229,27 @@ func NewServer(cfg ServerConfig, node *NodeClient) *Server {
 	if cfg.MaxDiff == 0 {
 		cfg.MaxDiff = cfg.MinDiff * 1024
 	}
+	ruleAlgo := "sha"
+	if cfg.Algo == "scrypt" {
+		ruleAlgo = "scrypt"
+	}
+	sym := "QUAI"
+	if cfg.Algo == "scrypt" {
+		sym = "QUAIS"
+	}
 	return &Server{
-		algo:       cfg.Algo,
-		listenAddr: cfg.ListenAddr,
-		node:       node,
-		workers:    make(map[string]*Worker),
-		jobHistory: make(map[string]*Job),
-		minDiff:    cfg.MinDiff,
-		maxDiff:    cfg.MaxDiff,
-		targetTime: cfg.TargetTime,
-		stopCh:     make(chan struct{}),
+		symbol:       sym,
+		algo:         cfg.Algo,
+		ruleAlgo:     ruleAlgo,
+		listenAddr:   cfg.ListenAddr,
+		coinbaseAddr: cfg.CoinbaseAddr,
+		node:         node,
+		workers:      make(map[string]*Worker),
+		jobHistory:   make(map[string]*Job),
+		minDiff:      cfg.MinDiff,
+		maxDiff:      cfg.MaxDiff,
+		targetTime:   cfg.TargetTime,
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -295,7 +259,7 @@ func (s *Server) SetCallbacks(onBlock func(uint64, string, string), onShare func
 	s.onShare = onShare
 }
 
-// Start begins listening for miner connections and subscribing to node work.
+// Start begins listening for miner connections and polling the node for work.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
@@ -303,10 +267,8 @@ func (s *Server) Start() error {
 	}
 	log.Printf("[quai/%s] stratum listening on %s", s.algo, s.listenAddr)
 
-	// Register for new work from the node
-	s.node.onNewWork = s.onNewHeader
-
 	go s.acceptLoop(ln)
+	go s.pollLoop()
 	go s.vardiffLoop()
 	go s.jobCleanupLoop()
 	return nil
@@ -328,21 +290,45 @@ func (s *Server) acceptLoop(ln net.Listener) {
 	}
 }
 
-// onNewHeader is called whenever the node sends a new pending header.
-func (s *Server) onNewHeader(h *PendingHeader) {
+// pollLoop fetches block templates every second and broadcasts new work.
+func (s *Server) pollLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var lastQuaiRoot string
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+		t, err := s.node.GetBlockTemplate(s.ruleAlgo, s.coinbaseAddr)
+		if err != nil {
+			if s.online.Swap(false) {
+				log.Printf("[quai/%s] node offline: %v", s.algo, err)
+			}
+			continue
+		}
+		if !s.online.Swap(true) {
+			log.Printf("[quai/%s] node online", s.algo)
+		}
+		if t.QuaiRoot != lastQuaiRoot {
+			lastQuaiRoot = t.QuaiRoot
+			s.onNewTemplate(t)
+		}
+	}
+}
+
+// onNewTemplate broadcasts new work to all connected miners.
+func (s *Server) onNewTemplate(t *BlockTemplate) {
 	s.mu.Lock()
-	job := newJob(h, nil) // use header's workshare diff for pool-level target
-	s.currentJob = job
-	s.jobHistory[job.ID] = job
+	s.currentTemplate = t
 	workerList := make([]*Worker, 0, len(s.workers))
 	for _, w := range s.workers {
 		workerList = append(workerList, w)
 	}
 	s.mu.Unlock()
 
-	// Broadcast new job to all connected miners
 	for _, w := range workerList {
-		// Read worker fields under w.mu to avoid race with handleSubmit/adjustDifficulties
 		w.mu.Lock()
 		authorized := w.authorized
 		diff := w.difficulty
@@ -350,21 +336,19 @@ func (s *Server) onNewHeader(h *PendingHeader) {
 		if !authorized {
 			continue
 		}
-		// Create a per-worker job with their current difficulty
-		wJob := newJob(h, floatToBigInt(diff))
+		job := newJob(t, diff)
 		s.mu.Lock()
-		s.jobHistory[wJob.ID] = wJob
+		s.jobHistory[job.ID] = job
 		s.mu.Unlock()
-		_ = w.notify("mining.notify", wJob.miningNotify(true))
+		_ = w.notify("mining.notify", job.miningNotify(true))
 	}
-	log.Printf("[quai/%s] new work broadcast to %d miners (sealhash %s...)", s.algo, len(workerList), hex.EncodeToString(h.SealHash())[:12])
+	log.Printf("[quai/%s] new work broadcast to %d miners (quairoot %s)", s.algo, len(workerList), t.QuaiRoot)
 }
 
 // handleConn processes a single miner connection.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// Generate unique extranonce1
 	en1b := make([]byte, extranonce1Len)
 	rand.Read(en1b)
 	en1 := hex.EncodeToString(en1b)
@@ -399,7 +383,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleMessage(w, msg)
 	}
 
-	// Cleanup on disconnect
 	s.mu.Lock()
 	delete(s.workers, en1)
 	s.mu.Unlock()
@@ -421,7 +404,6 @@ func (s *Server) handleMessage(w *Worker, msg map[string]json.RawMessage) {
 	case "mining.submit":
 		s.handleSubmit(w, id, msg["params"])
 	case "mining.suggest_difficulty":
-		// Miner is requesting a starting difficulty — honor within bounds
 		var params []interface{}
 		json.Unmarshal(msg["params"], &params)
 		if len(params) > 0 {
@@ -437,13 +419,11 @@ func (s *Server) handleMessage(w *Worker, msg map[string]json.RawMessage) {
 }
 
 func (s *Server) handleSubscribe(w *Worker, id interface{}) {
-	// Respond: [subscription_id, extranonce1, extranonce2_size]
 	_ = w.respond(id, []interface{}{
 		[][]string{{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"}},
 		w.extraNonce1,
 		extranonce2Len,
 	}, nil)
-	// Set initial difficulty
 	_ = w.notify("mining.set_difficulty", []interface{}{w.difficulty})
 }
 
@@ -454,7 +434,6 @@ func (s *Server) handleAuthorize(w *Worker, id interface{}, rawParams json.RawMe
 		_ = w.respond(id, false, []interface{}{24, "No username"})
 		return
 	}
-	// Username format: 0xQuaiAddress.workerName
 	username := params[0]
 	parts := strings.SplitN(username, ".", 2)
 	address := parts[0]
@@ -462,35 +441,32 @@ func (s *Server) handleAuthorize(w *Worker, id interface{}, rawParams json.RawMe
 	if len(parts) == 2 {
 		workerName = parts[1]
 	}
-	// Validate it looks like a Quai address (0x...)
 	if !strings.HasPrefix(address, "0x") || len(address) < 10 {
-		_ = w.respond(id, false, []interface{}{24, "Invalid Quai address format (use 0xAddress.worker)"})
+		_ = w.respond(id, false, []interface{}{24, "Invalid Quai address (use 0xAddress.worker)"})
 		return
 	}
 
 	w.mu.Lock()
 	w.authorized = true
 	w.name = workerName
+	diff := w.difficulty
 	w.mu.Unlock()
 
 	_ = w.respond(id, true, nil)
 	log.Printf("[quai/%s] authorized: %s from %s", s.algo, workerName, w.remoteAddr)
 
-	// Send current job immediately
 	s.mu.RLock()
-	job := s.currentJob
+	tmpl := s.currentTemplate
 	s.mu.RUnlock()
-	if job != nil {
-		w.mu.Lock()
-		diff := w.difficulty
-		w.mu.Unlock()
-		wJob := newJob(job.Header, floatToBigInt(diff))
-		s.mu.Lock()
-		s.jobHistory[wJob.ID] = wJob
-		s.mu.Unlock()
-		_ = w.notify("mining.set_difficulty", []interface{}{diff})
-		_ = w.notify("mining.notify", wJob.miningNotify(true))
+	if tmpl == nil {
+		return
 	}
+	job := newJob(tmpl, diff)
+	s.mu.Lock()
+	s.jobHistory[job.ID] = job
+	s.mu.Unlock()
+	_ = w.notify("mining.set_difficulty", []interface{}{diff})
+	_ = w.notify("mining.notify", job.miningNotify(true))
 }
 
 func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessage) {
@@ -505,7 +481,6 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 	ntime := params[3]
 	nonce := params[4]
 
-	// Look up job
 	s.mu.RLock()
 	job, ok := s.jobHistory[jobID]
 	s.mu.RUnlock()
@@ -520,27 +495,31 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		return
 	}
 
-	// Read extranonce1 under lock (written once at connect, but be safe)
 	w.mu.Lock()
 	en1 := w.extraNonce1
 	w.mu.Unlock()
 
-	// Build the 80-byte header the miner hashed
-	header80 := buildHeader80(job.SealHash, ntime, job.NBits, en1, extranonce2, nonce)
+	// Assemble coinbase transaction
+	coinbaseTx := assembleCoinbase(job.Template.Coinb1, en1, extranonce2, job.Template.Coinb2)
 
-	// Hash it with the appropriate algorithm
+	// Compute merkle root (internal byte order, not reversed)
+	mRoot := computeMerkleRoot(coinbaseTx, job.Template.MerkleBranch)
+
+	// Build the 80-byte header the miner hashed
+	header80 := buildHeader80(job.Template, mRoot, ntime, nonce)
+
+	// Hash with the appropriate algorithm (result is big-endian for comparison)
 	var hashBytes []byte
 	switch s.algo {
 	case "scrypt":
 		hashBytes = scryptHash(header80)
-	default: // sha256d
+	default:
 		hashBytes = sha256dHash(header80)
 	}
-
 	hashInt := new(big.Int).SetBytes(hashBytes)
 
-	// Check against worker difficulty target
-	if job.Target == nil || hashInt.Cmp(job.Target) > 0 {
+	// Reject if below worker's vardiff target
+	if job.WorkerTarget == nil || hashInt.Cmp(job.WorkerTarget) > 0 {
 		w.mu.Lock()
 		w.sharesRejected++
 		w.mu.Unlock()
@@ -551,7 +530,7 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		return
 	}
 
-	// Valid workshare — update counters under w.mu
+	// Valid share — update counters
 	shareDiff := bigIntToDiff(hashInt)
 	w.mu.Lock()
 	w.sharesAccepted++
@@ -565,64 +544,55 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 	if s.onShare != nil {
 		s.onShare(w.name, true)
 	}
+	s.sampleMu.Lock()
+	s.shareSamples = append(s.shareSamples, ShareSample{Difficulty: shareDiff, TimeMS: time.Now().UnixMilli(), Accepted: true})
+	if len(s.shareSamples) > 1000 {
+		s.shareSamples = s.shareSamples[len(s.shareSamples)-1000:]
+	}
+	s.sampleMu.Unlock()
 
-	// Check if this meets the block's full difficulty
-	blockTarget := difficultyToNBits(job.Header.BlockDifficulty())
-	blockTargetInt := nbitsToTarget(blockTarget)
-	if blockTargetInt != nil && hashInt.Cmp(blockTargetInt) <= 0 {
-		// BLOCK FOUND — submit to node
-		go s.submitBlock(job, w, nonce, extranonce2, ntime)
-	} else {
-		// Submit as workshare (contributes to network even without full block)
-		go s.submitWorkshare(job, w, nonce, extranonce2)
+	// Submit to node if it also meets the template's workshare/block target
+	nodeTarget := job.Template.TargetInt
+	if nodeTarget != nil && hashInt.Cmp(nodeTarget) <= 0 {
+		go s.submitToNode(job, coinbaseTx, header80, w)
 	}
 }
 
-// buildHeader80 assembles the 80-byte Bitcoin-style header that the miner hashed.
-func buildHeader80(sealHash []byte, ntime, nbits, en1, en2, nonce string) []byte {
-	buf := make([]byte, 80)
-	// version (4B LE)
-	binary.LittleEndian.PutUint32(buf[0:], 0x20000000)
-	// prevhash (32B) = sealHash
-	copy(buf[4:], sealHash)
-	// merkle root (32B) = sealHash (stable placeholder)
-	copy(buf[36:], sealHash)
-	// ntime (4B LE)
-	ntimeBytes, _ := hex.DecodeString(ntime)
-	copy(buf[68:], reverseBytes(ntimeBytes))
-	// nbits (4B LE)
-	nbitsBytes, _ := hex.DecodeString(nbits)
-	copy(buf[72:], reverseBytes(nbitsBytes))
-	// nonce (4B LE)
-	nonceBytes, _ := hex.DecodeString(nonce)
-	copy(buf[76:], reverseBytes(nonceBytes))
-	return buf
-}
+// submitToNode sends the serialized block (header + coinbase tx) to the Quai node.
+// Every share meeting the template target is submitted — the node decides if it's a
+// workshare (status 0x0), valid block (0x1), or canonical block (0x2).
+func (s *Server) submitToNode(job *Job, coinbaseTx, header80 []byte, w *Worker) {
+	// Serialized block: 80-byte header + varint(1) + coinbase tx bytes
+	block := make([]byte, 0, len(header80)+1+len(coinbaseTx))
+	block = append(block, header80...)
+	block = append(block, 0x01) // varint: 1 transaction
+	block = append(block, coinbaseTx...)
+	rawHex := hex.EncodeToString(block)
 
-// submitBlock sends a found block to the Quai node.
-func (s *Server) submitBlock(job *Job, w *Worker, nonce, en2, ntime string) {
-	nonceHex := "0x" + nonce
-	mixHashHex := "0x" + hex.EncodeToString(job.SealHash) // simplified — real impl derives mixHash
-	err := s.node.ReceiveMinedHeader(job.Header, nonceHex, mixHashHex)
-	height := job.Header.ZoneNumber()
+	result, err := s.node.SubmitBlock(rawHex, s.ruleAlgo)
+	height := job.Template.Height
 	if err != nil {
-		log.Printf("[quai/%s] BLOCK SUBMIT FAILED height=%d worker=%s: %v", s.algo, height, w.name, err)
+		log.Printf("[quai/%s] submit failed height=%d worker=%s: %v", s.algo, height, w.name, err)
 		return
 	}
-	s.blocksFound.Add(1)
-	log.Printf("[quai/%s] *** BLOCK FOUND *** height=%d worker=%s", s.algo, height, w.name)
-	if s.onBlock != nil {
-		s.onBlock(height, nonceHex, w.name)
-	}
-}
 
-// submitWorkshare sends a valid workshare to the node (contributes to Quai's merged PoW).
-func (s *Server) submitWorkshare(job *Job, w *Worker, nonce, en2 string) {
-	nonceHex := "0x" + nonce
-	mixHashHex := "0x" + hex.EncodeToString(job.SealHash)
-	if err := s.node.ReceiveMinedHeader(job.Header, nonceHex, mixHashHex); err != nil {
-		// Workshare rejection is normal (stale, already submitted, etc.)
-		log.Printf("[quai/%s] workshare rejected worker=%s: %v", s.algo, w.name, err)
+	switch result.Status {
+	case "0x2":
+		s.blocksFound.Add(1)
+		s.recordBlock(height, result.Hash, w.name)
+		log.Printf("[quai/%s] *** CANONICAL BLOCK *** height=%d hash=%s worker=%s", s.algo, height, result.Hash, w.name)
+		if s.onBlock != nil {
+			s.onBlock(height, result.Hash, w.name)
+		}
+	case "0x1":
+		s.blocksFound.Add(1)
+		s.recordBlock(height, result.Hash, w.name)
+		log.Printf("[quai/%s] *** BLOCK FOUND *** height=%d hash=%s worker=%s", s.algo, height, result.Hash, w.name)
+		if s.onBlock != nil {
+			s.onBlock(height, result.Hash, w.name)
+		}
+	default: // "0x0" = workshare
+		log.Printf("[quai/%s] workshare submitted height=%d worker=%s", s.algo, height, w.name)
 	}
 }
 
@@ -650,7 +620,6 @@ func (s *Server) adjustDifficulties() {
 	s.mu.RUnlock()
 
 	for _, w := range workers {
-		// Snapshot mutable fields under w.mu to avoid data races
 		w.mu.Lock()
 		authorized := w.authorized
 		lastShareAt := w.lastShareAt
@@ -672,7 +641,6 @@ func (s *Server) adjustDifficulties() {
 			continue
 		}
 		actualTime := elapsed / totalShares
-		// Ratio of actual time per share vs target
 		ratio := actualTime / s.targetTime
 		if ratio < 0.5 || ratio > 2.0 {
 			newDiff := oldDiff / ratio
@@ -743,11 +711,15 @@ func (s *Server) Workers() []WorkerInfo {
 
 	out := make([]WorkerInfo, 0, len(wlist))
 	for _, w := range wlist {
-		// Snapshot under w.mu — fields may be updated by worker or vardiff goroutines
 		w.mu.Lock()
+		diff1 := 65536.0
+		if s.algo == "sha256d" {
+			diff1 = 4294967296.0
+		}
 		info := WorkerInfo{
 			Name:           w.name,
 			Difficulty:     w.difficulty,
+			HashrateKHs:    w.difficulty * diff1 / s.targetTime / 1000.0,
 			SharesAccepted: w.sharesAccepted,
 			SharesRejected: w.sharesRejected,
 			SharesStale:    w.sharesStale,
@@ -763,12 +735,78 @@ func (s *Server) Workers() []WorkerInfo {
 	return out
 }
 
+// ─── Block assembly helpers ───────────────────────────────────────────────────
+
+// assembleCoinbase concatenates coinb1 + extranonce1 + extranonce2 + coinb2.
+func assembleCoinbase(coinb1, en1, en2, coinb2 string) []byte {
+	b1, _ := hex.DecodeString(coinb1)
+	e1, _ := hex.DecodeString(en1)
+	e2, _ := hex.DecodeString(en2)
+	b2, _ := hex.DecodeString(coinb2)
+	tx := make([]byte, len(b1)+len(e1)+len(e2)+len(b2))
+	n := copy(tx, b1)
+	n += copy(tx[n:], e1)
+	n += copy(tx[n:], e2)
+	copy(tx[n:], b2)
+	return tx
+}
+
+// computeMerkleRoot builds the merkle root from a coinbase transaction and
+// the merkle branch from the block template. Returns bytes in internal (LE) order.
+func computeMerkleRoot(coinbaseTx []byte, branch []string) []byte {
+	hash := sha256dInternal(coinbaseTx)
+	for _, b := range branch {
+		branchBytes, _ := hex.DecodeString(b)
+		combined := append(hash, branchBytes...)
+		hash = sha256dInternal(combined)
+	}
+	return hash
+}
+
+// buildHeader80 assembles the 80-byte Bitcoin-style block header.
+func buildHeader80(t *BlockTemplate, merkleRoot []byte, ntime, nonce string) []byte {
+	buf := make([]byte, 80)
+
+	// version (4B LE)
+	binary.LittleEndian.PutUint32(buf[0:4], t.Version)
+
+	// prevhash (32B) in internal format (each 4-byte word reversed)
+	prevBytes, _ := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	copy(buf[4:36], reverseChunks32Bytes(prevBytes))
+
+	// merkle root (32B) already in internal byte order
+	copy(buf[36:68], merkleRoot)
+
+	// ntime (4B LE)
+	ntimeVal, _ := strconv.ParseUint(ntime, 16, 32)
+	binary.LittleEndian.PutUint32(buf[68:72], uint32(ntimeVal))
+
+	// bits (4B LE)
+	bitsVal, _ := strconv.ParseUint(t.Bits, 16, 32)
+	binary.LittleEndian.PutUint32(buf[72:76], uint32(bitsVal))
+
+	// nonce (4B LE)
+	nonceVal, _ := strconv.ParseUint(nonce, 16, 32)
+	binary.LittleEndian.PutUint32(buf[76:80], uint32(nonceVal))
+
+	return buf
+}
+
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
 
+// sha256dInternal returns the SHA256d of data in internal byte order (not reversed).
+// Used for merkle tree computation where hashes are concatenated and re-hashed.
+func sha256dInternal(data []byte) []byte {
+	h1 := sha256.Sum256(data)
+	h2 := sha256.Sum256(h1[:])
+	return h2[:]
+}
+
+// sha256dHash returns the SHA256d of data in big-endian (display) byte order.
+// Used for share difficulty comparison against big.Int targets.
 func sha256dHash(data []byte) []byte {
 	h1 := sha256.Sum256(data)
 	h2 := sha256.Sum256(h1[:])
-	// Return in little-endian (Bitcoin convention)
 	out := make([]byte, 32)
 	copy(out, h2[:])
 	for i, j := 0, 31; i < j; i, j = i+1, j-1 {
@@ -778,41 +816,103 @@ func sha256dHash(data []byte) []byte {
 }
 
 func scryptHash(data []byte) []byte {
-	// Litecoin scrypt params: N=1024, r=1, p=1, keyLen=32
 	dk, err := scrypt.Key(data, data, 1024, 1, 1, 32)
 	if err != nil {
 		return make([]byte, 32)
 	}
-	// Return in little-endian
 	for i, j := 0, len(dk)-1; i < j; i, j = i+1, j-1 {
 		dk[i], dk[j] = dk[j], dk[i]
 	}
 	return dk
 }
 
-func reverseBytes(b []byte) []byte {
+// reverseChunks32Bytes reverses the byte order within each 4-byte chunk.
+// This converts between display byte order and Bitcoin internal header format.
+func reverseChunks32Bytes(b []byte) []byte {
 	out := make([]byte, len(b))
-	for i := range b {
-		out[i] = b[len(b)-1-i]
+	for i := 0; i+4 <= len(b); i += 4 {
+		out[i], out[i+1], out[i+2], out[i+3] = b[i+3], b[i+2], b[i+1], b[i]
 	}
 	return out
 }
 
-func floatToBigInt(f float64) *big.Int {
-	b := new(big.Int)
-	b.SetInt64(int64(f))
-	return b
+// reverseChunks32 is the hex-string version of reverseChunks32Bytes.
+func reverseChunks32(hexStr string) string {
+	b, _ := hex.DecodeString(hexStr)
+	return hex.EncodeToString(reverseChunks32Bytes(b))
 }
 
 func bigIntToDiff(hash *big.Int) float64 {
-	// diff = diff1Target / hash
-	diff1, _ := new(big.Int).SetString("00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
 	if hash.Sign() == 0 {
 		return 0
 	}
-	result := new(big.Float).SetInt(diff1)
+	result := new(big.Float).SetInt(diff1Target)
 	hashF := new(big.Float).SetInt(hash)
 	result.Quo(result, hashF)
 	f, _ := result.Float64()
 	return f
+}
+
+// ─── Observable methods ───────────────────────────────────────────────────────
+
+// Symbol returns the coin symbol used in dashboard snapshots ("QUAI" or "QUAIS").
+func (s *Server) Symbol() string { return s.symbol }
+
+// NodeOnline reports whether the Quai node is currently reachable.
+func (s *Server) NodeOnline() bool { return s.online.Load() }
+
+// CurrentHeight returns the block height from the most recent template, or 0 if none.
+func (s *Server) CurrentHeight() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.currentTemplate == nil {
+		return 0
+	}
+	return s.currentTemplate.Height
+}
+
+// ShareSamples returns a snapshot of recent accepted share samples.
+func (s *Server) ShareSamples() []ShareSample {
+	s.sampleMu.Lock()
+	out := make([]ShareSample, len(s.shareSamples))
+	copy(out, s.shareSamples)
+	s.sampleMu.Unlock()
+	return out
+}
+
+// RecordHashrateSample appends a periodic KH/s snapshot for the hashrate history chart.
+func (s *Server) RecordHashrateSample(khs float64) {
+	s.sampleMu.Lock()
+	defer s.sampleMu.Unlock()
+	s.hashrateSamples = append(s.hashrateSamples, HashrateSample{KHs: khs, TimeMS: time.Now().UnixMilli()})
+	if len(s.hashrateSamples) > 288 {
+		s.hashrateSamples = s.hashrateSamples[len(s.hashrateSamples)-288:]
+	}
+}
+
+// HashrateSamples returns a snapshot of the hashrate history.
+func (s *Server) HashrateSamples() []HashrateSample {
+	s.sampleMu.Lock()
+	out := make([]HashrateSample, len(s.hashrateSamples))
+	copy(out, s.hashrateSamples)
+	s.sampleMu.Unlock()
+	return out
+}
+
+// BlockLog returns a snapshot of found blocks.
+func (s *Server) BlockLog() []BlockInfo {
+	s.sampleMu.Lock()
+	out := make([]BlockInfo, len(s.blockLog))
+	copy(out, s.blockLog)
+	s.sampleMu.Unlock()
+	return out
+}
+
+func (s *Server) recordBlock(height uint64, hash, worker string) {
+	s.sampleMu.Lock()
+	s.blockLog = append(s.blockLog, BlockInfo{Height: height, Hash: hash, Worker: worker, FoundAt: time.Now()})
+	if len(s.blockLog) > 50 {
+		s.blockLog = s.blockLog[len(s.blockLog)-50:]
+	}
+	s.sampleMu.Unlock()
 }

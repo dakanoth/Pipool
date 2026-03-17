@@ -1178,8 +1178,7 @@ footer {
   <div class="section-head">
     <span class="section-title">TELEMETRY</span>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <select id="chartCoin" onchange="renderChart()" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.6rem;padding:2px 8px">
-      </select>
+      <div id="coinFilterBtns" style="display:flex;gap:4px;flex-wrap:wrap"></div>
       <div style="display:flex;gap:4px">
         <button onclick="setChartMode('hashrate')" id="btnHashrate" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">HASHRATE</button>
         <button onclick="setChartMode('diff')" id="btnDiff" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">SHARE DIFF</button>
@@ -1806,7 +1805,7 @@ function apply(s) {
   if (s.workers) {
     s.workers.forEach(function(w){ if ((w.best_share||0) > bestShareSession) bestShareSession = w.best_share; });
   }
-  if (s.coins) { populateCoinFilter(s.coins); updateTelemetryStats(s.coins); }
+  if (s.coins) { lastCoins = s.coins; populateCoinFilter(s.coins); updateTelemetryStats(s.coins); }
   renderChart();
 
   if (s.notifs) applyNotifs(s.notifs);
@@ -2056,6 +2055,13 @@ var blockLogGlobal = [];
 var coinNetDiff = {};
 var mergeChildrenMap = {}; // parent symbol -> [aux symbols]
 var chartMode = 'diff'; // 'hashrate' | 'diff'
+var selectedCoins = {}; // sym -> bool (toggled on/off)
+var lastCoins = [];
+var COIN_COLORS = {
+  'BTC':'#ff8c00','BCH':'#00cc88','LTC':'#7ab4ff','DOGE':'#ccbb00',
+  'DGB':'#0099ff','DGBS':'#6655ff','PEP':'#ff44aa',
+  'QUAI':'#ff6644','QUAIS':'#ffaa66'
+};
 var workerTab = 'active'; // 'active' | 'known'
 var bestShareSession = 0;
 var currencyRate = 1.0;
@@ -2174,12 +2180,10 @@ function setChartMode(m) {
 }
 
 function populateCoinFilter(coins) {
-  var sel = document.getElementById('chartCoin');
-  if (!sel) return;
-  var existing = {};
-  for (var i = 0; i < sel.options.length; i++) existing[sel.options[i].value] = true;
+  var wrap = document.getElementById('coinFilterBtns');
+  if (!wrap) return;
 
-  // Rebuild merge children map and net diff cache from latest snapshot
+  // Rebuild merge children map and net diff cache
   mergeChildrenMap = {};
   coins.forEach(function(c) {
     if (c.difficulty && c.daemon_online) coinNetDiff[c.symbol] = c.difficulty;
@@ -2190,22 +2194,45 @@ function populateCoinFilter(coins) {
     }
   });
 
+  var existing = {};
+  wrap.querySelectorAll('[data-coin]').forEach(function(b){ existing[b.getAttribute('data-coin')] = true; });
+
   coins.forEach(function(c) {
-    if (c.is_merge_aux) return; // merge-aux coins share their parent's stratum — no independent share data
-    if (!existing[c.symbol]) {
-      var opt = document.createElement('option');
-      opt.value = c.symbol; opt.textContent = c.symbol;
-      sel.appendChild(opt);
-      existing[c.symbol] = true;
+    if (c.is_merge_aux) return;
+    if (existing[c.symbol]) return;
+    existing[c.symbol] = true;
+    // Auto-select first coin on first load; subsequent coins default off
+    if (selectedCoins[c.symbol] === undefined) {
+      var hasAny = Object.keys(selectedCoins).some(function(k){ return selectedCoins[k]; });
+      selectedCoins[c.symbol] = !hasAny;
     }
+    var btn = document.createElement('button');
+    btn.setAttribute('data-coin', c.symbol);
+    btn.textContent = c.symbol;
+    btn.onclick = function(){ toggleCoinFilter(c.symbol); };
+    applyBtnStyle(btn, c.symbol);
+    wrap.appendChild(btn);
   });
-  // Default to first option if nothing valid is selected
-  if (!existing[sel.value] && sel.options.length > 0) sel.value = sel.options[0].value;
+}
+
+function applyBtnStyle(btn, sym) {
+  var on = !!selectedCoins[sym];
+  var color = on ? (COIN_COLORS[sym] || 'var(--hi2)') : 'var(--dim)';
+  btn.style.cssText = 'background:var(--off);border:1px solid '+(on?'var(--bdr2)':'var(--bdr)')+';color:'+color+';font-family:var(--scan);font-size:.55rem;padding:2px 7px;cursor:pointer;letter-spacing:1px';
+}
+
+function toggleCoinFilter(sym) {
+  selectedCoins[sym] = !selectedCoins[sym];
+  var btn = document.querySelector('[data-coin="'+sym+'"]');
+  if (btn) applyBtnStyle(btn, sym);
+  renderChart();
+  updateTelemetryStats(lastCoins);
 }
 
 function updateTelemetryStats(coins) {
-  var sel = document.getElementById('chartCoin');
-  var filter = sel ? sel.value : '';
+  // Use the first selected primary (non-aux) coin for stats
+  var activeList = Object.keys(selectedCoins).filter(function(s){ return selectedCoins[s]; });
+  var filter = activeList.length === 1 ? activeList[0] : (activeList[0] || '');
 
   var netDiff = 0, totalKHs = 0;
   coins.forEach(function(c) {
@@ -2291,8 +2318,9 @@ function renderChart() {
   var canvas = document.getElementById('diffChart');
   var noData = document.getElementById('noShareData');
   if (!canvas) return;
-  var sel = document.getElementById('chartCoin');
-  var filter = sel ? sel.value : 'ALL';
+
+  // Active coins = those toggled on
+  var activeCoins = Object.keys(selectedCoins).filter(function(s){ return selectedCoins[s]; });
 
   var cssSt = getComputedStyle(document.documentElement);
   var cLine = cssSt.getPropertyValue('--chart-line').trim() || '#00ff41';
@@ -2303,15 +2331,15 @@ function renderChart() {
   var cSurf = cssSt.getPropertyValue('--surf').trim()       || '#000f00';
 
   if (chartMode === 'hashrate') {
-    // Group hashrate history by coin so each chain gets its own line
+    // Group hashrate history by coin, filtered to selected coins
     var coinGroups = {};
     hashrateHistoryGlobal.forEach(function(s) {
-      if (filter !== 'ALL' && s.coin !== filter) return;
+      if (activeCoins.length > 0 && activeCoins.indexOf(s.coin) < 0) return;
       if (!coinGroups[s.coin]) coinGroups[s.coin] = [];
       coinGroups[s.coin].push(s);
     });
-    var activeCoins = Object.keys(coinGroups).filter(function(c){ return coinGroups[c].length >= 2; });
-    if (activeCoins.length === 0) {
+    var visCoins = Object.keys(coinGroups).filter(function(c){ return coinGroups[c].length >= 2; });
+    if (visCoins.length === 0) {
       canvas.style.display = 'none'; noData.style.display = 'block'; return;
     }
     canvas.style.display = 'block'; noData.style.display = 'none';
@@ -2325,37 +2353,29 @@ function renderChart() {
     var PAD = {t:14, r:12, b:28, l:68};
     var cW = W-PAD.l-PAD.r, cH = H-PAD.t-PAD.b;
 
-    // Unified time range across all shown coins
-    var allSamples = [].concat.apply([], activeCoins.map(function(c){ return coinGroups[c]; }));
+    var allSamples = [].concat.apply([], visCoins.map(function(c){ return coinGroups[c]; }));
     var tMin = Math.min.apply(null, allSamples.map(function(s){return s.t;}));
     var tMax = Math.max.apply(null, allSamples.map(function(s){return s.t;}));
     var tSpan = tMax - tMin || 1;
     function xPos(t) { return PAD.l + (t - tMin) / tSpan * cW; }
 
-    // Per-coin color palette
-    var COIN_COLORS = {'LTC':cLine,'BTC':'#ff8c00','DOGE':'#ccbb00','BCH':'#00cc88','PEP':'#ff44aa'};
-    var FALLBACK_COLORS = [cLine,'#ff8c00','#00aaff','#ff4466','#aa44ff'];
+    var FALLBACK_COLORS = [cLine,'#ff8c00','#00aaff','#ff4466','#aa44ff','#00cc88','#ccbb00'];
+    var multiCoin = visCoins.length > 1;
 
-    // In ALL mode each coin is normalized to its own max (avoids BTC dwarfing LTC).
-    // In single-coin mode use log scale when range > 100× so ramp-up is visible.
-    var multiCoin = activeCoins.length > 1;
-
-    // Compute per-coin max for normalization
     var coinMax = {};
-    activeCoins.forEach(function(c) {
+    visCoins.forEach(function(c) {
       coinMax[c] = Math.max.apply(null, coinGroups[c].map(function(s){return s.khs;})) * 1.15 || 1;
     });
 
-    // For single-coin: decide log vs linear
     var useLog = false;
     if (!multiCoin) {
-      var singleMax = coinMax[activeCoins[0]];
-      var posKHs = coinGroups[activeCoins[0]].filter(function(s){return s.khs>0;}).map(function(s){return s.khs;});
+      var singleMax = coinMax[visCoins[0]];
+      var posKHs = coinGroups[visCoins[0]].filter(function(s){return s.khs>0;}).map(function(s){return s.khs;});
       var singleMin = posKHs.length ? Math.min.apply(null, posKHs) : singleMax;
       useLog = singleMax / Math.max(singleMin, 1e-9) > 100;
     }
-    var logMax = useLog ? Math.log10(coinMax[activeCoins[0]]) : 0;
-    var logMin = useLog ? Math.log10(Math.max(coinMax[activeCoins[0]] * 1e-6, 0.001)) : 0;
+    var logMax = useLog ? Math.log10(coinMax[visCoins[0]]) : 0;
+    var logMin = useLog ? Math.log10(Math.max(coinMax[visCoins[0]] * 1e-6, 0.001)) : 0;
 
     function yPos(khs, coin) {
       if (multiCoin) return PAD.t + cH * (1 - Math.min(khs / coinMax[coin], 1));
@@ -2363,16 +2383,13 @@ function renderChart() {
         var v = Math.max(khs, Math.pow(10, logMin));
         return PAD.t + cH * (1 - (Math.log10(v) - logMin) / (logMax - logMin));
       }
-      return PAD.t + cH * (1 - khs / coinMax[activeCoins[0]]);
+      return PAD.t + cH * (1 - khs / coinMax[visCoins[0]]);
     }
 
-    // Background
     ctx.fillStyle = cSurf; ctx.fillRect(0,0,W,H);
 
-    // Y-axis grid + labels
     ctx.strokeStyle = cBdr; ctx.lineWidth = 0.5;
     if (multiCoin) {
-      // Normalized: 0%, 25%, 50%, 75%, 100% per coin — just draw the grid
       for (var gi=0; gi<=4; gi++) {
         var gy = PAD.t + (gi/4)*cH;
         ctx.beginPath(); ctx.moveTo(PAD.l,gy); ctx.lineTo(W-PAD.r,gy); ctx.stroke();
@@ -2380,20 +2397,19 @@ function renderChart() {
         ctx.fillText((100-gi*25)+'%', PAD.l-4, gy+3);
       }
     } else if (useLog) {
-      // Log scale: draw a grid line at each power of 10 within range
       var p0 = Math.floor(logMin), p1 = Math.ceil(logMax);
       for (var p=p0; p<=p1; p++) {
         [1,2,5].forEach(function(m) {
           var v = m * Math.pow(10, p);
           if (v < Math.pow(10,logMin) || v > Math.pow(10,logMax)) return;
-          var gy2 = yPos(v, activeCoins[0]);
+          var gy2 = yPos(v, visCoins[0]);
           ctx.beginPath(); ctx.moveTo(PAD.l,gy2); ctx.lineTo(W-PAD.r,gy2); ctx.stroke();
           ctx.fillStyle = cDim2; ctx.font='9px monospace'; ctx.textAlign='right';
           ctx.fillText(fmtKHs(v), PAD.l-4, gy2+3);
         });
       }
     } else {
-      var linMax = coinMax[activeCoins[0]];
+      var linMax = coinMax[visCoins[0]];
       for (var gi2=0; gi2<=4; gi2++) {
         var gy3 = PAD.t + (gi2/4)*cH;
         ctx.beginPath(); ctx.moveTo(PAD.l,gy3); ctx.lineTo(W-PAD.r,gy3); ctx.stroke();
@@ -2402,25 +2418,22 @@ function renderChart() {
       }
     }
 
-    // Net diff dashed line (single coin only)
     if (!multiCoin) {
-      var netDiff = coinNetDiff[filter] || 0;
-      if (netDiff > 0) {
+      var netDiffH = coinNetDiff[visCoins[0]] || 0;
+      if (netDiffH > 0) {
         var ny = PAD.t + cH*0.15;
         ctx.strokeStyle = cNet; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
         ctx.beginPath(); ctx.moveTo(PAD.l,ny); ctx.lineTo(W-PAD.r,ny); ctx.stroke();
         ctx.setLineDash([]); ctx.fillStyle=cNet; ctx.font='9px monospace'; ctx.textAlign='left';
-        ctx.fillText('NET DIFF ~'+fmtDiffShort(netDiff), PAD.l+4, ny-3);
+        ctx.fillText('NET DIFF ~'+fmtDiffShort(netDiffH), PAD.l+4, ny-3);
       }
     }
 
-    // Draw each coin's line
-    activeCoins.forEach(function(coin, ci) {
+    visCoins.forEach(function(coin, ci) {
       var csamps = coinGroups[coin];
       var color = COIN_COLORS[coin] || FALLBACK_COLORS[ci % FALLBACK_COLORS.length];
       var pts = csamps.map(function(s){ return {x:xPos(s.t), y:yPos(s.khs, coin)}; });
 
-      // Area fill (single coin only)
       if (!multiCoin) {
         ctx.beginPath();
         ctx.moveTo(pts[0].x, PAD.t+cH);
@@ -2431,14 +2444,12 @@ function renderChart() {
         ctx.fill();
       }
 
-      // Line
       ctx.beginPath();
       ctx.strokeStyle = color; ctx.lineWidth = 2;
       ctx.shadowColor = color; ctx.shadowBlur = 4;
       pts.forEach(function(p,i){ i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y); });
       ctx.stroke(); ctx.shadowBlur = 0;
 
-      // Coin label at end of line (multi-coin mode)
       if (multiCoin) {
         var lp = pts[pts.length-1];
         var lastKHs = csamps[csamps.length-1].khs;
@@ -2448,7 +2459,6 @@ function renderChart() {
       }
     });
 
-    // Time labels
     ctx.fillStyle=cDim2; ctx.font='9px monospace'; ctx.textAlign='center';
     [0,0.25,0.5,0.75,1].forEach(function(f){
       var t=tMin+tSpan*f, d=new Date(t);
@@ -2456,10 +2466,19 @@ function renderChart() {
     });
 
   } else {
-    // DIFF MODE — per-coin scatter with log Y-axis and time X-axis
-    var dsamples = shareHistoryGlobal.filter(function(s){ return s.coin===filter; });
-    dsamples.sort(function(a,b){ return a.t-b.t; });
-    if (dsamples.length === 0) {
+    // DIFF MODE — scatter plot; supports multiple coins simultaneously
+    var multiDiff = activeCoins.length > 1;
+
+    // Collect and group share data
+    var coinShares = {};
+    activeCoins.forEach(function(sym) {
+      var arr = shareHistoryGlobal.filter(function(s){ return s.coin === sym; });
+      arr.sort(function(a,b){ return a.t-b.t; });
+      if (arr.length > 0) coinShares[sym] = arr;
+    });
+    var visSyms = Object.keys(coinShares);
+
+    if (visSyms.length === 0) {
       canvas.style.display='none'; noData.style.display='block'; return;
     }
     canvas.style.display='block'; noData.style.display='none';
@@ -2473,14 +2492,18 @@ function renderChart() {
     var PAD2={t:16,r:12,b:28,l:72};
     var cW2=W2-PAD2.l-PAD2.r, cH2=H2-PAD2.t-PAD2.b;
 
-    var AUX_COLORS = {'DOGE':'#ccbb00','BCH':'#00cc88','DGB':'#0088ff','DGBS':'#0055ff','PEP':'#ff44aa'};
-    var auxChildren = mergeChildrenMap[filter] || [];
-    var parentNetD = coinNetDiff[filter] || 0;
+    // Unified log scale across all visible share data + all net diffs
+    var posDiffs = [];
+    visSyms.forEach(function(sym) {
+      coinShares[sym].forEach(function(s){ if(s.diff>0) posDiffs.push(s.diff); });
+      if (coinNetDiff[sym] > 0) posDiffs.push(coinNetDiff[sym]);
+      // include merge children net diffs for single-coin view
+      if (!multiDiff) {
+        (mergeChildrenMap[sym]||[]).forEach(function(ac){ if(coinNetDiff[ac]>0) posDiffs.push(coinNetDiff[ac]); });
+      }
+    });
+    if (posDiffs.length === 0) { canvas.style.display='none'; noData.style.display='block'; return; }
 
-    // Log Y scale — include parent and all aux chain diffs so all lines are always visible
-    var posDiffs = dsamples.map(function(s){return s.diff;}).filter(function(d){return d>0;});
-    if (parentNetD > 0) posDiffs.push(parentNetD);
-    auxChildren.forEach(function(ac){ if (coinNetDiff[ac] > 0) posDiffs.push(coinNetDiff[ac]); });
     var rawMin = Math.min.apply(null, posDiffs);
     var rawMax = Math.max.apply(null, posDiffs);
     var logMin2 = Math.log10(Math.max(rawMin * 0.5, 1));
@@ -2491,15 +2514,18 @@ function renderChart() {
       return PAD2.t + cH2 * (1 - (Math.log10(v) - logMin2) / logRange2);
     }
 
-    // Time X axis
-    var tMin2=dsamples[0].t, tMax2=dsamples[dsamples.length-1].t;
+    // Unified time axis
+    var allTimes = [];
+    visSyms.forEach(function(sym){ coinShares[sym].forEach(function(s){ allTimes.push(s.t); }); });
+    var tMin2 = Math.min.apply(null, allTimes);
+    var tMax2 = Math.max.apply(null, allTimes);
     var tSpan2 = tMax2-tMin2 || 1;
     function xDiff(t) { return PAD2.l + (t-tMin2)/tSpan2*cW2; }
 
     // Background
     ctx2.fillStyle=cSurf; ctx2.fillRect(0,0,W2,H2);
 
-    // Grid lines at powers of 10 (major at 1×, minor at 2× and 5×)
+    // Grid lines
     var pLow=Math.floor(logMin2), pHigh=Math.ceil(logMax2);
     for (var p=pLow; p<=pHigh; p++) {
       [1,2,5].forEach(function(m) {
@@ -2516,81 +2542,114 @@ function renderChart() {
       });
     }
 
-    // Aux chain net diff dashed lines (drawn before parent so parent is on top)
-    var auxLabelOffsets = {};
-    auxChildren.forEach(function(ac, ai) {
-      var acD = coinNetDiff[ac] || 0;
-      if (acD <= 0) return;
-      var lv = Math.log10(acD);
-      if (lv < logMin2 || lv > logMax2) return;
-      var ay = yDiff(acD);
-      var acColor = AUX_COLORS[ac] || '#aaaaaa';
-      ctx2.strokeStyle = acColor; ctx2.lineWidth = 1; ctx2.setLineDash([4,4]);
-      ctx2.beginPath(); ctx2.moveTo(PAD2.l, ay); ctx2.lineTo(W2-PAD2.r, ay); ctx2.stroke();
-      ctx2.setLineDash([]);
-      // Stagger labels if aux lines are close together
-      var labelX = PAD2.l + 4 + ai * 80;
-      ctx2.fillStyle = acColor; ctx2.font = '8px monospace'; ctx2.textAlign = 'left';
-      ctx2.fillText(ac+' '+fmtDiffShort(acD), labelX, ay-3);
-    });
-
-    // Parent chain net diff dashed line
-    if (parentNetD > 0) {
-      var lv2=Math.log10(parentNetD);
-      if (lv2 >= logMin2 && lv2 <= logMax2) {
-        var ny2=yDiff(parentNetD);
-        ctx2.strokeStyle=cNet; ctx2.lineWidth=1.5; ctx2.setLineDash([6,4]);
-        ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny2); ctx2.lineTo(W2-PAD2.r,ny2); ctx2.stroke();
+    // Net diff lines — one per visible coin (and aux children in single-coin mode)
+    if (!multiDiff && visSyms.length === 1) {
+      var sym1 = visSyms[0];
+      var auxChildren = mergeChildrenMap[sym1] || [];
+      // Aux chain net diffs
+      auxChildren.forEach(function(ac, ai) {
+        var acD = coinNetDiff[ac] || 0;
+        if (acD <= 0) return;
+        var lv = Math.log10(acD);
+        if (lv < logMin2 || lv > logMax2) return;
+        var ay = yDiff(acD);
+        var acColor = COIN_COLORS[ac] || '#aaaaaa';
+        ctx2.strokeStyle = acColor; ctx2.lineWidth = 1; ctx2.setLineDash([4,4]);
+        ctx2.beginPath(); ctx2.moveTo(PAD2.l, ay); ctx2.lineTo(W2-PAD2.r, ay); ctx2.stroke();
         ctx2.setLineDash([]);
-        ctx2.fillStyle=cNet; ctx2.font='bold 9px monospace'; ctx2.textAlign='left';
-        ctx2.fillText(filter+' NET  '+fmtDiffShort(parentNetD), PAD2.l+4, ny2-4);
-      }
-    }
-
-    // Faint connecting line between dots
-    ctx2.strokeStyle='rgba(0,180,60,0.18)'; ctx2.lineWidth=1; ctx2.setLineDash([]);
-    ctx2.beginPath();
-    dsamples.forEach(function(s,i){
-      var x=xDiff(s.t), y=yDiff(s.diff);
-      i===0 ? ctx2.moveTo(x,y) : ctx2.lineTo(x,y);
-    });
-    ctx2.stroke();
-
-    // Dots — colored by what threshold they cleared
-    dsamples.forEach(function(s){
-      var x=xDiff(s.t), y=yDiff(s.diff);
-      var dotColor, dotR=3, dotGlow=5;
-      if (!s.ok) {
-        dotColor = cRej;
-      } else if (parentNetD > 0 && s.diff >= parentNetD) {
-        dotColor = '#ffffff'; dotR=6; dotGlow=16; // parent chain block!
-      } else {
-        var isAuxHit = auxChildren.some(function(ac){ return coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac]; });
-        if (isAuxHit) {
-          // Find which aux coin was hit for color (pick highest threshold cleared)
-          dotColor = '#ffdd00'; dotR=5; dotGlow=12;
-          auxChildren.forEach(function(ac){
-            if (coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac])
-              dotColor = AUX_COLORS[ac] || '#ffdd00';
-          });
-        } else {
-          dotColor = cLine;
+        var labelX = PAD2.l + 4 + ai * 80;
+        ctx2.fillStyle = acColor; ctx2.font = '8px monospace'; ctx2.textAlign = 'left';
+        ctx2.fillText(ac+' '+fmtDiffShort(acD), labelX, ay-3);
+      });
+      // Parent net diff
+      var parentNetD = coinNetDiff[sym1] || 0;
+      if (parentNetD > 0) {
+        var lv2 = Math.log10(parentNetD);
+        if (lv2 >= logMin2 && lv2 <= logMax2) {
+          var ny2=yDiff(parentNetD);
+          ctx2.strokeStyle=cNet; ctx2.lineWidth=1.5; ctx2.setLineDash([6,4]);
+          ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny2); ctx2.lineTo(W2-PAD2.r,ny2); ctx2.stroke();
+          ctx2.setLineDash([]);
+          ctx2.fillStyle=cNet; ctx2.font='bold 9px monospace'; ctx2.textAlign='left';
+          ctx2.fillText(sym1+' NET  '+fmtDiffShort(parentNetD), PAD2.l+4, ny2-4);
         }
       }
-      ctx2.beginPath(); ctx2.arc(x,y,dotR,0,Math.PI*2);
-      ctx2.fillStyle=dotColor;
-      ctx2.shadowColor=dotColor; ctx2.shadowBlur=dotGlow;
-      ctx2.fill(); ctx2.shadowBlur=0;
+    } else {
+      // Multi-coin: draw net diff line for each visible coin in its color
+      visSyms.forEach(function(sym, si) {
+        var nd = coinNetDiff[sym] || 0;
+        if (nd <= 0) return;
+        var lv = Math.log10(nd);
+        if (lv < logMin2 || lv > logMax2) return;
+        var ny3 = yDiff(nd);
+        var nColor = COIN_COLORS[sym] || cNet;
+        ctx2.strokeStyle=nColor; ctx2.lineWidth=1.2; ctx2.setLineDash([6,4]);
+        ctx2.beginPath(); ctx2.moveTo(PAD2.l,ny3); ctx2.lineTo(W2-PAD2.r,ny3); ctx2.stroke();
+        ctx2.setLineDash([]);
+        ctx2.fillStyle=nColor; ctx2.font='8px monospace'; ctx2.textAlign='left';
+        ctx2.fillText(sym+' '+fmtDiffShort(nd), PAD2.l + 4 + si*90, ny3-3);
+      });
+    }
+
+    // Draw each coin's shares
+    var FALLBACK2 = [cLine,'#ff8c00','#00aaff','#ff4466','#aa44ff','#00cc88','#ccbb00'];
+    visSyms.forEach(function(sym, si) {
+      var dsamples = coinShares[sym];
+      var coinColor = COIN_COLORS[sym] || FALLBACK2[si % FALLBACK2.length];
+      var parentNetD2 = coinNetDiff[sym] || 0;
+      var auxCh = (!multiDiff && visSyms.length === 1) ? (mergeChildrenMap[sym]||[]) : [];
+
+      // Faint connecting line
+      ctx2.strokeStyle = coinColor;
+      ctx2.globalAlpha = 0.2;
+      ctx2.lineWidth=1; ctx2.setLineDash([]);
+      ctx2.beginPath();
+      dsamples.forEach(function(s,i){
+        var x=xDiff(s.t), y=yDiff(s.diff);
+        i===0 ? ctx2.moveTo(x,y) : ctx2.lineTo(x,y);
+      });
+      ctx2.stroke();
+      ctx2.globalAlpha = 1;
+
+      // Dots
+      dsamples.forEach(function(s){
+        var x=xDiff(s.t), y=yDiff(s.diff);
+        var dotColor, dotR=3, dotGlow=5;
+        if (!s.ok) {
+          dotColor = cRej;
+        } else if (parentNetD2 > 0 && s.diff >= parentNetD2) {
+          dotColor = '#ffffff'; dotR=6; dotGlow=16;
+        } else {
+          var isAuxHit = auxCh.some(function(ac){ return coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac]; });
+          if (isAuxHit) {
+            dotColor = '#ffdd00'; dotR=5; dotGlow=12;
+            auxCh.forEach(function(ac){
+              if (coinNetDiff[ac] > 0 && s.diff >= coinNetDiff[ac])
+                dotColor = COIN_COLORS[ac] || '#ffdd00';
+            });
+          } else {
+            dotColor = multiDiff ? coinColor : cLine;
+          }
+        }
+        ctx2.beginPath(); ctx2.arc(x,y,dotR,0,Math.PI*2);
+        ctx2.fillStyle=dotColor;
+        ctx2.shadowColor=dotColor; ctx2.shadowBlur=dotGlow;
+        ctx2.fill(); ctx2.shadowBlur=0;
+      });
     });
 
     // Block found vertical markers
-    var relevantCoins = [filter].concat(auxChildren);
+    var allVisCoins = visSyms.slice();
+    if (!multiDiff && visSyms.length === 1) {
+      (mergeChildrenMap[visSyms[0]]||[]).forEach(function(ac){ allVisCoins.push(ac); });
+    }
     blockLogGlobal.forEach(function(b) {
-      if (relevantCoins.indexOf(b.coin) < 0) return;
+      if (allVisCoins.indexOf(b.coin) < 0) return;
       if (!b.found_at_ms) return;
       var bx = xDiff(b.found_at_ms);
       if (bx < PAD2.l || bx > W2-PAD2.r) return;
-      var bColor = b.coin === filter ? '#ffffff' : (AUX_COLORS[b.coin] || '#ffdd00');
+      var bColor = (COIN_COLORS[b.coin] || '#ffdd00');
+      if (!multiDiff && b.coin === visSyms[0]) bColor = '#ffffff';
       ctx2.strokeStyle = bColor; ctx2.lineWidth = 1.5; ctx2.setLineDash([3,3]);
       ctx2.globalAlpha = 0.7;
       ctx2.beginPath(); ctx2.moveTo(bx, PAD2.t); ctx2.lineTo(bx, H2-PAD2.b); ctx2.stroke();

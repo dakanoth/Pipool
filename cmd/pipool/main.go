@@ -390,66 +390,60 @@ func main() {
 	// ─── Quai Network stratum servers ─────────────────────────────────────────
 	var quaiServers []*quai.Server
 	if cfg.Quai.Enabled {
-		log.Printf("[quai] Quai integration enabled — connecting to node at %s:%d",
-			cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
+		log.Printf("[quai] Quai integration enabled — node at %s:%d",
+			cfg.Quai.Node.Host, cfg.Quai.Node.HTTPPort)
 
-		quaiNode := quai.NewNodeClient(cfg.Quai.Node.Host, cfg.Quai.Node.WSPort)
-		quaiCtx, quaiCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		quaiErr := quaiNode.Connect(quaiCtx)
-		quaiCancel()
-		if quaiErr != nil {
-			log.Printf("[quai] WARNING: could not connect to Quai node: %v", quaiErr)
-		} else {
-			quaiNode.StartPolling(context.Background(), time.Second, nil) // callbacks set per-server below
+		quaiNode := quai.NewNodeClient(cfg.Quai.Node.Host, cfg.Quai.Node.HTTPPort)
 
-			// SHA-256 server (for Goldshell, Bitmain, etc.)
-			if cfg.Quai.SHA256.Enabled {
-				qSHA := quai.NewServer(quai.ServerConfig{
-					Algo:       "sha256d",
-					ListenAddr: fmt.Sprintf("0.0.0.0:%d", cfg.Quai.SHA256.Port),
-					MinDiff:    cfg.Quai.SHA256.MinDiff,
-					MaxDiff:    cfg.Quai.SHA256.MaxDiff,
-					TargetTime: cfg.Quai.SHA256.TargetTime,
-				}, quaiNode)
-				qSHA.SetCallbacks(
-					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
-					},
-					nil,
-				)
-				if err := qSHA.Start(); err != nil {
-					log.Printf("[quai/sha256d] failed to start: %v", err)
-				} else {
-					quaiServers = append(quaiServers, qSHA)
-					log.Printf("[quai/sha256d] stratum listening on port %d", cfg.Quai.SHA256.Port)
-				}
+		// SHA-256 server (for Goldshell, Bitmain, etc.)
+		if cfg.Quai.SHA256.Enabled {
+			qSHA := quai.NewServer(quai.ServerConfig{
+				Algo:         "sha256d",
+				ListenAddr:   fmt.Sprintf("0.0.0.0:%d", cfg.Quai.SHA256.Port),
+				CoinbaseAddr: cfg.Quai.SHA256.Wallet,
+				MinDiff:      cfg.Quai.SHA256.MinDiff,
+				MaxDiff:      cfg.Quai.SHA256.MaxDiff,
+				TargetTime:   cfg.Quai.SHA256.TargetTime,
+			}, quaiNode)
+			qSHA.SetCallbacks(
+				func(height uint64, hash, worker string) {
+					notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
+				},
+				nil,
+			)
+			if err := qSHA.Start(); err != nil {
+				log.Printf("[quai/sha256d] failed to start: %v", err)
+			} else {
+				quaiServers = append(quaiServers, qSHA)
+				log.Printf("[quai/sha256d] stratum listening on port %d", cfg.Quai.SHA256.Port)
 			}
+		}
 
-			// Scrypt server (for Elphapex DG Home 1, Goldshell Mini-DOGE, etc.)
-			if cfg.Quai.Scrypt.Enabled {
-				qScrypt := quai.NewServer(quai.ServerConfig{
-					Algo:       "scrypt",
-					ListenAddr: fmt.Sprintf("0.0.0.0:%d", cfg.Quai.Scrypt.Port),
-					MinDiff:    cfg.Quai.Scrypt.MinDiff,
-					MaxDiff:    cfg.Quai.Scrypt.MaxDiff,
-					TargetTime: cfg.Quai.Scrypt.TargetTime,
-				}, quaiNode)
-				qScrypt.SetCallbacks(
-					func(height uint64, hash, worker string) {
-						notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
-					},
-					nil,
-				)
-				if err := qScrypt.Start(); err != nil {
-					log.Printf("[quai/scrypt] failed to start: %v", err)
-				} else {
-					quaiServers = append(quaiServers, qScrypt)
-					log.Printf("[quai/scrypt] stratum listening on port %d", cfg.Quai.Scrypt.Port)
-				}
+		// Scrypt server (for Elphapex DG Home 1, Goldshell Mini-DOGE, etc.)
+		if cfg.Quai.Scrypt.Enabled {
+			qScrypt := quai.NewServer(quai.ServerConfig{
+				Algo:         "scrypt",
+				ListenAddr:   fmt.Sprintf("0.0.0.0:%d", cfg.Quai.Scrypt.Port),
+				CoinbaseAddr: cfg.Quai.Scrypt.Wallet,
+				MinDiff:      cfg.Quai.Scrypt.MinDiff,
+				MaxDiff:      cfg.Quai.Scrypt.MaxDiff,
+				TargetTime:   cfg.Quai.Scrypt.TargetTime,
+			}, quaiNode)
+			qScrypt.SetCallbacks(
+				func(height uint64, hash, worker string) {
+					notifier.BlockFound("QUAI", hash, int64(height), 0, -1, worker)
+				},
+				nil,
+			)
+			if err := qScrypt.Start(); err != nil {
+				log.Printf("[quai/scrypt] failed to start: %v", err)
+			} else {
+				quaiServers = append(quaiServers, qScrypt)
+				log.Printf("[quai/scrypt] stratum listening on port %d", cfg.Quai.Scrypt.Port)
 			}
 		}
 	}
-	_ = quaiServers // used in dashboard snapshot below
+	// quaiServers passed to buildDashboardSnapshot
 
 	// ─── ASIC health polling ──────────────────────────────────────────────────
 	go func() {
@@ -679,7 +673,7 @@ func main() {
 		// instead of allocating a new http.Client every 5 seconds
 		dash := dashboard.New(dashPort, pushInterval,
 			func() dashboard.StatsSnapshot {
-				return buildDashboardSnapshot(cfg, servers, sysmon, dashClients, &asicMu, asicHealth)
+				return buildDashboardSnapshot(cfg, servers, quaiServers, sysmon, dashClients, &asicMu, asicHealth)
 			},
 			func() dashboard.NotifSettings {
 				a := cfg.Discord.Alerts
@@ -973,7 +967,7 @@ func explorerURL(cfg *config.PoolConfig, symbol string) string {
 	return defaultExplorers[symbol]
 }
 
-func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health) dashboard.StatsSnapshot {
+func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, quaiServers []*quai.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
 		Timestamp:   time.Now(),
 		Uptime:      fmtUptime(sysmon.Uptime()),
@@ -1015,6 +1009,32 @@ func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, s
 			Host:      host,
 			Port:      coinCfg.Stratum.Port,
 		})
+	}
+
+	// Quai Network stratum endpoints
+	if cfg.Quai.Enabled {
+		host := cfg.Pool.Host
+		if host == "" {
+			host = "YOUR_POOL_IP"
+		}
+		if cfg.Quai.SHA256.Enabled {
+			snap.Endpoints = append(snap.Endpoints, dashboard.StratumEndpoint{
+				Symbol:    "QUAI",
+				MergeDesc: "QUAI",
+				Algorithm: "sha256d",
+				Host:      host,
+				Port:      cfg.Quai.SHA256.Port,
+			})
+		}
+		if cfg.Quai.Scrypt.Enabled {
+			snap.Endpoints = append(snap.Endpoints, dashboard.StratumEndpoint{
+				Symbol:    "QUAIS",
+				MergeDesc: "QUAI-S",
+				Algorithm: "scrypt",
+				Host:      host,
+				Port:      cfg.Quai.Scrypt.Port,
+			})
+		}
 	}
 
 	srvMap := make(map[string]*stratum.Server)
@@ -1206,6 +1226,54 @@ collect:
 	snap.ScryptKHs = scryptKHs
 	snap.BlocksFound = totalBlocks
 
+	// ─── Quai Network coin stats ──────────────────────────────────────────────
+	for _, qs := range quaiServers {
+		stats := qs.Stats()
+		sym := qs.Symbol()
+		cs := dashboard.CoinStats{
+			Symbol:        sym,
+			Enabled:       true,
+			DaemonOnline:  qs.NodeOnline(),
+			NodeHost:      cfg.Quai.Node.Host,
+			NodeLatencyMs: -1,
+			Height:        int64(qs.CurrentHeight()),
+			Miners:        stats.ConnectedMiners,
+			Blocks:        stats.BlocksFound,
+			SyncPct:       100.0,
+		}
+		// Estimate hashrate from accepted shares in the last 5 minutes
+		samples := qs.ShareSamples()
+		cutoffMS := time.Now().Add(-5 * time.Minute).UnixMilli()
+		var recentSamples []quai.ShareSample
+		for _, ss := range samples {
+			if ss.TimeMS >= cutoffMS {
+				recentSamples = append(recentSamples, ss)
+			}
+		}
+		if len(recentSamples) >= 2 {
+			var diffSum float64
+			for _, ss := range recentSamples {
+				diffSum += ss.Difficulty
+			}
+			spanSec := float64(recentSamples[len(recentSamples)-1].TimeMS-recentSamples[0].TimeMS) / 1000.0
+			if spanSec > 0 {
+				diff1 := 65536.0
+				if stats.Algo == "sha256d" {
+					diff1 = 4294967296.0
+				}
+				cs.HashrateKHs = diffSum * diff1 / spanSec / 1000.0
+			}
+		}
+		snap.Coins = append(snap.Coins, cs)
+		snap.TotalKHs += cs.HashrateKHs
+		if stats.Algo == "sha256d" {
+			snap.Sha256KHs += cs.HashrateKHs
+		} else {
+			snap.ScryptKHs += cs.HashrateKHs
+		}
+		snap.BlocksFound += cs.Blocks
+	}
+
 	// Storage stats
 	snap.Disks = collectDiskStats(cfg)
 
@@ -1266,6 +1334,33 @@ collect:
 		}
 	}
 
+	// Quai Network workers
+	for _, qs := range quaiServers {
+		sym := qs.Symbol()
+		for _, w := range qs.Workers() {
+			ws := dashboard.WorkerStat{
+				Name:           w.Name,
+				Coin:           sym,
+				Difficulty:     w.Difficulty,
+				HashrateKHs:    w.HashrateKHs,
+				SharesAccepted: w.SharesAccepted,
+				SharesRejected: w.SharesRejected,
+				SharesStale:    w.SharesStale,
+				BestShare:      w.BestShare,
+				RemoteAddr:     w.RemoteAddr,
+				Online:         true,
+			}
+			if !w.ConnectedAt.IsZero() {
+				ws.ConnectedAt = w.ConnectedAt.Format("Jan 2 15:04")
+			}
+			if !w.LastShareAt.IsZero() {
+				ws.LastSeenAt = w.LastShareAt.Format("Jan 2 15:04:05")
+				ws.SessionDuration = fmtWorkerUptime(time.Since(w.ConnectedAt))
+			}
+			snap.Workers = append(snap.Workers, ws)
+		}
+	}
+
 	// After workers loop, compute totals and per-coin electrical cost (online workers only)
 	{
 		coinCost := make(map[string]float64)
@@ -1315,6 +1410,34 @@ collect:
 		}
 	}
 
+	// Quai share and hashrate history
+	for _, qs := range quaiServers {
+		sym := qs.Symbol()
+		for _, ss := range qs.ShareSamples() {
+			snap.ShareHistory = append(snap.ShareHistory, dashboard.ShareSample{
+				Coin:       sym,
+				Difficulty: ss.Difficulty,
+				TimeMS:     ss.TimeMS,
+				Accepted:   ss.Accepted,
+			})
+		}
+		var quaiKHs float64
+		for _, cs := range snap.Coins {
+			if cs.Symbol == sym {
+				quaiKHs = cs.HashrateKHs
+				break
+			}
+		}
+		qs.RecordHashrateSample(quaiKHs)
+		for _, hs := range qs.HashrateSamples() {
+			snap.HashrateHistory = append(snap.HashrateHistory, dashboard.HashrateSample{
+				Coin:   sym,
+				KHs:    hs.KHs,
+				TimeMS: hs.TimeMS,
+			})
+		}
+	}
+
 	// Block log across all servers
 	for _, srv := range servers {
 		for _, b := range srv.BlockLog() {
@@ -1331,6 +1454,22 @@ collect:
 				Confirmations:  b.Confirmations,
 				IsOrphaned:     b.IsOrphaned,
 				MaturityTarget: stratum.CoinMaturityThreshold(b.Coin),
+			})
+		}
+	}
+
+	// Quai block log
+	for _, qs := range quaiServers {
+		sym := qs.Symbol()
+		for _, b := range qs.BlockLog() {
+			snap.BlockLog = append(snap.BlockLog, dashboard.BlockEvent{
+				Coin:      sym,
+				Height:    int64(b.Height),
+				Hash:      b.Hash,
+				Worker:    b.Worker,
+				FoundAt:   b.FoundAt.Format("Jan 2 15:04:05"),
+				FoundAtMS: b.FoundAt.UnixMilli(),
+				Luck:      -1,
 			})
 		}
 	}
