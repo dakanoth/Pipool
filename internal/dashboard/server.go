@@ -191,6 +191,9 @@ type BlockEvent struct {
 	FoundAtMS   int64   `json:"found_at_ms"` // epoch ms for chart positioning
 	Luck        float64 `json:"luck"`        // luck %; -1 = N/A (aux chain)
 	ExplorerURL string  `json:"explorer_url,omitempty"` // base URL + hash link
+	Confirmations  int64 `json:"confirmations"`
+	IsOrphaned     bool  `json:"is_orphaned"`
+	MaturityTarget int64 `json:"maturity_target"`
 }
 
 // HistoBucket is one bin of the share difficulty histogram
@@ -728,7 +731,6 @@ body::before {
 
 /* ── RESOURCE BARS ── */
 .res-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; }
-@media(max-width:700px){ .res-grid { grid-template-columns:1fr; } }
 .res-top { display:flex; justify-content:space-between; margin-bottom:6px; }
 .res-name { font-size:0.6rem; text-transform:uppercase; letter-spacing:2px; color:var(--dim); font-family:var(--scan); }
 .res-val { font-family:var(--scan); font-size:0.72rem; color:var(--hi2); }
@@ -999,13 +1001,55 @@ body::before {
 
 /* ── LAYOUT ── */
 .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:16px; }
-@media(max-width:900px){ .row2 { grid-template-columns:1fr; } }
-/* Mobile responsive — worker table scrolls horizontally; coins stack to single column */
-@media(max-width:600px){
+/* ─── RESPONSIVE / MOBILE ─────────────────────────────────────────────── */
+@media(max-width:900px){
+  .row2 { grid-template-columns:1fr; }
+}
+@media(max-width:700px){
+  .res-grid { grid-template-columns:1fr; }
+}
+@media(max-width:640px){
+  /* Topbar */
+  .topbar { padding:8px 12px; flex-wrap:wrap; gap:6px; }
+  .logo-text { font-size:1.6rem; letter-spacing:3px; }
+  .topbar-right { flex-wrap:wrap; gap:4px; }
+
+  /* Stat cards — 2 per row on phones */
+  .cards { grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
+  .card { padding:10px 12px; }
+  .card-val { font-size:1.4rem; letter-spacing:1px; }
+  .card-label { font-size:.54rem; }
+
+  /* Coin grid — single column */
+  .coin-grid { grid-template-columns:1fr !important; gap:8px; }
+  /* Legacy class names */
   .coins-grid { grid-template-columns:1fr !important; }
   .stats-grid  { grid-template-columns:1fr 1fr !important; }
+
+  /* Workers table — horizontal scroll */
   .section-body { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .workers-table { min-width:820px; }
+
+  /* Section padding */
+  .section { margin-bottom:10px; }
+  .section-head { padding:8px 12px; }
+
+  /* Chart — shorter on mobile */
+  canvas#diffChart { height:160px !important; max-height:160px; }
+
+  /* Modal — full width */
+  #worker-modal > div { width:96vw !important; max-width:96vw !important; margin:8px auto; max-height:90vh; overflow-y:auto; }
+
+  /* Block log entries — tighter */
+  .block-entry { padding:10px 0; gap:8px; }
+  .block-reward { font-size:.7rem; }
+
+  /* Page padding */
+  .wrap { padding:8px 4px; }
+}
+@media(max-width:400px){
+  .cards { grid-template-columns:1fr; }
+  .card-val { font-size:1.2rem; }
 }
 
 footer {
@@ -1700,9 +1744,27 @@ function apply(s) {
       var hashDisplay = b.explorer_url
         ? '<a href="'+b.explorer_url+b.hash+'" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted;word-break:break-all">'+b.hash.slice(0,16)+'…</a>'
         : b.hash.slice(0,16)+'…';
+      var confBar = '';
+      if (b.is_orphaned) {
+        confBar = '<div style="margin-top:4px;font-family:var(--scan);font-size:.58rem;color:#c0392b;letter-spacing:1px">&#9888; ORPHANED</div>';
+      } else if (b.maturity_target > 0) {
+        var pct = Math.min(100, Math.round((b.confirmations / b.maturity_target) * 100));
+        var mature = b.confirmations >= b.maturity_target;
+        var barColor = mature ? 'var(--hi)' : 'var(--hi2)';
+        var label = mature ? 'MATURED' : (b.confirmations + ' / ' + b.maturity_target + ' CONF');
+        confBar = '<div style="margin-top:5px">' +
+          '<div style="display:flex;justify-content:space-between;font-family:var(--scan);font-size:.54rem;color:var(--dim2);margin-bottom:2px">' +
+            '<span>' + label + '</span>' +
+            '<span>' + pct + '%</span>' +
+          '</div>' +
+          '<div style="height:3px;background:var(--off);border-radius:2px">' +
+            '<div style="height:100%;width:'+pct+'%;background:'+barColor+';border-radius:2px;transition:width 1s"></div>' +
+          '</div>' +
+        '</div>';
+      }
       return '<div class="block-entry">' +
         '<div class="block-trophy">***</div>' +
-        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+hashDisplay+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+luckStr+'</div></div>' +
+        '<div><div class="block-coin-height">'+b.coin+' // BLOCK #'+b.height+'</div><div class="block-hash">'+hashDisplay+'</div><div style="font-size:.58rem;color:var(--dim2);margin-top:2px">FOUND BY '+b.worker+luckStr+'</div>'+confBar+'</div>' +
         '<div class="block-meta"><div class="block-reward">'+b.reward+'</div><div class="block-time">'+b.found_at+'</div></div>' +
         '</div>';
     }).join('')+'</div>';

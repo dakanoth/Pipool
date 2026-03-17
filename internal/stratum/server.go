@@ -142,7 +142,8 @@ type Worker struct {
 	staleJobStreak  int    // consecutive stales for the same old job
 
 	// Extranonce assigned to this worker
-	extranonce1  string
+	extranonce1    string
+	supportsEnSub  bool // true if miner sent mining.extranonce.subscribe
 }
 
 // SeenWorker tracks all workers ever connected this session (for dashboard history)
@@ -348,8 +349,9 @@ func (s *Server) activateProxy() {
 			s.recentJobs[job.ID] = job
 		}
 		s.mu.Unlock()
-		// Kick all connected workers so they reconnect and get the new extranonce1
-		s.kickAllConnected()
+		// Update extranonce1 for all workers; miners that support set_extranonce
+		// get a notification, others are disconnected to force a reconnect.
+		s.updateExtraNonce(en1)
 		select {
 		case s.jobBroadcast <- job:
 		default:
@@ -383,6 +385,27 @@ func (s *Server) kickAllConnected() {
 	defer s.mu.RUnlock()
 	for _, w := range s.workers {
 		w.conn.Close()
+	}
+}
+
+// updateExtraNonce pushes a new extranonce1 to all connected workers.
+// Workers that sent mining.extranonce.subscribe get a mining.set_extranonce
+// notification; others are disconnected so they reconnect with the new value.
+func (s *Server) updateExtraNonce(en1 string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, w := range s.workers {
+		w.mu.Lock()
+		sub := w.supportsEnSub
+		w.mu.Unlock()
+		if sub {
+			w.mu.Lock()
+			w.extranonce1 = en1
+			w.mu.Unlock()
+			s.sendSetExtranonce(w, en1, 4)
+		} else {
+			w.conn.Close()
+		}
 	}
 }
 
@@ -958,7 +981,10 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 		}
 		return s.reply(w, msg.ID, true, nil)
 	case "mining.extranonce.subscribe":
-		// Acknowledge but don't change extranonce dynamically for now
+		w.mu.Lock()
+		w.supportsEnSub = true
+		w.mu.Unlock()
+		log.Printf("[%s] %s supports mining.extranonce.subscribe", s.coin.Symbol, w.remoteAddr)
 		return s.reply(w, msg.ID, true, nil)
 	default:
 		log.Printf("[%s] unknown method: %s", s.coin.Symbol, msg.Method)
@@ -1865,6 +1891,18 @@ func (s *Server) sendDifficulty(w *Worker, diff float64) error {
 	return s.writeJSON(w, msg)
 }
 
+// sendSetExtranonce pushes a new extranonce1 to a miner that has subscribed.
+// This avoids a TCP reconnect when the extranonce needs to change (e.g. proxy switch).
+func (s *Server) sendSetExtranonce(w *Worker, en1 string, en2Size int) {
+	msg := stratumNotify{
+		Method: "mining.set_extranonce",
+		Params: []any{en1, en2Size},
+	}
+	if err := s.writeJSON(w, msg); err != nil {
+		log.Printf("[%s] sendSetExtranonce to %s failed: %v", s.coin.Symbol, w.remoteAddr, err)
+	}
+}
+
 func (s *Server) sendJob(w *Worker, job *Job) error {
 	params := []any{
 		job.ID,
@@ -2389,8 +2427,8 @@ func (s *Server) Diag() DiagStats {
 	}
 }
 
-// coinMaturityThreshold returns the number of confirmations required before a block reward is spendable.
-func coinMaturityThreshold(symbol string) int64 {
+// CoinMaturityThreshold returns the number of confirmations required before a block reward is spendable.
+func CoinMaturityThreshold(symbol string) int64 {
 	switch strings.ToUpper(symbol) {
 	case "DOGE":
 		return 60
@@ -2455,7 +2493,7 @@ func (s *Server) trackConfirmations() {
 						}
 					} else {
 						s.blockLog[i].Confirmations = u.confirmations
-						threshold := coinMaturityThreshold(s.blockLog[i].Coin)
+						threshold := CoinMaturityThreshold(s.blockLog[i].Coin)
 						if !s.blockLog[i].MatureNotified && s.blockLog[i].Confirmations >= threshold {
 							s.blockLog[i].MatureNotified = true
 							if s.OnBlockMature != nil {
