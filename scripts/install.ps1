@@ -20,7 +20,7 @@ function Err   { Write-Host "  [XX] $args" -ForegroundColor Red; exit 1 }
 Write-Host @"
   +------------------------------------------------------+
   |   PiPool Nodes -- Windows Node Runner                |
-  |   LTC / DOGE / BTC / BCH / PEP / LCC                |
+  |   LTC / DOGE / BTC / BCH / PEP                      |
   +------------------------------------------------------+
 "@ -ForegroundColor Cyan
 
@@ -50,11 +50,6 @@ if ($ENABLE_PEP -match "^[Yy]") {
     $PEP_WALLET = Read-Host "  PEP wallet address"
 }
 
-$ENABLE_LCC = Read-Host "  Enable LCC (Litecoin Cash)? [y/N]"
-$LCC_WALLET = ""
-if ($ENABLE_LCC -match "^[Yy]") {
-    $LCC_WALLET = Read-Host "  LCC wallet address"
-}
 
 # Data directories -- default to C:\PiPoolNodes\<coin>
 Write-Host "`n  Data directories (press Enter for defaults under $NODES_DIR\data\)" -ForegroundColor Cyan
@@ -63,14 +58,12 @@ $DOGE_DATADIR = Read-Host "  DOGE datadir [$NODES_DIR\data\dogecoin]"
 $BTC_DATADIR  = Read-Host "  BTC  datadir [$NODES_DIR\data\bitcoin]"
 $BCH_DATADIR  = Read-Host "  BCH  datadir [$NODES_DIR\data\bch]"
 $PEP_DATADIR  = Read-Host "  PEP  datadir [$NODES_DIR\data\pepecoin]"
-$LCC_DATADIR  = Read-Host "  LCC  datadir [$NODES_DIR\data\litecoincash]"
 
 if (-not $LTC_DATADIR)  { $LTC_DATADIR  = "$NODES_DIR\data\litecoin" }
 if (-not $DOGE_DATADIR) { $DOGE_DATADIR = "$NODES_DIR\data\dogecoin" }
 if (-not $BTC_DATADIR)  { $BTC_DATADIR  = "$NODES_DIR\data\bitcoin" }
 if (-not $BCH_DATADIR)  { $BCH_DATADIR  = "$NODES_DIR\data\bch" }
 if (-not $PEP_DATADIR)  { $PEP_DATADIR  = "$NODES_DIR\data\pepecoin" }
-if (-not $LCC_DATADIR)  { $LCC_DATADIR  = "$NODES_DIR\data\litecoincash" }
 
 # Generate RPC passwords
 function New-RpcPass { return [System.Convert]::ToBase64String((1..32 | ForEach-Object { [byte](Get-Random -Max 256) })).Substring(0,32) }
@@ -79,11 +72,10 @@ $DOGE_RPC_PASS = New-RpcPass
 $BTC_RPC_PASS  = New-RpcPass
 $BCH_RPC_PASS  = New-RpcPass
 $PEP_RPC_PASS  = New-RpcPass
-$LCC_RPC_PASS  = New-RpcPass
 
 # ?? Create directories ????????????????????????????????????????????????????????
 Step "Creating directories"
-foreach ($dir in @($NODES_DIR, $BIN_DIR, $LTC_DATADIR, $DOGE_DATADIR, $BTC_DATADIR, $BCH_DATADIR, $PEP_DATADIR, $LCC_DATADIR)) {
+foreach ($dir in @($NODES_DIR, $BIN_DIR, $LTC_DATADIR, $DOGE_DATADIR, $BTC_DATADIR, $BCH_DATADIR, $PEP_DATADIR)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 Log "Directories created"
@@ -251,31 +243,12 @@ listen=1
 "@
 }
 
-if ($ENABLE_LCC -match "^[Yy]") {
-    Write-DaemonConfig "$LCC_DATADIR\litecoincash.conf" @"
-server=1
-daemon=0
-datadir=$LCC_DATADIR
-rpcuser=lccd
-rpcpassword=$LCC_RPC_PASS
-rpcallowip=127.0.0.1
-rpcallowip=$PI_IP
-rpcbind=0.0.0.0
-rpcport=62457
-zmqpubhashblock=tcp://0.0.0.0:28336
-dbcache=512
-maxmempool=300
-listen=1
-"@
-}
-
 Log "Daemon configs written"
 
 # ?? Write pipool.json snippet ?????????????????????????????????????????????????
 Step "Writing pipool-nodes.json (copy values to your Pi's pipool.json)"
 $PC_IP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike "*Loopback*" } | Select-Object -First 1).IPAddress
 $PEP_ENABLED = if ($ENABLE_PEP -match "^[Yy]") { "true" } else { "false" }
-$LCC_ENABLED = if ($ENABLE_LCC -match "^[Yy]") { "true" } else { "false" }
 
 $pipoolJson = @"
 {
@@ -376,25 +349,6 @@ $pipoolJson = @"
       },
       "wallet": "$PEP_WALLET",
       "block_reward": 50000
-    },
-    "LCC": {
-      "enabled": $LCC_ENABLED,
-      "symbol": "LCC",
-      "algorithm": "sha256d",
-      "merge_parent": "BTC",
-      "datadir": "",
-      "stratum": {
-        "port": 3338,
-        "vardiff": { "min_diff": 1, "max_diff": 1048576, "target_ms": 30000, "retarget_s": 60 },
-        "tls": { "enabled": false, "port": 3348, "cert_file": "", "key_file": "" }
-      },
-      "node": {
-        "host": "$PC_IP", "port": 62457,
-        "user": "lccd", "password": "$LCC_RPC_PASS",
-        "zmq_pub_hashblock": "tcp://$PC_IP`:28336"
-      },
-      "wallet": "$LCC_WALLET",
-      "block_reward": 250
     }
   }
 }
@@ -413,9 +367,7 @@ $ports = @(
     @{ Name="PiPool-BTC-ZMQ";   Port=28334 },
     @{ Name="PiPool-BCH-RPC";   Port=8336  },
     @{ Name="PiPool-BCH-ZMQ";   Port=28335 },
-    @{ Name="PiPool-PEP-RPC";   Port=33873 },
-    @{ Name="PiPool-LCC-RPC";   Port=62457 },
-    @{ Name="PiPool-LCC-ZMQ";   Port=28336 }
+    @{ Name="PiPool-PEP-RPC";   Port=33873 }
 )
 foreach ($rule in $ports) {
     $existing = Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
@@ -443,8 +395,6 @@ $cfg = @"
 `$BCH_DATADIR  = '$BCH_DATADIR'
 `$PEP_DATADIR  = '$PEP_DATADIR'
 `$ENABLE_PEP   = '$ENABLE_PEP'
-`$LCC_DATADIR  = '$LCC_DATADIR'
-`$ENABLE_LCC   = '$ENABLE_LCC'
 `$PC_IP        = '$PC_IP'
 `$PI_IP        = '$PI_IP'
 "@
