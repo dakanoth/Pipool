@@ -246,6 +246,10 @@ type ConfigEditorData struct {
 	UpstreamHosts   map[string]string `json:"upstream_hosts"`
 	UpstreamPorts   map[string]int    `json:"upstream_ports"`
 	UpstreamUsers   map[string]string `json:"upstream_users"`
+
+	// Quai Network node
+	QuaiNodeHost string `json:"quai_node_host"`
+	QuaiNodePort int    `json:"quai_node_port"`
 }
 
 // StatsFn returns the current pool snapshot
@@ -1433,6 +1437,16 @@ footer {
           Change which node PiPool connects to. After saving, click APPLY &amp; RESTART to reconnect.
         </div>
         <div id="cfgNodes"></div>
+        <div id="cfgQuaiNode" style="margin-top:12px">
+          <div style="font-family:var(--scan);font-size:.56rem;color:var(--dim2);letter-spacing:2px;margin-bottom:6px">QUAI NETWORK NODE</div>
+          <div class="node-cfg-row">
+            <div class="node-cfg-label">NODE HOST</div>
+            <input class="node-cfg-host" id="cfgQuaiHost" placeholder="e.g. 192.168.1.100" value="">
+            <span style="font-family:var(--scan);font-size:.56rem;color:var(--dim2)">:</span>
+            <input class="node-cfg-port" id="cfgQuaiPort" type="number" placeholder="9001" value="9001">
+            <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2);padding-left:6px">HTTP RPC PORT</span>
+          </div>
+        </div>
       </div>
 
     </div>
@@ -2812,6 +2826,15 @@ function applyCfg(c) {
       nodesDiv.appendChild(div);
     });
   }
+
+  // Quai node settings
+  var quaiDiv = document.getElementById('cfgQuaiNode');
+  if (quaiDiv) {
+    var qHost = document.getElementById('cfgQuaiHost');
+    var qPort = document.getElementById('cfgQuaiPort');
+    if (qHost) qHost.value = c.quai_node_host || '';
+    if (qPort) qPort.value = c.quai_node_port || 9001;
+  }
 }
 
 function cfgFdAddRow(worker, diff) {
@@ -2879,6 +2902,14 @@ function saveCfg() {
     var uu= document.getElementById('upUser_'+sym);    if (uu) upUsers[sym] = uu.value.trim();
   });
 
+  // Collect Quai node settings
+  var quaiNodeHost = '';
+  var quaiNodePort = 9001;
+  var qhEl = document.getElementById('cfgQuaiHost');
+  var qpEl = document.getElementById('cfgQuaiPort');
+  if (qhEl) quaiNodeHost = qhEl.value.trim();
+  if (qpEl) quaiNodePort = parseInt(qpEl.value) || 9001;
+
   var payload = {
     temp_limit_c:       parseInt(document.getElementById('cfgTempLimit').value)||75,
     worker_timeout_s:   parseInt(document.getElementById('cfgWorkerTimeout').value)||120,
@@ -2892,7 +2923,9 @@ function saveCfg() {
     kwh_rate_usd:       parseFloat(document.getElementById('cfgKwhRate').value) || 0,
     node_hosts: nodeHosts, node_ports: nodePorts, node_users: nodeUsers, node_passwords: nodePws,
     backup_enabled: bkEnabled, backup_hosts: bkHosts, backup_ports: bkPorts, backup_users: bkUsers, backup_passwords: bkPws,
-    upstream_enabled: upEnabled, upstream_hosts: upHosts, upstream_ports: upPorts, upstream_users: upUsers
+    upstream_enabled: upEnabled, upstream_hosts: upHosts, upstream_ports: upPorts, upstream_users: upUsers,
+    quai_node_host: quaiNodeHost,
+    quai_node_port: quaiNodePort
   };
 
   // Currency preference is client-side only — save to localStorage

@@ -181,6 +181,8 @@ type Server struct {
 	jobHistory      map[string]*Job // recent jobs for share validation
 	blocksFound     atomic.Uint64
 	validShares     atomic.Uint64
+	staleShares     atomic.Uint64
+	rejectedShares  atomic.Uint64
 	online          atomic.Bool
 
 	// Vardiff settings
@@ -488,6 +490,7 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		w.mu.Lock()
 		w.sharesStale++
 		w.mu.Unlock()
+		s.staleShares.Add(1)
 		_ = w.respond(id, false, []interface{}{21, "Stale — job not found"})
 		if s.onShare != nil {
 			s.onShare(w.name, false)
@@ -523,6 +526,7 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 		w.mu.Lock()
 		w.sharesRejected++
 		w.mu.Unlock()
+		s.rejectedShares.Add(1)
 		_ = w.respond(id, false, []interface{}{23, "Low difficulty share"})
 		if s.onShare != nil {
 			s.onShare(w.name, false)
@@ -690,6 +694,8 @@ type Stats struct {
 	ConnectedMiners int32
 	ValidShares     uint64
 	BlocksFound     uint64
+	StaleShares     uint64
+	RejectedShares  uint64
 }
 
 func (s *Server) Stats() Stats {
@@ -698,6 +704,8 @@ func (s *Server) Stats() Stats {
 		ConnectedMiners: s.connectedMiners.Load(),
 		ValidShares:     s.validShares.Load(),
 		BlocksFound:     s.blocksFound.Load(),
+		StaleShares:     s.staleShares.Load(),
+		RejectedShares:  s.rejectedShares.Load(),
 	}
 }
 

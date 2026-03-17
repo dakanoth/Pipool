@@ -255,10 +255,10 @@ Open `http://<pi-ip>:8080` in any browser on your network.
 | **Telemetry chart** | Per-coin toggle buttons — select any combination of coins simultaneously. Diff mode: multi-coin scatter plot with per-coin colors and net diff lines on a shared log scale. Hashrate mode: overlaid area/line chart per selected coin |
 | **Block log** | All found blocks with height, reward, luck %, confirmations, orphan status |
 | **Storage** | Disk usage per mount with per-chain data sizes |
-| **Chain diagnostics** | Stale %, reject %, job age, issue detection per chain |
+| **Chain diagnostics** | Stale %, reject %, job age, issue detection per chain — includes QUAI/QUAIS |
 | **Connection info** | Stratum address, port, and algorithm per coin |
 | **Notifications** | Toggle Discord alerts live |
-| **Pool settings** | Edit wallets, vardiff, webhook, auto-kick, fixed diffs, electricity rate — saved to disk |
+| **Pool settings** | Edit wallets, vardiff, webhook, auto-kick, fixed diffs, electricity rate, Quai node host/port — saved to disk |
 
 ---
 

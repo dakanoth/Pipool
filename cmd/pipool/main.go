@@ -754,6 +754,18 @@ func main() {
 					upPorts[sym] = cc.UpstreamPool.Port
 					upUsers[sym] = cc.UpstreamPool.User
 				}
+				if cfg.Quai.Enabled {
+					if cfg.Quai.SHA256.Enabled {
+						wallets["QUAI"] = cfg.Quai.SHA256.Wallet
+						vmin["QUAI"] = cfg.Quai.SHA256.MinDiff
+						vmax["QUAI"] = cfg.Quai.SHA256.MaxDiff
+					}
+					if cfg.Quai.Scrypt.Enabled {
+						wallets["QUAIS"] = cfg.Quai.Scrypt.Wallet
+						vmin["QUAIS"] = cfg.Quai.Scrypt.MinDiff
+						vmax["QUAIS"] = cfg.Quai.Scrypt.MaxDiff
+					}
+				}
 				return dashboard.ConfigEditorData{
 					TempLimitC:      cfg.Pool.TempLimitC,
 					WorkerTimeoutS:  cfg.Pool.WorkerTimeout,
@@ -771,6 +783,8 @@ func main() {
 					BackupUsers: bkUsers, BackupPasswords: bkPws,
 					UpstreamEnabled: upEnabled, UpstreamHosts: upHosts, UpstreamPorts: upPorts,
 					UpstreamUsers: upUsers,
+					QuaiNodeHost: cfg.Quai.Node.Host,
+					QuaiNodePort: cfg.Quai.Node.HTTPPort,
 				}
 			},
 			// Config editor: SET and persist
@@ -850,6 +864,23 @@ func main() {
 						cfg.Coins[sym] = cc
 					}
 				}
+				// Apply Quai settings
+				if cd.QuaiNodeHost != "" {
+					cfg.Quai.Node.Host = cd.QuaiNodeHost
+				}
+				if cd.QuaiNodePort > 0 {
+					cfg.Quai.Node.HTTPPort = cd.QuaiNodePort
+				}
+				if w, ok := cd.Wallets["QUAI"]; ok && w != "" {
+					cfg.Quai.SHA256.Wallet = w
+				}
+				if w, ok := cd.Wallets["QUAIS"]; ok && w != "" {
+					cfg.Quai.Scrypt.Wallet = w
+				}
+				if v, ok := cd.VardiffMin["QUAI"]; ok && v > 0 { cfg.Quai.SHA256.MinDiff = v }
+				if v, ok := cd.VardiffMax["QUAI"]; ok && v > 0 { cfg.Quai.SHA256.MaxDiff = v }
+				if v, ok := cd.VardiffMin["QUAIS"]; ok && v > 0 { cfg.Quai.Scrypt.MinDiff = v }
+				if v, ok := cd.VardiffMax["QUAIS"]; ok && v > 0 { cfg.Quai.Scrypt.MaxDiff = v }
 				if err := config.Save(cfg, *cfgPath); err != nil {
 					log.Printf("[dashboard] config save failed: %v", err)
 				} else {
@@ -1543,6 +1574,45 @@ collect:
 					cd.Issues = append(cd.Issues, fmt.Sprintf("High node latency: %dms — may cause stale jobs", cs.NodeLatencyMs))
 				}
 			}
+		}
+		snap.ChainDiags = append(snap.ChainDiags, cd)
+	}
+
+	// Quai chain diagnostics
+	for _, qs := range quaiServers {
+		stats := qs.Stats()
+		sym := qs.Symbol()
+		total := stats.ValidShares + stats.StaleShares + stats.RejectedShares
+		var stalePct, rejectPct float64
+		if total > 0 {
+			stalePct = float64(stats.StaleShares) / float64(total) * 100
+			rejectPct = float64(stats.RejectedShares) / float64(total) * 100
+		}
+		cd := dashboard.ChainDiag{
+			Symbol:      sym,
+			ValidShares: stats.ValidShares,
+			StaleShares: stats.StaleShares,
+			RejectedShares: stats.RejectedShares,
+			TotalShares: total,
+			StalePct:    stalePct,
+			RejectPct:   rejectPct,
+			WorkerCount: int(stats.ConnectedMiners),
+			HasJob:      qs.NodeOnline(),
+			CurrentJobAge: 0,
+		}
+		if !qs.NodeOnline() {
+			cd.Issues = append(cd.Issues, "Quai node offline — check go-quai is running with --rpc.http-addr 0.0.0.0")
+		}
+		if total >= 20 {
+			if stalePct >= 10 {
+				cd.Issues = append(cd.Issues, fmt.Sprintf("High stale rate: %.1f%%", stalePct))
+			}
+			if rejectPct >= 5 {
+				cd.Issues = append(cd.Issues, fmt.Sprintf("High reject rate: %.1f%%", rejectPct))
+			}
+		}
+		if stats.ConnectedMiners == 0 {
+			cd.Issues = append(cd.Issues, "No miners connected to this chain")
 		}
 		snap.ChainDiags = append(snap.ChainDiags, cd)
 	}
