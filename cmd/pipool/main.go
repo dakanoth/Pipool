@@ -49,6 +49,7 @@ var geckoIDs = map[string]string{
 	"BCH":  "bitcoin-cash",
 	"DGB":  "digibyte",
 	"DGBS": "digibyte", // DGB Scrypt — same underlying coin, different algo port
+	"PEP":  "pepecoin-network",
 }
 
 func coinPrice(symbol string) float64 {
