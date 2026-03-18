@@ -387,6 +387,8 @@ scripts/install.sh              — Full Ubuntu Server install script
 
 ## RAM Budget (Pi 5, 8 GB)
 
+> **Recommendation:** Run coin daemons on a separate machine (desktop PC, NAS, etc.) and point PiPool at them over the network. The Pi 5 has only 8 GB of RAM — coin daemons are memory-hungry and will compete with PiPool, the dashboard, and the OS for resources. A single daemon like `digibyted` can consume 6+ GB on its own. PiPool itself is lightweight (~30–80 MB) and is perfectly happy talking to remote nodes via RPC. Use the Pi for what it's good at — running the pool — and let beefier hardware handle the blockchain.
+
 | Component | RAM |
 |---|---|
 | PiPool itself | ~30–80 MB |
@@ -394,10 +396,10 @@ scripts/install.sh              — Full Ubuntu Server install script
 | dogecoind | ~300–500 MB |
 | bitcoind | ~500–700 MB |
 | bitcoin-cash-node | ~300–500 MB |
+| digibyted | ~4–7 GB (!) |
 | Ubuntu Server overhead | ~400 MB |
-| **Total (all 4 daemons)** | **~2–3 GB** |
 
-> Use `dbcache=256` in coin daemon configs to cap their RAM. The install script sets this automatically.
+> Use `dbcache=256` in coin daemon configs to cap their LevelDB cache. This does **not** limit total memory usage — the UTXO set, block index, and mempool are held separately in RAM and can dwarf the dbcache setting, especially on high-block-count chains like DigiByte (23M+ blocks).
 
 ---
 

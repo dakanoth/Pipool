@@ -58,7 +58,8 @@ type Server struct {
 	bestShareEver   float64            // all-time highest share difficulty this process
 	blockLog        []BlockEntry       // last 50 blocks found, shown on dashboard
 	currentJob      *Job
-	recentJobs      map[string]*Job    // last 4 jobs by ID — used to validate non-stale shares
+	recentJobs      map[string]*Job    // recent jobs by ID — used to validate non-stale shares
+	recentJobsMax   int                // max jobs to keep (from config, default 4)
 
 	// Luck tracking — valid work accumulated since last block found or session start
 	validWorkSinceBlock float64 // sum of accepted share diffs since last block (under mu)
@@ -224,6 +225,11 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 			coin.BackupNode.User, coin.BackupNode.Password, coin.Symbol)
 	}
 
+	maxJobs := coin.Stratum.RecentJobsSize
+	if maxJobs <= 0 {
+		maxJobs = 4
+	}
+
 	return &Server{
 		coin:            coin,
 		seenWorkers:     make(map[string]*SeenWorker),
@@ -236,6 +242,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		coordinator:     coord,
 		workers:         make(map[string]*Worker),
 		recentJobs:      make(map[string]*Job),
+		recentJobsMax:   maxJobs,
 		jobBroadcast:    make(chan *Job, 16),
 		stopCh:          make(chan struct{}),
 		workerKickTimes: make(map[string][]time.Time),
@@ -342,7 +349,7 @@ func (s *Server) activateProxy() {
 		s.upstreamEn1 = en1
 		s.upstreamDiff = diff
 		s.currentJob = job
-		if len(s.recentJobs) > 4 {
+		if len(s.recentJobs) > s.recentJobsMax {
 			// keep only the latest
 			s.recentJobs = map[string]*Job{job.ID: job}
 		} else {
@@ -581,7 +588,7 @@ func (s *Server) pollBlockTemplate() {
 		s.mu.Lock()
 		s.currentJob = job
 		s.recentJobs[job.ID] = job
-		if len(s.recentJobs) > 4 {
+		if len(s.recentJobs) > s.recentJobsMax {
 			var oldestID string
 			var oldestTime time.Time
 			for id, j := range s.recentJobs {
@@ -1166,7 +1173,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	}
 
 	// Look up the exact job the miner was working on.
-	// Shares for any of the last 4 jobs are accepted (not stale).
+	// Shares for any recent job in the window are accepted (not stale).
 	s.mu.RLock()
 	submittedJobID := params[1]
 	job, jobFound := s.recentJobs[submittedJobID]

@@ -94,6 +94,12 @@ type StratumConf struct {
 	// 0 = use default (5). For fast-block coins like DGBS (~15s blocks), set to 2
 	// so the reconnect cycle fires after ~10s of stale work instead of ~25s.
 	StaleKickCount int `json:"stale_kick_count,omitempty"`
+	// RecentJobsSize controls how many recent jobs are kept for share validation.
+	// Shares referencing a job not in this window are marked stale. Default is 4.
+	// For fast-block coins (e.g. DGBS with ~15s blocks), increase this so that
+	// slower miners (like DG1Home at high fixed diff) don't have their job evicted
+	// before they can submit shares. Example: 8 keeps ~2 min of jobs at 15s blocks.
+	RecentJobsSize int `json:"recent_jobs_size,omitempty"`
 }
 
 type TLSConf struct {
