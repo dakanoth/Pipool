@@ -569,6 +569,35 @@ func (n *Notifier) GuardianAlert(severity, title, detail string) {
 	})
 }
 
+// SwapAlert sends a notification about auto-swap events.
+func (n *Notifier) SwapAlert(severity, title, detail string) {
+	if n.cfg.WebhookURL == "" {
+		return
+	}
+	if !n.rateLimitOK("swap:"+title, 2*time.Minute) {
+		return
+	}
+	color := ColorAdvisory
+	switch severity {
+	case "error":
+		color = ColorCritical
+	case "warn":
+		color = ColorWarning
+	case "info":
+		color = ColorAdvisory
+	}
+	go n.send(webhookPayload{
+		Username: botName,
+		Embeds: []embed{{
+			Title:       title,
+			Description: detail,
+			Color:       color,
+			Footer:      &embedFooter{Text: "PIPOOL AUTO-SWAP · TRADEOGRE"},
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
 func (n *Notifier) rateLimitOK(key string, cooldown time.Duration) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()

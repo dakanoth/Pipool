@@ -16,6 +16,28 @@ type PoolConfig struct {
 	Logging  LoggingConfig           `json:"logging"`
 	Quai     QuaiConfig              `json:"quai"`
 	Guardian GuardianConfig          `json:"guardian"`
+	Swap     SwapConfig              `json:"swap"`
+}
+
+// SwapConfig controls the auto-swap system that converts mined coins to a destination coin.
+type SwapConfig struct {
+	Enabled          bool              `json:"enabled"`
+	Exchange         string            `json:"exchange"`           // "tradeogre"
+	APIKey           string            `json:"api_key"`
+	APISecret        string            `json:"api_secret"`
+	CheckIntervalMin int               `json:"check_interval_min"` // default 15
+	StateFile        string            `json:"state_file"`
+	Rules            map[string]SwapRule   `json:"rules"`          // coin → swap rule
+	DepositAddrs     map[string]string `json:"deposit_addrs"`      // coin → exchange deposit address
+}
+
+// SwapRule defines auto-swap behavior for a single source coin.
+type SwapRule struct {
+	Enabled     bool    `json:"enabled"`
+	Destination string  `json:"destination"`      // target coin symbol
+	MinBalance  float64 `json:"min_balance"`       // minimum balance before triggering
+	KeepBalance float64 `json:"keep_balance"`      // keep this much in source wallet
+	MaxSlippage float64 `json:"max_slippage_pct"`  // max acceptable slippage %
 }
 
 // GuardianConfig controls the autonomous monitoring system.

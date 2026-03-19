@@ -310,6 +310,14 @@ func (c *Client) GetWalletInfo() (*WalletInfo, error) {
 	return &wi, err
 }
 
+// SendToAddress sends coins from the daemon wallet to the given address.
+// Returns the transaction ID on success.
+func (c *Client) SendToAddress(addr string, amount float64) (string, error) {
+	var txid string
+	err := c.Call("sendtoaddress", []any{addr, amount}, &txid)
+	return txid, err
+}
+
 // GetBlockHash returns the block hash at the given height.
 func (c *Client) GetBlockHash(height int64) (string, error) {
 	var hash string

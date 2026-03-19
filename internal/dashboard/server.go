@@ -268,6 +268,8 @@ type Server struct {
 	setConfig       func(ConfigEditorData)
 	GetWorkerDetail func(coin, name string) *WorkerDetail
 	TriggerRestart  func()
+	GetSwapStatus   func() json.RawMessage
+	UpdateSwapRule  func(coin string, enabled bool, dest string, minBal, keepBal float64)
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -304,6 +306,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/node/test", s.handleNodeTest)
 	mux.HandleFunc("/api/restart", s.handleRestartReq)
 	mux.HandleFunc("/api/worker/", s.handleWorkerDetail)
+	mux.HandleFunc("/api/swap", s.handleSwap)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("[dashboard] http://0.0.0.0%s", addr)
@@ -479,6 +482,47 @@ func (s *Server) handleWorkerDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(detail)
+}
+
+func (s *Server) handleSwap(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(204)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if s.GetSwapStatus == nil {
+			json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		w.Write(s.GetSwapStatus())
+	case http.MethodPost:
+		if s.UpdateSwapRule == nil {
+			http.Error(w, "swap not configured", 503)
+			return
+		}
+		var req struct {
+			Coin        string  `json:"coin"`
+			Enabled     bool    `json:"enabled"`
+			Destination string  `json:"destination"`
+			MinBalance  float64 `json:"min_balance"`
+			KeepBalance float64 `json:"keep_balance"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		s.UpdateSwapRule(req.Coin, req.Enabled, req.Destination, req.MinBalance, req.KeepBalance)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -1697,6 +1741,41 @@ function apply(s) {
           return balLine;
         })() +
         (function(){
+          // Auto-swap toggle row
+          var swapHtml = '';
+          if (window._swapStatus && window._swapStatus.enabled) {
+            var rule = (window._swapStatus.rules||{})[c.symbol] || {};
+            var checked = rule.enabled ? 'checked' : '';
+            var dest = rule.destination || 'LTC';
+            var activeJob = rule.active_job;
+            var jobStatus = '';
+            if (activeJob) {
+              jobStatus = '<span style="color:var(--amber);font-size:10px;margin-left:6px">['+activeJob.state+']</span>';
+            }
+            // Build destination options from available coins
+            var destOpts = '';
+            var availCoins = (window._lastStats && window._lastStats.coins) ? window._lastStats.coins.map(function(x){return x.symbol;}) : [];
+            availCoins.forEach(function(sym){
+              if (sym === c.symbol) return;
+              destOpts += '<option value="'+sym+'"'+(sym===dest?' selected':'')+'>'+sym+'</option>';
+            });
+            swapHtml = '<div class="cs-row" style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+              '<div class="cs-l">AUTO-SWAP</div>' +
+              '<div class="cs-v" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" '+checked+' onchange="toggleSwap(\''+c.symbol+'\',this.checked,this.parentElement.parentElement.querySelector(\'select\').value)" style="accent-color:var(--hi)">' +
+                  '<span style="font-size:11px">Enabled</span>' +
+                '</label>' +
+                '<select onchange="updateSwapDest(\''+c.symbol+'\',this.value)" style="background:var(--bg1);color:var(--fg);border:1px solid var(--bdr);border-radius:4px;padding:2px 4px;font-size:11px;font-family:inherit">' +
+                  destOpts +
+                '</select>' +
+                jobStatus +
+              '</div>' +
+            '</div>';
+          }
+          return swapHtml;
+        })() +
+        (function(){
           var histoHtml = '';
           if (c.diff_histogram && c.diff_histogram.length) {
             var maxCount = Math.max.apply(null, c.diff_histogram.map(function(b){return b.count;}));
@@ -2741,6 +2820,56 @@ evtSrc.onerror = function() { document.getElementById('liveStatus').textContent 
 fetch('/api/stats').then(function(r){return r.json();}).then(apply).catch(function(){});
 fetch('/api/discord').then(function(r){return r.json();}).then(applyNotifs).catch(function(){});
 fetch('/api/config').then(function(r){return r.json();}).then(applyCfg).catch(function(){});
+
+// ── Auto-Swap ──────────────────────────────────────────────────────────────
+
+window._swapStatus = null;
+window._lastStats = null;
+
+function fetchSwapStatus() {
+  fetch('/api/swap').then(function(r){return r.json();}).then(function(d) {
+    window._swapStatus = d;
+  }).catch(function(){});
+}
+fetchSwapStatus();
+setInterval(fetchSwapStatus, 30000);
+
+// Wrap original apply to also store lastStats
+var _origApply = apply;
+apply = function(s) {
+  window._lastStats = s;
+  _origApply(s);
+};
+
+function toggleSwap(coin, enabled, dest) {
+  var rule = (window._swapStatus && window._swapStatus.rules && window._swapStatus.rules[coin]) || {};
+  fetch('/api/swap', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      coin: coin,
+      enabled: enabled,
+      destination: dest || rule.destination || 'LTC',
+      min_balance: rule.min_balance || 0,
+      keep_balance: rule.keep_balance || 0
+    })
+  }).then(function(){ fetchSwapStatus(); });
+}
+
+function updateSwapDest(coin, dest) {
+  var rule = (window._swapStatus && window._swapStatus.rules && window._swapStatus.rules[coin]) || {};
+  fetch('/api/swap', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      coin: coin,
+      enabled: rule.enabled || false,
+      destination: dest,
+      min_balance: rule.min_balance || 0,
+      keep_balance: rule.keep_balance || 0
+    })
+  }).then(function(){ fetchSwapStatus(); });
+}
 
 // ── Config editor ──────────────────────────────────────────────────────────
 

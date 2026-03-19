@@ -26,6 +26,7 @@ import (
 	"github.com/dakota/pipool/internal/discord"
 	"github.com/dakota/pipool/internal/guardian"
 	"github.com/dakota/pipool/internal/merge"
+	"github.com/dakota/pipool/internal/swap"
 	"github.com/dakota/pipool/internal/metrics"
 	"github.com/dakota/pipool/internal/mining"
 	"github.com/dakota/pipool/internal/rpc"
@@ -752,6 +753,7 @@ func main() {
 	}()
 
 	// ─── Web dashboard (always on) ───────────────────────────────────────────
+	var dash *dashboard.Server
 	{
 		dashPort := cfg.Dashboard.Port
 		if dashPort == 0 {
@@ -763,7 +765,7 @@ func main() {
 		}
 		// Pre-build one RPC client per coin — reused every dashboard snapshot
 		// instead of allocating a new http.Client every 5 seconds
-		dash := dashboard.New(dashPort, pushInterval,
+		dash = dashboard.New(dashPort, pushInterval,
 			func() dashboard.StatsSnapshot {
 				return buildDashboardSnapshot(cfg, servers, quaiServers, sysmon, dashClients, &asicMu, asicHealth)
 			},
@@ -1122,6 +1124,87 @@ func main() {
 		}
 	}
 
+	// ─── Auto-Swap engine ────────────────────────────────────────────────────
+	var swapEngine *swap.Engine
+	{
+		scfg := swap.DefaultConfig()
+		if cfg.Swap.Enabled {
+			scfg.Enabled = true
+		}
+		if cfg.Swap.Exchange != "" {
+			scfg.Exchange = cfg.Swap.Exchange
+		}
+		scfg.APIKey = cfg.Swap.APIKey
+		scfg.APISecret = cfg.Swap.APISecret
+		if cfg.Swap.CheckIntervalMin > 0 {
+			scfg.CheckIntervalMin = cfg.Swap.CheckIntervalMin
+		}
+		if cfg.Swap.StateFile != "" {
+			scfg.StateFile = cfg.Swap.StateFile
+		}
+		// Convert config swap rules
+		if len(cfg.Swap.Rules) > 0 {
+			scfg.Rules = make(map[string]swap.Rule)
+			for coin, rule := range cfg.Swap.Rules {
+				scfg.Rules[coin] = swap.Rule{
+					Enabled:     rule.Enabled,
+					Destination: rule.Destination,
+					MinBalance:  rule.MinBalance,
+					KeepBalance: rule.KeepBalance,
+					MaxSlippage: rule.MaxSlippage,
+				}
+			}
+		}
+		if len(cfg.Swap.DepositAddrs) > 0 {
+			scfg.DepositAddrs = cfg.Swap.DepositAddrs
+		}
+
+		// Build wallet RPC adapters for each enabled coin
+		swapWallets := make(map[string]swap.WalletRPC)
+		for sym, coinCfg := range cfg.Coins {
+			if !coinCfg.Enabled {
+				continue
+			}
+			cli := rpc.NewClient(coinCfg.Node.Host, coinCfg.Node.Port,
+				coinCfg.Node.User, coinCfg.Node.Password, sym)
+			swapWallets[sym] = &swapWalletAdapter{cli: cli, symbol: sym}
+		}
+
+		swapEngine = swap.New(scfg, swapWallets, &swapAlertAdapter{notifier})
+		swapEngine.Start()
+
+		// Wire swap callbacks to dashboard
+		if dash != nil {
+			se := swapEngine // capture for closures
+			dash.GetSwapStatus = func() json.RawMessage {
+				status := se.Status()
+				b, _ := json.Marshal(status)
+				return b
+			}
+			dash.UpdateSwapRule = func(coin string, enabled bool, dest string, minBal, keepBal float64) {
+				se.UpdateRule(coin, swap.Rule{
+					Enabled:     enabled,
+					Destination: dest,
+					MinBalance:  minBal,
+					KeepBalance: keepBal,
+				})
+				// Also persist to config file
+				if cfg.Swap.Rules == nil {
+					cfg.Swap.Rules = make(map[string]config.SwapRule)
+				}
+				cfg.Swap.Rules[coin] = config.SwapRule{
+					Enabled:     enabled,
+					Destination: dest,
+					MinBalance:  minBal,
+					KeepBalance: keepBal,
+				}
+				if err := config.Save(cfg, *cfgPath); err != nil {
+					log.Printf("[swap] config save failed: %v", err)
+				}
+			}
+		}
+	}
+
 	// ─── Graceful shutdown ────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1132,6 +1215,9 @@ func main() {
 	// Cancel background goroutines first so they don't pile up RPC calls during shutdown
 	shutdownCancel()
 
+	if swapEngine != nil {
+		swapEngine.Stop()
+	}
 	if guard != nil {
 		guard.Stop()
 	}
@@ -2328,3 +2414,30 @@ type guardianSysAdapter struct{ m *mining.SystemMonitor }
 func (a *guardianSysAdapter) CPUTemp() float64  { return a.m.CurrentTemp() }
 func (a *guardianSysAdapter) CPUUsage() float64 { return a.m.ReadCPUUsage() }
 func (a *guardianSysAdapter) RAMUsedGB() float64 { return a.m.ReadRAMUsage() }
+
+// ─── Swap engine adapters ─────────────────────────────────────────────────────
+
+type swapWalletAdapter struct {
+	cli    *rpc.Client
+	symbol string
+}
+
+func (a *swapWalletAdapter) Symbol() string { return a.symbol }
+func (a *swapWalletAdapter) GetBalance() (confirmed, immature float64, err error) {
+	wi, err := a.cli.GetWalletInfo()
+	if err != nil {
+		return 0, 0, err
+	}
+	return wi.Balance, wi.ImmatureBalance, nil
+}
+func (a *swapWalletAdapter) SendToAddress(addr string, amount float64) (string, error) {
+	return a.cli.SendToAddress(addr, amount)
+}
+
+type swapAlertAdapter struct{ n *discord.Notifier }
+
+func (a *swapAlertAdapter) SwapAlert(severity, title, detail string) {
+	if a.n != nil {
+		a.n.SwapAlert(severity, title, detail)
+	}
+}
