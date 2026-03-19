@@ -692,6 +692,64 @@ func main() {
 		}
 	}()
 
+	// ─── Wallet balance alert ────────────────────────────────────────────────
+	go func() {
+		// Wait a bit for daemons to warm up before first check
+		select {
+		case <-shutdownCtx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			cfgMu.RLock()
+			checkMin := cfg.Discord.Alerts.WalletCheckMin
+			thresholds := cfg.Discord.Alerts.WalletThresholds
+			cfgMu.RUnlock()
+
+			if checkMin <= 0 {
+				checkMin = 60 // default: check every hour
+			}
+
+			var alerts []discord.WalletBalance
+			for sym, cli := range dashClients {
+				wi, err := cli.GetWalletInfo()
+				if err != nil || (wi.Balance == 0 && wi.ImmatureBalance == 0) {
+					continue
+				}
+				threshold := 0.0
+				if thresholds != nil {
+					threshold = thresholds[sym]
+				}
+				if wi.Balance >= threshold {
+					alerts = append(alerts, discord.WalletBalance{
+						Symbol:    sym,
+						Confirmed: wi.Balance,
+						Immature:  wi.ImmatureBalance,
+						PriceUSD:  coinPrice(sym),
+					})
+				}
+			}
+			if len(alerts) > 0 {
+				notifier.WalletBalanceAlert(alerts)
+			}
+
+			// Sleep for the configured interval
+			wait := time.Duration(checkMin) * time.Minute
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-time.After(wait):
+			}
+			// Also drain the ticker to avoid buildup
+			select {
+			case <-ticker.C:
+			default:
+			}
+		}
+	}()
+
 	// ─── Web dashboard (always on) ───────────────────────────────────────────
 	{
 		dashPort := cfg.Dashboard.Port

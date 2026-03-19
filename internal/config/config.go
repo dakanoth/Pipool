@@ -151,6 +151,12 @@ type DiscordAlerts struct {
 	// StaleKickAlertCount fires a Discord alert when a worker is kicked for stale shares
 	// this many times within a 1-hour rolling window. 0 = disabled.
 	StaleKickAlertCount int `json:"stale_kick_alert_count,omitempty"`
+	// WalletBalanceAlert: check wallet balances every N minutes and notify if above threshold.
+	// 0 = disabled.
+	WalletCheckMin int `json:"wallet_check_min,omitempty"`
+	// Per-coin minimum balance to trigger an alert (e.g. {"BTC": 0.001, "LTC": 1.0}).
+	// Coins not listed use a default threshold of 0 (always alert if any balance exists).
+	WalletThresholds map[string]float64 `json:"wallet_thresholds,omitempty"`
 }
 
 type DashboardConfig struct {

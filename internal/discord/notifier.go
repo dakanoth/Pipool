@@ -479,6 +479,60 @@ func (n *Notifier) StaleKick(coin, workerName string, kickCount int) {
 	})
 }
 
+// WalletBalance holds a per-coin balance for the wallet alert
+type WalletBalance struct {
+	Symbol    string
+	Confirmed float64
+	Immature  float64
+	PriceUSD  float64
+}
+
+func (n *Notifier) WalletBalanceAlert(balances []WalletBalance) {
+	if !n.cfg.Enabled {
+		return
+	}
+	n.mu.Lock()
+	key := "wallet"
+	if time.Since(n.lastSent[key]) < 30*time.Minute {
+		n.mu.Unlock()
+		return
+	}
+	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
+
+	fields := make([]embedField, 0, len(balances)*2)
+	for _, b := range balances {
+		value := fmt.Sprintf("%.8f %s", b.Confirmed, b.Symbol)
+		if b.PriceUSD > 0 {
+			usdVal := b.Confirmed * b.PriceUSD
+			value += fmt.Sprintf(" (~$%.2f)", usdVal)
+		}
+		if b.Immature > 0 {
+			value += fmt.Sprintf("\n+ %.8f immature", b.Immature)
+		}
+		fields = append(fields, embedField{
+			Name:   b.Symbol,
+			Value:  value,
+			Inline: true,
+		})
+	}
+
+	go n.send(webhookPayload{
+		Username: botName,
+		Embeds: []embed{{
+			Title: "WALLET BALANCE REPORT",
+			Description: fmt.Sprintf(
+				"%s\n\nYou have funds sitting in the following wallets. Consider moving them.",
+				lvlAdvisory,
+			),
+			Color:     ColorAdvisory,
+			Fields:    fields,
+			Footer:    &embedFooter{Text: botFooter},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 func (n *Notifier) send(payload webhookPayload) {
