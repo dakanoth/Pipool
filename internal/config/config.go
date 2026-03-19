@@ -15,6 +15,23 @@ type PoolConfig struct {
 	Dashboard DashboardConfig        `json:"dashboard"`
 	Logging  LoggingConfig           `json:"logging"`
 	Quai     QuaiConfig              `json:"quai"`
+	Guardian GuardianConfig          `json:"guardian"`
+}
+
+// GuardianConfig controls the autonomous monitoring system.
+type GuardianConfig struct {
+	Enabled          bool    `json:"enabled"`
+	TickSec          int     `json:"tick_sec"`            // evaluation interval (default 30)
+	LogLevel         int     `json:"log_level"`           // 0=errors, 1=actions, 2=verbose
+	MaxStaleRatePct  float64 `json:"max_stale_rate_pct"`  // kick worker if stale% exceeds (default 40)
+	MaxRejectRatePct float64 `json:"max_reject_rate_pct"` // kick worker if reject% exceeds (default 25)
+	MinSharesForKick int     `json:"min_shares_for_kick"` // min shares before kick (default 50)
+	SilentWorkerMin  int     `json:"silent_worker_min"`   // alert if no shares for N min (default 15)
+	MaxJobAgeSec     int     `json:"max_job_age_sec"`     // alert if job older than this (default 300)
+	TempWarnC        float64 `json:"temp_warn_c"`         // warning threshold (default 75)
+	TempCritC        float64 `json:"temp_crit_c"`         // critical threshold (default 82)
+	TempTrendWarn    float64 `json:"temp_trend_warn"`     // °C/min rise rate to warn (default 2.0)
+	HashrateDropPct  float64 `json:"hashrate_drop_pct"`   // alert if hashrate drops >N% (default 50)
 }
 
 type PoolSettings struct {

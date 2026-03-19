@@ -86,10 +86,19 @@ func (u *UpstreamProxy) send(msg interface{}) {
 	if u.writer == nil {
 		return
 	}
-	b, _ := json.Marshal(msg)
+	b, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("[%s/proxy] marshal error: %v", u.symbol, err)
+		return
+	}
 	b = append(b, '\n')
-	u.writer.Write(b)
-	u.writer.Flush()
+	if _, err := u.writer.Write(b); err != nil {
+		log.Printf("[%s/proxy] write error: %v", u.symbol, err)
+		return
+	}
+	if err := u.writer.Flush(); err != nil {
+		log.Printf("[%s/proxy] flush error: %v", u.symbol, err)
+	}
 }
 
 func (u *UpstreamProxy) run(conn net.Conn) {

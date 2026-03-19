@@ -533,6 +533,52 @@ func (n *Notifier) WalletBalanceAlert(balances []WalletBalance) {
 	})
 }
 
+// GuardianAlert sends an alert from the autonomous guardian system.
+func (n *Notifier) GuardianAlert(severity, title, detail string) {
+	if n.cfg.WebhookURL == "" || !n.cfg.Alerts.BlockFound { // reuse BlockFound as "alerts enabled" check
+		return
+	}
+	if !n.rateLimitOK("guardian:"+title, 5*time.Minute) {
+		return
+	}
+	color := ColorCaution
+	lvl := lvlCaution
+	switch severity {
+	case "CRITICAL":
+		color = ColorCritical
+		lvl = lvlCritical
+	case "WARN":
+		color = ColorWarning
+		lvl = lvlWarning
+	case "ACTION":
+		color = ColorCaution
+		lvl = "**[ GUARDIAN ]**"
+	default:
+		color = ColorAdvisory
+		lvl = lvlAdvisory
+	}
+	n.send(webhookPayload{
+		Username: botName,
+		Embeds: []embed{{
+			Title:       fmt.Sprintf("%s %s", lvl, title),
+			Description: detail,
+			Color:       color,
+			Footer:      &embedFooter{Text: "PIPOOL GUARDIAN · AUTONOMOUS MONITOR"},
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+}
+
+func (n *Notifier) rateLimitOK(key string, cooldown time.Duration) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if last, ok := n.lastSent[key]; ok && time.Since(last) < cooldown {
+		return false
+	}
+	n.lastSent[key] = time.Now()
+	return true
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 func (n *Notifier) send(payload webhookPayload) {

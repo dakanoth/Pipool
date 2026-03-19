@@ -24,6 +24,7 @@ import (
 	"github.com/dakota/pipool/internal/ctl"
 	"github.com/dakota/pipool/internal/dashboard"
 	"github.com/dakota/pipool/internal/discord"
+	"github.com/dakota/pipool/internal/guardian"
 	"github.com/dakota/pipool/internal/merge"
 	"github.com/dakota/pipool/internal/metrics"
 	"github.com/dakota/pipool/internal/mining"
@@ -1067,6 +1068,59 @@ func main() {
 		log.Printf("[dashboard] http://0.0.0.0:%d — open in any browser on your network", dashPort)
 	}
 
+	// ─── Guardian (autonomous monitor) ───────────────────────────────────────
+	var guard *guardian.Guardian
+	{
+		gcfg := guardian.DefaultConfig()
+		if cfg.Guardian.Enabled || cfg.Guardian.TickSec > 0 {
+			gcfg.Enabled = cfg.Guardian.Enabled
+		}
+		if cfg.Guardian.TickSec > 0 {
+			gcfg.TickSec = cfg.Guardian.TickSec
+		}
+		if cfg.Guardian.LogLevel > 0 {
+			gcfg.LogLevel = cfg.Guardian.LogLevel
+		}
+		if cfg.Guardian.MaxStaleRatePct > 0 {
+			gcfg.MaxStaleRatePct = cfg.Guardian.MaxStaleRatePct
+		}
+		if cfg.Guardian.MaxRejectRatePct > 0 {
+			gcfg.MaxRejectRatePct = cfg.Guardian.MaxRejectRatePct
+		}
+		if cfg.Guardian.MinSharesForKick > 0 {
+			gcfg.MinSharesForKick = cfg.Guardian.MinSharesForKick
+		}
+		if cfg.Guardian.SilentWorkerMin > 0 {
+			gcfg.SilentWorkerMin = cfg.Guardian.SilentWorkerMin
+		}
+		if cfg.Guardian.MaxJobAgeSec > 0 {
+			gcfg.MaxJobAgeSec = cfg.Guardian.MaxJobAgeSec
+		}
+		if cfg.Guardian.TempWarnC > 0 {
+			gcfg.TempWarnC = cfg.Guardian.TempWarnC
+		}
+		if cfg.Guardian.TempCritC > 0 {
+			gcfg.TempCritC = cfg.Guardian.TempCritC
+		}
+		if cfg.Guardian.TempTrendWarn > 0 {
+			gcfg.TempTrendWarn = cfg.Guardian.TempTrendWarn
+		}
+		if cfg.Guardian.HashrateDropPct > 0 {
+			gcfg.HashrateDropPct = cfg.Guardian.HashrateDropPct
+		}
+
+		if gcfg.Enabled {
+			gsrvs := make([]guardian.StratumServer, len(servers))
+			for i, s := range servers {
+				gsrvs[i] = &guardianStratumAdapter{s}
+			}
+			guard = guardian.New(gcfg, gsrvs, &guardianAlertAdapter{notifier}, &guardianSysAdapter{sysmon})
+			guard.Start()
+		} else {
+			log.Println("[guardian] disabled — add \"guardian\":{\"enabled\":true} to config to enable")
+		}
+	}
+
 	// ─── Graceful shutdown ────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1077,6 +1131,9 @@ func main() {
 	// Cancel background goroutines first so they don't pile up RPC calls during shutdown
 	shutdownCancel()
 
+	if guard != nil {
+		guard.Stop()
+	}
 	for _, srv := range servers {
 		srv.Stop()
 	}
@@ -2215,3 +2272,58 @@ func probeDaemon(coin config.CoinConfig) error {
 	)
 	return cli.Ping()
 }
+
+// ─── Guardian adapters ───────────────────────────────────────────────────────
+// These bridge the gap between the guardian's import-cycle-free interfaces
+// and the actual stratum/discord/mining types.
+
+type guardianStratumAdapter struct{ s *stratum.Server }
+
+func (a *guardianStratumAdapter) Coin() string { return a.s.Coin() }
+func (a *guardianStratumAdapter) Stats() guardian.StratumStats {
+	st := a.s.Stats()
+	return guardian.StratumStats{
+		Symbol: st.Symbol, Algorithm: st.Algorithm,
+		ConnectedMiners: st.ConnectedMiners, TotalShares: st.TotalShares,
+		ValidShares: st.ValidShares, BlocksFound: st.BlocksFound,
+		ValidWorkSinceBlock: st.ValidWorkSinceBlock, LastNetworkDiff: st.LastNetworkDiff,
+	}
+}
+func (a *guardianStratumAdapter) Diag() guardian.DiagStats {
+	d := a.s.Diag()
+	return guardian.DiagStats{
+		Symbol: d.Symbol, TotalShares: d.TotalShares, ValidShares: d.ValidShares,
+		StaleShares: d.StaleShares, RejectedShares: d.RejectedShares,
+		CurrentJobID: d.CurrentJobID, CurrentJobAge: d.CurrentJobAge,
+		WorkerCount: d.WorkerCount, HasJob: d.HasJob,
+	}
+}
+func (a *guardianStratumAdapter) AllWorkers() []guardian.WorkerInfo {
+	ws := a.s.AllWorkers()
+	out := make([]guardian.WorkerInfo, len(ws))
+	for i, w := range ws {
+		out[i] = guardian.WorkerInfo{
+			Name: w.Name, DeviceName: w.DeviceName, HashrateKHs: w.HashrateKHs,
+			SharesAccepted: w.SharesAccepted, SharesRejected: w.SharesRejected,
+			SharesStale: w.SharesStale, Difficulty: w.Difficulty,
+			Online: w.Online, RemoteAddr: w.RemoteAddr,
+			WattsEstimate: w.WattsEstimate, LastShareAt: w.LastShareAt,
+		}
+	}
+	return out
+}
+func (a *guardianStratumAdapter) KickWorker(name string) bool { return a.s.KickWorker(name) }
+
+type guardianAlertAdapter struct{ n *discord.Notifier }
+
+func (a *guardianAlertAdapter) GuardianAlert(severity, title, detail string) {
+	if a.n != nil {
+		a.n.GuardianAlert(severity, title, detail)
+	}
+}
+
+type guardianSysAdapter struct{ m *mining.SystemMonitor }
+
+func (a *guardianSysAdapter) CPUTemp() float64  { return a.m.CurrentTemp() }
+func (a *guardianSysAdapter) CPUUsage() float64 { return a.m.ReadCPUUsage() }
+func (a *guardianSysAdapter) RAMUsedGB() float64 { return a.m.ReadRAMUsage() }

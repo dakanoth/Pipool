@@ -362,6 +362,7 @@ func (s *Server) activateProxy() {
 		select {
 		case s.jobBroadcast <- job:
 		default:
+			log.Printf("[%s] WARNING: proxy job broadcast channel full, job dropped", s.coin.Symbol)
 		}
 	})
 	if err := u.Start(); err != nil {
@@ -603,6 +604,7 @@ func (s *Server) pollBlockTemplate() {
 		select {
 		case s.jobBroadcast <- job:
 		default:
+			log.Printf("[%s] WARNING: job broadcast channel full, job %s dropped — miners may have stale work", s.coin.Symbol, job.ID)
 		}
 		// On a real new block (clean_jobs=true), immediately kick any worker that
 		// is already in a stale streak — they are confirmed to be ignoring clean_jobs
