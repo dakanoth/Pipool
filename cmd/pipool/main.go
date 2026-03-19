@@ -2057,8 +2057,29 @@ func registerCtlHandlers(
 		if len(args) < 3 {
 			return ctl.Response{OK: false, Message: "usage: vardiff <SYMBOL> <min_diff> <max_diff>"}
 		}
+		symbol := strings.ToUpper(args[0])
+		coinCfg, ok := cfg.Coins[symbol]
+		if !ok {
+			return ctl.Response{OK: false, Message: fmt.Sprintf("unknown coin: %s", symbol)}
+		}
+		var minDiff, maxDiff float64
+		if _, err := fmt.Sscanf(args[1], "%f", &minDiff); err != nil {
+			return ctl.Response{OK: false, Message: fmt.Sprintf("invalid min_diff: %s", args[1])}
+		}
+		if _, err := fmt.Sscanf(args[2], "%f", &maxDiff); err != nil {
+			return ctl.Response{OK: false, Message: fmt.Sprintf("invalid max_diff: %s", args[2])}
+		}
+		if minDiff <= 0 || maxDiff <= 0 || minDiff > maxDiff {
+			return ctl.Response{OK: false, Message: "min_diff must be > 0 and <= max_diff"}
+		}
+		coinCfg.Stratum.Vardiff.MinDiff = minDiff
+		coinCfg.Stratum.Vardiff.MaxDiff = maxDiff
+		cfg.Coins[symbol] = coinCfg
+		if err := config.Save(cfg, cfgPath); err != nil {
+			log.Printf("[ctl] failed to save config after vardiff update: %v", err)
+		}
 		return ctl.Response{OK: true, Message: fmt.Sprintf(
-			"vardiff for %s updated: min=%s max=%s (takes effect on next share)", args[0], args[1], args[2])}
+			"vardiff for %s updated: min=%.4f max=%.0f (saved, takes effect on next share)", symbol, minDiff, maxDiff)}
 	})
 
 	ctlSrv.Register("reload", func(args []string) ctl.Response {
