@@ -1069,6 +1069,7 @@ func main() {
 	}
 
 	// ─── Guardian (autonomous monitor) ───────────────────────────────────────
+	log.Printf("[guardian] initializing guardian subsystem (config enabled=%v)", cfg.Guardian.Enabled)
 	var guard *guardian.Guardian
 	{
 		gcfg := guardian.DefaultConfig()
