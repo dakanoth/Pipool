@@ -446,12 +446,20 @@ func main() {
 	}
 	// quaiServers passed to buildDashboardSnapshot
 
+	// Shutdown context — cancelled on SIGINT/SIGTERM so background goroutines exit cleanly.
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+
 	// ─── ASIC health polling ──────────────────────────────────────────────────
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		asicAlertedAt := make(map[string]time.Time)
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			for _, srv := range servers {
 				for _, w := range srv.AllWorkers() {
 					if !w.Online || w.DeviceName == "" {
@@ -493,7 +501,12 @@ func main() {
 		powerClient := &http.Client{Timeout: 3 * time.Second}
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			for _, srv := range servers {
 				for _, w := range srv.AllWorkers() {
 					if !w.Online {
@@ -509,7 +522,6 @@ func main() {
 						url := "http://" + host + "/api/system/info"
 						resp, err := powerClient.Get(url)
 						if err != nil {
-							log.Printf("[power] %s: HTTP error: %v", w.Name, err)
 							return
 						}
 						defer resp.Body.Close()
@@ -518,7 +530,6 @@ func main() {
 							Temp  float64 `json:"temp"`
 						}
 						if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-							log.Printf("[power] %s: decode error: %v", w.Name, err)
 							return
 						}
 						srv.SetLiveWatts(w.Name, info.Power, info.Temp)
@@ -570,7 +581,12 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			reg.CPUTempC.Set(sysmon.CurrentTemp())
 			reg.CPUUsagePct.Set(sysmon.ReadCPUUsage())
 			reg.RAMUsedGB.Set(sysmon.ReadRAMUsage())
@@ -613,9 +629,7 @@ func main() {
 	notifier.PoolStarted(activeSymbols)
 
 	// ─── Live coin price fetcher ──────────────────────────────────────────────
-	priceCtx, priceCancel := context.WithCancel(context.Background())
-	defer priceCancel()
-	go fetchPricesLoop(priceCtx)
+	go fetchPricesLoop(shutdownCtx)
 
 	// ─── Periodic hashrate report ─────────────────────────────────────────────
 	// Polls every minute; checks live config so dashboard interval changes take effect without restart.
@@ -623,7 +637,12 @@ func main() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		var minutesSinceReport int
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			minutesSinceReport++
 			interval := cfg.Discord.Alerts.HashrateIntervalMin
 			if interval > 0 && minutesSinceReport >= interval {
@@ -637,7 +656,12 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			alertMin := cfg.Pool.LastShareAlertMin
 			if alertMin <= 0 {
 				continue
@@ -969,6 +993,9 @@ func main() {
 
 	sig := <-sigCh
 	log.Printf("Received signal %v — shutting down PiPool...", sig)
+
+	// Cancel background goroutines first so they don't pile up RPC calls during shutdown
+	shutdownCancel()
 
 	for _, srv := range servers {
 		srv.Stop()
