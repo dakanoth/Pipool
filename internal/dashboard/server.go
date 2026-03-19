@@ -1612,7 +1612,7 @@ function apply(s) {
   document.getElementById('daemonCount').textContent = coins.filter(function(c){return c.daemon_online;}).length+'/'+coins.length+' ONLINE';
 
   var grid = document.getElementById('coinGrid');
-  grid.innerHTML = '';
+  var coinHtml = [];
   coins.forEach(function(c) {
     var offline = !c.enabled || !c.daemon_online ? 'offline' : '';
     var mergeClass = c.is_merge_aux ? 'merge' : '';
@@ -1655,7 +1655,7 @@ function apply(s) {
         '</div>';
     }
 
-    grid.innerHTML +=
+    coinHtml.push(
       '<div class="coin-card '+offline+' '+mergeClass+'">' +
         '<div class="coin-head">' +
           '<div class="coin-badge">'+c.symbol+'</div>' +
@@ -1728,8 +1728,9 @@ function apply(s) {
           }
           return adjHtml;
         })() +
-      '</div>';
+      '</div>');
   });
+  grid.innerHTML = coinHtml.join('');
 
   renderWorkersTab(s);
 
@@ -1778,7 +1779,7 @@ function apply(s) {
   if (disks.length === 0) {
     dw.innerHTML = '<div style="font-family:var(--scan);font-size:.7rem;color:var(--dim2)">NO STORAGE DATA</div>';
   } else {
-    dw.innerHTML = '';
+    var diskHtml = [];
     disks.forEach(function(d) {
       var pct = Math.min(d.used_pct,100).toFixed(1);
       var chainHtml = '';
@@ -1791,13 +1792,14 @@ function apply(s) {
         });
         chainHtml += '</div>';
       }
-      dw.innerHTML += '<div class="disk-card">' +
+      diskHtml.push('<div class="disk-card">' +
         '<div class="disk-title">'+d.label.toUpperCase()+'</div>' +
         '<div class="disk-mount">'+d.mount+'</div>' +
         '<div class="disk-summary"><span class="disk-used">USED '+d.used_gb.toFixed(1)+'/'+d.total_gb.toFixed(1)+' GB ('+pct+'%)</span><span class="disk-free">FREE '+d.free_gb.toFixed(1)+' GB</span></div>' +
         '<div class="bar-track"><div class="bar-fill bar-ssd" style="width:'+pct+'%"></div></div>' +
-        chainHtml + '</div>';
+        chainHtml + '</div>');
     });
+    dw.innerHTML = diskHtml.join('');
     document.getElementById('storageUpdated').textContent = new Date().toLocaleTimeString();
   }
 
@@ -1824,7 +1826,7 @@ function apply(s) {
   if (gg && groups.length > 0) {
     if (sec) sec.style.display = '';
     if (gc) gc.textContent = groups.length + ' GROUPS';
-    gg.innerHTML = '';
+    var groupHtml = [];
     groups.forEach(function(g) {
       var profitStr = '';
       var kwhRate = s.kwh_rate_usd || 0;
@@ -1835,7 +1837,7 @@ function apply(s) {
           '<div class="group-stat-v '+pClass+'">'+(p>=0?'+':'')+
           '$'+Math.abs(p).toFixed(2)+'</div></div>';
       }
-      gg.innerHTML += '<div class="group-card">'+
+      groupHtml.push('<div class="group-card">'+
         '<div class="group-name">'+g.name+'</div>'+
         '<div class="group-stat"><div class="group-stat-l">MINERS</div>'+
         '<div class="group-stat-v">'+g.online_count+' / '+g.worker_count+' ONLINE</div></div>'+
@@ -1844,8 +1846,9 @@ function apply(s) {
         '<div class="group-stat"><div class="group-stat-l">SHARES</div>'+
         '<div class="group-stat-v">'+g.shares_accepted+'</div></div>'+
         profitStr+
-        '</div>';
+        '</div>');
     });
+    gg.innerHTML = groupHtml.join('');
   } else if (sec) {
     sec.style.display = 'none';
   }
@@ -2029,6 +2032,7 @@ function applyTheme(t) {
   var btn = document.getElementById('themeBtn');
   if (btn) btn.textContent = THEME_LABELS[t] || t.toUpperCase();
   try { localStorage.setItem('pipool_theme', t); } catch(e) {}
+  cachedChartCSS = null; // invalidate so next render picks up new theme colors
 }
 
 function cycleTheme() {
@@ -2066,6 +2070,23 @@ var COIN_COLORS = {
   'DGB':'#0099ff','DGBS':'#6655ff','PEP':'#ff44aa',
   'QUAI':'#ff6644','QUAIS':'#ffaa66'
 };
+// Cached CSS chart colors — refreshed on theme change to avoid getComputedStyle per frame
+var cachedChartCSS = null;
+function refreshChartCSS() {
+  var cssSt = getComputedStyle(document.documentElement);
+  cachedChartCSS = {
+    line: cssSt.getPropertyValue('--chart-line').trim() || '#00ff41',
+    net:  cssSt.getPropertyValue('--chart-net').trim()  || '#ff4400',
+    rej:  cssSt.getPropertyValue('--chart-rej').trim()  || '#ff6600',
+    bdr:  cssSt.getPropertyValue('--bdr').trim()        || '#004400',
+    dim2: cssSt.getPropertyValue('--dim2').trim()       || '#005514',
+    surf: cssSt.getPropertyValue('--surf').trim()       || '#000f00'
+  };
+}
+// Track pending animation frame to avoid stacking renders
+var chartRAF = 0;
+// Track last canvas dimensions to avoid unnecessary GPU texture reallocation
+var lastCanvasW = 0, lastCanvasH = 0;
 var workerTab = 'active'; // 'active' | 'known'
 var bestShareSession = 0;
 var currencyRate = 1.0;
@@ -2319,6 +2340,12 @@ function fmtSeconds(s) {
 }
 
 function renderChart() {
+  // Debounce via requestAnimationFrame — prevents stacking renders within a single frame
+  if (chartRAF) cancelAnimationFrame(chartRAF);
+  chartRAF = requestAnimationFrame(renderChartNow);
+}
+function renderChartNow() {
+  chartRAF = 0;
   var canvas = document.getElementById('diffChart');
   var noData = document.getElementById('noShareData');
   if (!canvas) return;
@@ -2326,13 +2353,13 @@ function renderChart() {
   // Active coins = those toggled on
   var activeCoins = Object.keys(selectedCoins).filter(function(s){ return selectedCoins[s]; });
 
-  var cssSt = getComputedStyle(document.documentElement);
-  var cLine = cssSt.getPropertyValue('--chart-line').trim() || '#00ff41';
-  var cNet  = cssSt.getPropertyValue('--chart-net').trim()  || '#ff4400';
-  var cRej  = cssSt.getPropertyValue('--chart-rej').trim()  || '#ff6600';
-  var cBdr  = cssSt.getPropertyValue('--bdr').trim()        || '#004400';
-  var cDim2 = cssSt.getPropertyValue('--dim2').trim()       || '#005514';
-  var cSurf = cssSt.getPropertyValue('--surf').trim()       || '#000f00';
+  if (!cachedChartCSS) refreshChartCSS();
+  var cLine = cachedChartCSS.line;
+  var cNet  = cachedChartCSS.net;
+  var cRej  = cachedChartCSS.rej;
+  var cBdr  = cachedChartCSS.bdr;
+  var cDim2 = cachedChartCSS.dim2;
+  var cSurf = cachedChartCSS.surf;
 
   if (chartMode === 'hashrate') {
     // Group hashrate history by coin, filtered to selected coins
@@ -2350,9 +2377,14 @@ function renderChart() {
 
     var rect = canvas.getBoundingClientRect();
     var dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width*dpr; canvas.height = rect.height*dpr;
+    var needW = Math.round(rect.width*dpr), needH = Math.round(rect.height*dpr);
+    if (canvas.width !== needW || canvas.height !== needH) {
+      canvas.width = needW; canvas.height = needH;
+      lastCanvasW = needW; lastCanvasH = needH;
+    }
     var ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, rect.width, rect.height);
     var W = rect.width, H = rect.height;
     var PAD = {t:14, r:12, b:28, l:68};
     var cW = W-PAD.l-PAD.r, cH = H-PAD.t-PAD.b;
@@ -2473,12 +2505,18 @@ function renderChart() {
     // DIFF MODE — scatter plot; supports multiple coins simultaneously
     var multiDiff = activeCoins.length > 1;
 
-    // Collect and group share data
+    // Collect and group share data — single pass instead of per-coin filter
     var coinShares = {};
-    activeCoins.forEach(function(sym) {
-      var arr = shareHistoryGlobal.filter(function(s){ return s.coin === sym; });
-      arr.sort(function(a,b){ return a.t-b.t; });
-      if (arr.length > 0) coinShares[sym] = arr;
+    var activeLookup = {};
+    activeCoins.forEach(function(sym){ activeLookup[sym] = true; });
+    shareHistoryGlobal.forEach(function(s) {
+      if (!activeLookup[s.coin]) return;
+      if (!coinShares[s.coin]) coinShares[s.coin] = [];
+      coinShares[s.coin].push(s);
+    });
+    // Sort each coin's shares by time
+    Object.keys(coinShares).forEach(function(sym) {
+      coinShares[sym].sort(function(a,b){ return a.t-b.t; });
     });
     var visSyms = Object.keys(coinShares);
 
@@ -2489,9 +2527,14 @@ function renderChart() {
 
     var rect2 = canvas.getBoundingClientRect();
     var dpr2 = window.devicePixelRatio||1;
-    canvas.width=rect2.width*dpr2; canvas.height=rect2.height*dpr2;
+    var needW2 = Math.round(rect2.width*dpr2), needH2 = Math.round(rect2.height*dpr2);
+    if (canvas.width !== needW2 || canvas.height !== needH2) {
+      canvas.width = needW2; canvas.height = needH2;
+      lastCanvasW = needW2; lastCanvasH = needH2;
+    }
     var ctx2=canvas.getContext('2d');
-    ctx2.scale(dpr2,dpr2);
+    ctx2.setTransform(dpr2, 0, 0, dpr2, 0, 0);
+    ctx2.clearRect(0, 0, rect2.width, rect2.height);
     var W2=rect2.width, H2=rect2.height;
     var PAD2={t:16,r:12,b:28,l:72};
     var cW2=W2-PAD2.l-PAD2.r, cH2=H2-PAD2.t-PAD2.b;
