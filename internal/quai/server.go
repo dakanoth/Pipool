@@ -203,6 +203,7 @@ type Server struct {
 	hashrateSamples []HashrateSample // ring buffer, last 288 snapshots (24h at 5-min interval)
 	blockLog        []BlockInfo      // ring buffer, last 50 blocks
 
+	ln     net.Listener
 	stopCh chan struct{}
 }
 
@@ -267,6 +268,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("quai stratum listen %s: %w", s.listenAddr, err)
 	}
+	s.ln = ln
 	log.Printf("[quai/%s] stratum listening on %s", s.algo, s.listenAddr)
 
 	go s.acceptLoop(ln)
@@ -274,6 +276,18 @@ func (s *Server) Start() error {
 	go s.vardiffLoop()
 	go s.jobCleanupLoop()
 	return nil
+}
+
+// Stop shuts down the Quai stratum server gracefully.
+func (s *Server) Stop() {
+	select {
+	case <-s.stopCh:
+	default:
+		close(s.stopCh)
+	}
+	if s.ln != nil {
+		s.ln.Close()
+	}
 }
 
 func (s *Server) acceptLoop(ln net.Listener) {

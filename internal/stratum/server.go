@@ -840,6 +840,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 		conn.Close()
 		s.mu.Lock()
 		delete(s.workers, workerID)
+		delete(s.workerKickTimes, w.workerName)
 		// Update seenWorkers on disconnect
 		if w.authorized && w.workerName != "" {
 			if seen, ok := s.seenWorkers[w.workerName]; ok {

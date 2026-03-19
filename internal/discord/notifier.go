@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/dakota/pipool/internal/config"
@@ -41,6 +42,7 @@ const (
 type Notifier struct {
 	cfg      *config.DiscordConfig
 	httpCli  *http.Client
+	mu       sync.Mutex
 	lastSent map[string]time.Time
 }
 
@@ -146,10 +148,13 @@ func (n *Notifier) MinerConnected(coin, workerName, remoteAddr string, totalMine
 		return
 	}
 	key := "connect:" + coin
+	n.mu.Lock()
 	if time.Since(n.lastSent[key]) < 30*time.Second {
+		n.mu.Unlock()
 		return
 	}
 	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
 
 	go n.send(webhookPayload{
 		Username: botName,
@@ -200,10 +205,13 @@ func (n *Notifier) HighTemp(tempC float64, limitC int) {
 		return
 	}
 	key := "temp"
+	n.mu.Lock()
 	if time.Since(n.lastSent[key]) < 10*time.Minute {
+		n.mu.Unlock()
 		return
 	}
 	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
 
 	severity := lvlWarning
 	color := ColorWarning
@@ -337,10 +345,13 @@ func (n *Notifier) NodeUnreachable(coin string, err error) {
 		return
 	}
 	key := "node:" + coin
+	n.mu.Lock()
 	if time.Since(n.lastSent[key]) < 5*time.Minute {
+		n.mu.Unlock()
 		return
 	}
 	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
 
 	go n.send(webhookPayload{
 		Username: botName,
@@ -363,10 +374,13 @@ func (n *Notifier) WorkerStale(coin, workerName string, silentMin int) {
 		return
 	}
 	key := "stale:" + coin + ":" + workerName
+	n.mu.Lock()
 	if time.Since(n.lastSent[key]) < 30*time.Minute {
+		n.mu.Unlock()
 		return
 	}
 	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
 
 	go n.send(webhookPayload{
 		Username: botName,
@@ -394,10 +408,13 @@ func (n *Notifier) HashrateDropped(coin string, currentKHs, previousKHs float64,
 		return
 	}
 	key := "drop:" + coin
+	n.mu.Lock()
 	if time.Since(n.lastSent[key]) < 15*time.Minute {
+		n.mu.Unlock()
 		return
 	}
 	n.lastSent[key] = time.Now()
+	n.mu.Unlock()
 
 	go n.send(webhookPayload{
 		Username: botName,

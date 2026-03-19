@@ -246,6 +246,10 @@ func main() {
 
 	log.Printf("PiPool v%s starting — pool: %s", version, cfg.Pool.Name)
 
+	// cfgMu protects cfg fields that are mutated by dashboard HTTP handlers
+	// while background goroutines read them.
+	var cfgMu sync.RWMutex
+
 	// ─── System Monitor ───────────────────────────────────────────────────────
 	sysmon := mining.NewSystemMonitor()
 
@@ -644,7 +648,9 @@ func main() {
 			case <-ticker.C:
 			}
 			minutesSinceReport++
+			cfgMu.RLock()
 			interval := cfg.Discord.Alerts.HashrateIntervalMin
+			cfgMu.RUnlock()
 			if interval > 0 && minutesSinceReport >= interval {
 				notifier.HashrateReport(buildReportData(servers, sysmon))
 				minutesSinceReport = 0
@@ -662,7 +668,9 @@ func main() {
 				return
 			case <-ticker.C:
 			}
+			cfgMu.RLock()
 			alertMin := cfg.Pool.LastShareAlertMin
+			cfgMu.RUnlock()
 			if alertMin <= 0 {
 				continue
 			}
@@ -701,7 +709,9 @@ func main() {
 				return buildDashboardSnapshot(cfg, servers, quaiServers, sysmon, dashClients, &asicMu, asicHealth)
 			},
 			func() dashboard.NotifSettings {
+				cfgMu.RLock()
 				a := cfg.Discord.Alerts
+				cfgMu.RUnlock()
 				return dashboard.NotifSettings{
 					BlockFound:          a.BlockFound,
 					MinerConnected:      a.MinerConnected,
@@ -714,6 +724,7 @@ func main() {
 				}
 			},
 			func(ns dashboard.NotifSettings) {
+				cfgMu.Lock()
 				cfg.Discord.Alerts.BlockFound          = ns.BlockFound
 				cfg.Discord.Alerts.MinerConnected      = ns.MinerConnected
 				cfg.Discord.Alerts.MinerDisconnect     = ns.MinerDisconnect
@@ -725,22 +736,31 @@ func main() {
 				if err := config.Save(cfg, *cfgPath); err != nil {
 					log.Printf("[dashboard] notif save failed: %v", err)
 				}
+				cfgMu.Unlock()
 			},
 			func() string {
+				cfgMu.RLock()
+				defer cfgMu.RUnlock()
 				return cfg.Pool.CoinbaseTag
 			},
 			func(tag string) {
+				cfgMu.Lock()
 				cfg.Pool.CoinbaseTag = tag
+				cfgMu.Unlock()
 				for _, srv := range servers {
 					srv.SetCoinbaseTag(tag)
 				}
+				cfgMu.RLock()
 				if err := config.Save(cfg, *cfgPath); err != nil {
 					log.Printf("[dashboard] tag save failed: %v", err)
 				}
+				cfgMu.RUnlock()
 				log.Printf("[dashboard] coinbase tag updated to: %s", tag)
 			},
 			// Config editor: GET current editable settings
 			func() dashboard.ConfigEditorData {
+				cfgMu.RLock()
+				defer cfgMu.RUnlock()
 				wallets := make(map[string]string)
 				vmin := make(map[string]float64)
 				vmax := make(map[string]float64)
@@ -814,6 +834,8 @@ func main() {
 			},
 			// Config editor: SET and persist
 			func(cd dashboard.ConfigEditorData) {
+				cfgMu.Lock()
+				defer cfgMu.Unlock()
 				cfg.Pool.TempLimitC      = cd.TempLimitC
 				cfg.Pool.WorkerTimeout   = cd.WorkerTimeoutS
 				cfg.Discord.WebhookURL   = cd.DiscordWebhook
@@ -1000,6 +1022,10 @@ func main() {
 	for _, srv := range servers {
 		srv.Stop()
 	}
+	for _, qs := range quaiServers {
+		qs.Stop()
+	}
+	sysmon.Stop()
 
 	log.Printf("PiPool stopped cleanly. Goodbye!")
 }

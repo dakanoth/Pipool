@@ -15,6 +15,7 @@ type SystemMonitor struct {
 	startTime  time.Time
 	lastTempC  atomic.Value // float64
 	throttling atomic.Bool
+	stopCh     chan struct{}
 
 	// CPU delta tracking — need two snapshots to compute real utilisation
 	cpuMu       sync.Mutex
@@ -27,7 +28,10 @@ type SystemMonitor struct {
 }
 
 func NewSystemMonitor() *SystemMonitor {
-	m := &SystemMonitor{startTime: time.Now()}
+	m := &SystemMonitor{
+		startTime: time.Now(),
+		stopCh:    make(chan struct{}),
+	}
 	m.lastTempC.Store(float64(0))
 	return m
 }
@@ -37,7 +41,12 @@ func (m *SystemMonitor) Start(limitC int) {
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-m.stopCh:
+				return
+			case <-ticker.C:
+			}
 			temp := m.ReadCPUTemp()
 			m.lastTempC.Store(temp)
 
@@ -51,6 +60,15 @@ func (m *SystemMonitor) Start(limitC int) {
 			}
 		}
 	}()
+}
+
+// Stop signals the monitoring goroutine to exit.
+func (m *SystemMonitor) Stop() {
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
 }
 
 // ReadCPUTemp reads the Pi's CPU temperature from thermal zone sysfs

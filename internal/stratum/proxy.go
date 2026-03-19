@@ -62,7 +62,10 @@ func (u *UpstreamProxy) Start() error {
 
 func (u *UpstreamProxy) Stop() {
 	u.mu.Lock()
-	u.stopped = true
+	if !u.stopped {
+		u.stopped = true
+		close(u.stopCh)
+	}
 	if u.conn != nil {
 		u.conn.Close()
 	}
@@ -70,8 +73,11 @@ func (u *UpstreamProxy) Stop() {
 }
 
 func (u *UpstreamProxy) nextID() int {
+	u.mu.Lock()
 	u.idSeq++
-	return u.idSeq
+	id := u.idSeq
+	u.mu.Unlock()
+	return id
 }
 
 func (u *UpstreamProxy) send(msg interface{}) {
