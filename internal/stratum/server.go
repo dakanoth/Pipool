@@ -103,6 +103,7 @@ type Server struct {
 	OnBlockMature func(coin, hash string, height int64, reward string)
 	// OnStaleKick fires when a worker's hourly stale-kick count crosses the threshold.
 	OnStaleKick func(workerName string, kickCount int)
+	OnShareAccepted func(coin, workerAddr string, difficulty float64)
 
 	// workerKickTimes tracks rolling 1-hour stale kick timestamps per worker (under mu).
 	workerKickTimes map[string][]time.Time
@@ -243,7 +244,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		workers:         make(map[string]*Worker),
 		recentJobs:      make(map[string]*Job),
 		recentJobsMax:   maxJobs,
-		jobBroadcast:    make(chan *Job, 16),
+		jobBroadcast:    make(chan *Job, 256),
 		stopCh:          make(chan struct{}),
 		workerKickTimes: make(map[string][]time.Time),
 	}
@@ -870,7 +871,11 @@ func (s *Server) handleWorker(conn net.Conn) {
 			disconnectedName := w.workerName
 			onDisconnect := s.OnMinerDisconnect
 			go func() {
-				time.Sleep(3 * time.Minute)
+				select {
+				case <-time.After(3 * time.Minute):
+				case <-s.stopCh:
+					return
+				}
 				s.mu.RLock()
 				sw, exists := s.seenWorkers[disconnectedName]
 				stillOffline := !exists || !sw.Online
@@ -1295,6 +1300,11 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	s.mu.Unlock()
 	s.updateSeenWorkerShares(w)
 	s.recordShareSample(validationDiff, true, w.workerName)
+
+	// PPLNS share callback
+	if s.OnShareAccepted != nil {
+		s.OnShareAccepted(s.coin.Symbol, w.workerName, w.difficulty)
+	}
 
 	// Track work for luck computation
 	s.mu.Lock()
@@ -2092,11 +2102,15 @@ func (s *Server) AllWorkers() []WorkerInfo {
 			wi.Online           = true
 			wi.SessionStartedAt = w.connectedAt
 			wi.LastShareAt      = w.lastShareAt
-			wi.DiffHistory      = w.diffHistory
+			dh := make([]DiffEvent, len(w.diffHistory))
+			copy(dh, w.diffHistory)
+			wi.DiffHistory = dh
 		} else {
 			// Offline — use last seen time as fallback
 			wi.LastShareAt   = seen.LastSeenAt
-			wi.DiffHistory   = seen.DiffHistory
+			dh := make([]DiffEvent, len(seen.DiffHistory))
+			copy(dh, seen.DiffHistory)
+			wi.DiffHistory = dh
 		}
 		// Get wattage: live API data first, then manual override, then device class lookup
 		watts := seen.LiveWatts  // set by background poller if miner has HTTP API

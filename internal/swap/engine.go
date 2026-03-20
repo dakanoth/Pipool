@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
+
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,7 +24,8 @@ type Config struct {
 	CheckIntervalMin int            `json:"check_interval_min"` // how often to check balances (default 15)
 	StateFile     string            `json:"state_file"`     // path to persist swap state
 	Rules         map[string]Rule   `json:"rules"`          // coin symbol → swap rule
-	DepositAddrs  map[string]string `json:"deposit_addrs"`  // coin → TradeOgre deposit address
+	DepositAddrs  map[string]string `json:"deposit_addrs"`  // coin → exchange deposit address
+	WithdrawAddrs map[string]string `json:"withdraw_addrs"` // coin → pool wallet for withdrawal
 }
 
 // Rule defines auto-swap behavior for a single source coin.
@@ -100,10 +101,10 @@ type Alerter interface {
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
-// Engine monitors wallet balances and executes auto-swaps via TradeOgre.
+// Engine monitors wallet balances and executes auto-swaps via exchange.
 type Engine struct {
 	cfg     Config
-	exchange *TOClient
+	exchange Exchange
 	wallets map[string]WalletRPC // coin symbol → wallet RPC
 	alerter Alerter
 
@@ -123,7 +124,12 @@ func New(cfg Config, wallets map[string]WalletRPC, alerter Alerter) *Engine {
 	}
 
 	if cfg.APIKey != "" && cfg.APISecret != "" {
-		e.exchange = NewTOClient(cfg.APIKey, cfg.APISecret)
+		switch strings.ToLower(cfg.Exchange) {
+		case "xeggex":
+			e.exchange = NewXegClient(cfg.APIKey, cfg.APISecret)
+		default: // "tradeogre" or empty
+			e.exchange = NewTOExchange(cfg.APIKey, cfg.APISecret)
+		}
 	}
 
 	// Load persisted state
@@ -290,14 +296,13 @@ func (e *Engine) advanceJob(job *SwapJob) {
 }
 
 func (e *Engine) advanceWaitDeposit(job *SwapJob) {
-	// Check if the deposit has been credited on TradeOgre
-	bal, err := e.exchange.GetBalance(job.SourceCoin)
+	// Check if the deposit has been credited on the exchange
+	available, err := e.exchange.GetBalance(job.SourceCoin)
 	if err != nil {
 		log.Printf("[swap] %s: exchange balance check error: %v", job.ID, err)
 		return
 	}
 
-	available, _ := strconv.ParseFloat(bal.Available, 64)
 	if available < job.Amount*0.95 { // allow 5% for tx fees
 		// Not credited yet — check age, fail if too old
 		if time.Since(job.CreatedAt) > 6*time.Hour {
@@ -324,8 +329,8 @@ func (e *Engine) placeSellOrder(job *SwapJob, available float64) {
 		return
 	}
 
-	market := "BTC-" + strings.ToUpper(job.SourceCoin)
-	ticker, err := e.exchange.GetTicker(market)
+	market := e.exchange.MarketName(job.SourceCoin, "BTC")
+	bid, _, err := e.exchange.GetTicker(market)
 	if err != nil {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("ticker error for %s: %v", market, err)
@@ -334,9 +339,7 @@ func (e *Engine) placeSellOrder(job *SwapJob, available float64) {
 		return
 	}
 
-	// Use the current bid price (what buyers are willing to pay)
-	bidPrice := ticker.Bid
-	if bidPrice == "" || bidPrice == "0" || bidPrice == "0.00000000" {
+	if bid <= 0 {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("no bids on %s", market)
 		job.UpdatedAt = time.Now()
@@ -344,12 +347,11 @@ func (e *Engine) placeSellOrder(job *SwapJob, available float64) {
 	}
 
 	// Apply slight discount to bid to fill faster (0.5% below bid)
-	bid, _ := strconv.ParseFloat(bidPrice, 64)
 	sellPrice := bid * 0.995
 	sellPriceStr := strconv.FormatFloat(sellPrice, 'f', 8, 64)
 	qtyStr := strconv.FormatFloat(available, 'f', 8, 64)
 
-	result, err := e.exchange.SubmitSell(market, sellPriceStr, qtyStr)
+	orderID, err := e.exchange.SubmitSell(market, sellPriceStr, qtyStr)
 	if err != nil {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("sell order failed: %v", err)
@@ -358,59 +360,53 @@ func (e *Engine) placeSellOrder(job *SwapJob, available float64) {
 		return
 	}
 
-	job.SellOrderUUID = result.UUID
+	job.SellOrderUUID = orderID
 	job.SellPrice = sellPriceStr
 	job.State = StateSelling
 	job.UpdatedAt = time.Now()
 
 	log.Printf("[swap] %s: sell order placed on %s — qty=%.8f price=%s uuid=%s",
-		job.ID, market, available, sellPriceStr, result.UUID)
+		job.ID, market, available, sellPriceStr, orderID)
 }
 
 func (e *Engine) advanceSelling(job *SwapJob) {
 	// Check if sell order has been filled
-	info, err := e.exchange.GetOrder(job.SellOrderUUID)
+	filled, err := e.exchange.GetOrder(job.SellOrderUUID)
 	if err != nil {
-		// "not found" means the order was filled and removed from the book
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Order not found") {
-			log.Printf("[swap] %s: sell order filled", job.ID)
-			// Check BTC balance to see proceeds
-			btcBal, err := e.exchange.GetBalance("BTC")
-			if err != nil {
-				log.Printf("[swap] %s: BTC balance check error: %v", job.ID, err)
-				return
-			}
-			btcAvailable, _ := strconv.ParseFloat(btcBal.Available, 64)
-			job.BTCProceeds = btcAvailable
-			job.UpdatedAt = time.Now()
-
-			if strings.ToUpper(job.DestCoin) == "BTC" {
-				// Destination is BTC — we're done (just need to withdraw)
-				job.State = StateWithdrawing
-				e.initiateWithdraw(job)
-			} else {
-				// Need to buy the destination coin
-				job.State = StateBuying
-				e.placeBuyOrder(job)
-			}
-			return
-		}
-		log.Printf("[swap] %s: order check error: %v", job.ID, err)
+		log.Printf("[swap] %s: sell order check error: %v", job.ID, err)
 		return
 	}
 
-	if !info.Success {
-		// Order still pending — check if it's been too long
-		if time.Since(job.UpdatedAt) > 2*time.Hour {
-			// Cancel stale order
-			log.Printf("[swap] %s: sell order stale for 2h, cancelling", job.ID)
-			_ = e.exchange.CancelOrder(job.SellOrderUUID)
-			job.State = StateFailed
-			job.Error = "sell order not filled after 2 hours — cancelled"
-			job.UpdatedAt = time.Now()
-			e.alert("warn", fmt.Sprintf("Auto-Swap %s Cancelled", job.SourceCoin),
-				"Sell order was not filled after 2 hours. Funds remain on TradeOgre.")
+	if filled {
+		log.Printf("[swap] %s: sell order filled", job.ID)
+		// Check BTC balance to see proceeds
+		btcAvailable, err := e.exchange.GetBalance("BTC")
+		if err != nil {
+			log.Printf("[swap] %s: BTC balance check error: %v", job.ID, err)
+			return
 		}
+		job.BTCProceeds = btcAvailable
+		job.UpdatedAt = time.Now()
+
+		if strings.ToUpper(job.DestCoin) == "BTC" {
+			job.State = StateWithdrawing
+			e.initiateWithdraw(job)
+		} else {
+			job.State = StateBuying
+			e.placeBuyOrder(job)
+		}
+		return
+	}
+
+	// Order still pending — check if it's been too long
+	if time.Since(job.UpdatedAt) > 2*time.Hour {
+		log.Printf("[swap] %s: sell order stale for 2h, cancelling", job.ID)
+		_ = e.exchange.CancelOrder(job.SellOrderUUID)
+		job.State = StateFailed
+		job.Error = "sell order not filled after 2 hours — cancelled"
+		job.UpdatedAt = time.Now()
+		e.alert("warn", fmt.Sprintf("Auto-Swap %s Cancelled", job.SourceCoin),
+			fmt.Sprintf("Sell order was not filled after 2 hours. Funds remain on %s.", e.exchange.Name()))
 	}
 }
 
@@ -422,8 +418,8 @@ func (e *Engine) placeBuyOrder(job *SwapJob) {
 		return
 	}
 
-	market := "BTC-" + strings.ToUpper(job.DestCoin)
-	ticker, err := e.exchange.GetTicker(market)
+	market := e.exchange.MarketName(job.DestCoin, "BTC")
+	_, ask, err := e.exchange.GetTicker(market)
 	if err != nil {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("ticker error for %s: %v", market, err)
@@ -432,26 +428,22 @@ func (e *Engine) placeBuyOrder(job *SwapJob) {
 		return
 	}
 
-	// Use ask price + small premium to fill quickly
-	askPrice := ticker.Ask
-	if askPrice == "" || askPrice == "0" {
+	if ask <= 0 {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("no asks on %s", market)
 		job.UpdatedAt = time.Now()
 		return
 	}
 
-	ask, _ := strconv.ParseFloat(askPrice, 64)
 	buyPrice := ask * 1.005 // 0.5% above ask to fill instantly
 	buyPriceStr := strconv.FormatFloat(buyPrice, 'f', 8, 64)
 
 	// Calculate quantity: BTC proceeds / buy price = quantity of dest coin
 	qty := job.BTCProceeds / buyPrice
-	// TradeOgre takes 0.2% fee
-	qty = qty * 0.998
+	qty = qty * 0.998 // account for exchange fee
 	qtyStr := strconv.FormatFloat(qty, 'f', 8, 64)
 
-	result, err := e.exchange.SubmitBuy(market, buyPriceStr, qtyStr)
+	orderID, err := e.exchange.SubmitBuy(market, buyPriceStr, qtyStr)
 	if err != nil {
 		job.State = StateFailed
 		job.Error = fmt.Sprintf("buy order failed: %v", err)
@@ -460,60 +452,51 @@ func (e *Engine) placeBuyOrder(job *SwapJob) {
 		return
 	}
 
-	job.BuyOrderUUID = result.UUID
+	job.BuyOrderUUID = orderID
 	job.BuyPrice = buyPriceStr
 	job.State = StateBuying
 	job.UpdatedAt = time.Now()
 
 	log.Printf("[swap] %s: buy order placed on %s — qty=%s price=%s uuid=%s",
-		job.ID, market, qtyStr, buyPriceStr, result.UUID)
+		job.ID, market, qtyStr, buyPriceStr, orderID)
 }
 
 func (e *Engine) advanceBuying(job *SwapJob) {
 	if job.BuyOrderUUID == "" {
-		// Buy order hasn't been placed yet (e.g. just transitioned)
 		e.placeBuyOrder(job)
 		return
 	}
 
-	info, err := e.exchange.GetOrder(job.BuyOrderUUID)
+	filled, err := e.exchange.GetOrder(job.BuyOrderUUID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Order not found") {
-			log.Printf("[swap] %s: buy order filled", job.ID)
-			// Check destination coin balance
-			destBal, err := e.exchange.GetBalance(job.DestCoin)
-			if err == nil {
-				job.DestReceived, _ = strconv.ParseFloat(destBal.Available, 64)
-			}
-			job.State = StateWithdrawing
-			job.UpdatedAt = time.Now()
-			e.initiateWithdraw(job)
-			return
-		}
 		log.Printf("[swap] %s: buy order check error: %v", job.ID, err)
 		return
 	}
 
-	if !info.Success {
-		if time.Since(job.UpdatedAt) > 2*time.Hour {
-			log.Printf("[swap] %s: buy order stale for 2h, cancelling", job.ID)
-			_ = e.exchange.CancelOrder(job.BuyOrderUUID)
-			job.State = StateFailed
-			job.Error = "buy order not filled after 2 hours — cancelled"
-			job.UpdatedAt = time.Now()
-			e.alert("warn", fmt.Sprintf("Auto-Swap %s→%s Cancelled", job.SourceCoin, job.DestCoin),
-				"Buy order was not filled. BTC remains on TradeOgre.")
+	if filled {
+		log.Printf("[swap] %s: buy order filled", job.ID)
+		destAvail, err := e.exchange.GetBalance(job.DestCoin)
+		if err == nil {
+			job.DestReceived = destAvail
 		}
+		job.State = StateWithdrawing
+		job.UpdatedAt = time.Now()
+		e.initiateWithdraw(job)
+		return
+	}
+
+	if time.Since(job.UpdatedAt) > 2*time.Hour {
+		log.Printf("[swap] %s: buy order stale for 2h, cancelling", job.ID)
+		_ = e.exchange.CancelOrder(job.BuyOrderUUID)
+		job.State = StateFailed
+		job.Error = "buy order not filled after 2 hours — cancelled"
+		job.UpdatedAt = time.Now()
+		e.alert("warn", fmt.Sprintf("Auto-Swap %s→%s Cancelled", job.SourceCoin, job.DestCoin),
+			fmt.Sprintf("Buy order was not filled. BTC remains on %s.", e.exchange.Name()))
 	}
 }
 
 func (e *Engine) initiateWithdraw(job *SwapJob) {
-	// TradeOgre doesn't have a public withdrawal API endpoint.
-	// Withdrawals must be done manually from the web interface.
-	// Mark as complete and alert the user.
-	job.State = StateComplete
-	job.UpdatedAt = time.Now()
-
 	var destAmount float64
 	if strings.ToUpper(job.DestCoin) == "BTC" {
 		destAmount = job.BTCProceeds
@@ -521,9 +504,33 @@ func (e *Engine) initiateWithdraw(job *SwapJob) {
 		destAmount = job.DestReceived
 	}
 
-	msg := fmt.Sprintf("Swapped %.8f %s → %.8f %s via TradeOgre\n"+
-		"⚠️ **Withdraw manually** from TradeOgre to your %s wallet",
-		job.Amount, job.SourceCoin, destAmount, job.DestCoin, job.DestCoin)
+	// Get the destination wallet address from config
+	destAddr := e.cfg.WithdrawAddrs[job.DestCoin]
+
+	// Try automatic withdrawal via exchange API
+	if destAddr != "" {
+		txid, err := e.exchange.Withdraw(job.DestCoin, destAmount, destAddr)
+		if err == nil {
+			job.State = StateComplete
+			job.UpdatedAt = time.Now()
+			log.Printf("[swap] %s: withdrawal initiated — %.8f %s → %s (txid=%s)",
+				job.ID, destAmount, job.DestCoin, destAddr, txid)
+			e.alert("info", fmt.Sprintf("Auto-Swap %s→%s Complete", job.SourceCoin, job.DestCoin),
+				fmt.Sprintf("Swapped %.8f %s → %.8f %s via %s\nWithdrawal sent to `%s`\nTXID: `%s`",
+					job.Amount, job.SourceCoin, destAmount, job.DestCoin, e.exchange.Name(), destAddr, txid))
+			return
+		}
+		// If withdrawal API failed (e.g. TradeOgre doesn't support it), fall through
+		log.Printf("[swap] %s: auto-withdrawal not available: %v — manual withdrawal needed", job.ID, err)
+	}
+
+	// Fall back to manual withdrawal notification
+	job.State = StateComplete
+	job.UpdatedAt = time.Now()
+
+	msg := fmt.Sprintf("Swapped %.8f %s → %.8f %s via %s\n"+
+		"⚠️ **Withdraw manually** from %s to your %s wallet",
+		job.Amount, job.SourceCoin, destAmount, job.DestCoin, e.exchange.Name(), e.exchange.Name(), job.DestCoin)
 
 	log.Printf("[swap] %s: swap complete — %.8f %s → %.8f %s (manual withdrawal needed)",
 		job.ID, job.Amount, job.SourceCoin, destAmount, job.DestCoin)
@@ -532,30 +539,29 @@ func (e *Engine) initiateWithdraw(job *SwapJob) {
 }
 
 func (e *Engine) advanceWithdrawing(job *SwapJob) {
-	// Since TradeOgre doesn't have withdrawal API, mark as complete
+	// Withdrawal was already initiated in initiateWithdraw.
+	// If we're still in this state, mark complete.
 	e.initiateWithdraw(job)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// marketName returns the TradeOgre market string for trading source→dest.
-// All markets on TradeOgre are BTC-based.
+// marketName returns the exchange-specific market string for trading source→dest.
+// All markets are BTC-based (source→BTC or BTC→dest).
 func (e *Engine) marketName(source, dest string) string {
 	src := strings.ToUpper(source)
 	dst := strings.ToUpper(dest)
 
-	// Direct path: source → BTC → dest
 	if src == "BTC" || dst == "BTC" {
 		other := src
 		if src == "BTC" {
 			other = dst
 		}
-		return "BTC-" + other
+		return e.exchange.MarketName(other, "BTC")
 	}
 
 	// Need two hops: source → BTC, then BTC → dest
-	// Both markets must exist
-	return "BTC-" + src // first hop
+	return e.exchange.MarketName(src, "BTC") // first hop
 }
 
 func (e *Engine) hasActiveJob(coin string) bool {
@@ -712,5 +718,3 @@ func (e *Engine) GetConfig() Config {
 	return e.cfg
 }
 
-// ensure math import is used
-var _ = math.Abs

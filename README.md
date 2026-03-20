@@ -30,7 +30,7 @@ By downloading, installing, or running this software you agree to the following:
 | Category | Feature |
 |---|---|
 | **Language** | Go — single binary, minimal RAM, native concurrency |
-| **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt-N), DGB, DGBS, Quai Network ⚠️ *(EXPERIMENTAL — see warning below)* |
+| **Coins** | LTC, DOGE (merge), BTC, BCH (merge), PEP (Scrypt), DGB, DGBS, Quai Network ⚠️ *(EXPERIMENTAL — see warning below)* |
 | **Merge Mining** | AuxPoW for LTC+DOGE and BTC+BCH — one sync, two rewards |
 | **Stratum** | Full Stratum V1 — vardiff, per-worker extranonce, clean job broadcast |
 | **ASIC Support** | 65+ device classes auto-detected from user-agent (Antminer, Whatsminer, Goldshell, BitAxe, Elphapex, Plexsource, …) |
@@ -53,6 +53,15 @@ By downloading, installing, or running this software you agree to the following:
 | **Diff Countdown** | BTC/LTC epoch progress bar and projected next difficulty change % |
 | **Prometheus** | `/metrics` endpoint exposing hashrate, miners, temp, wallet balance, worker hashrate, and more |
 | **pipoolctl** | Unix-socket CLI for live status, worker management, and config changes |
+| **Payout Tracking** | Lifetime earnings per coin with USD value, block history, confirmation tracking |
+| **Responsive Dashboard** | Mobile-friendly CSS — usable on phones and tablets |
+| **Luck & Probability** | Real-time solo mining odds, session effort %, expected time to block |
+| **Multi-Exchange Swap** | Auto-swap mined coins via TradeOgre or XeggeX — state machine handles deposit → sell → buy → withdraw |
+| **Auto-Withdrawal** | Automatic withdrawal from exchange to pool wallet (XeggeX); manual notification fallback (TradeOgre) |
+| **Hashrate History** | 24h/7d/30d hashrate graphs persisted to disk with automatic downsampling (1min/5min/15min resolution) |
+| **Block Explorer** | Direct links to block explorers in the block log |
+| **Worker Uptime** | Online/offline history, uptime % (24h/7d/30d), disconnect pattern detection |
+| **PPLNS Mode** | Optional proportional payouts (Pay Per Last N Shares) with configurable window, pool fee, and per-coin minimums |
 | **Security** | IP allowlist, high-reject-rate auto-kick, optional dashboard password |
 
 ---
@@ -65,7 +74,7 @@ By downloading, installing, or running this software you agree to the following:
 | DOGE | 3334 | Scrypt / AuxPoW | Merged via LTC — no separate miner needed |
 | BTC | 3335 | SHA-256d | Primary — miners connect here for BTC+BCH |
 | BCH | 3336 | SHA-256d / AuxPoW | Merged via BTC — no separate miner needed |
-| PEP | 3337 | Scrypt-N (N=2048) | Optional — enable in config |
+| PEP | 3337 | Scrypt | Optional — enable in config |
 | DGB | 3339 | SHA-256d | Optional DigiByte SHA-256d |
 | DGBS | 3342 | Scrypt | Optional DigiByte Scrypt — uses 5s share target (fast blocks) |
 | QUAI (SHA-256d) | 3340 | SHA-256d | ⚠️ **EXPERIMENTAL** — Quai Network (see warning below) |
@@ -210,6 +219,22 @@ pipoolctl fixdiff wallet.miner1 256
     "port": 8080,
     "push_interval_s": 15
   },
+  "swap": {
+    "enabled": false,
+    "exchange": "tradeogre",
+    "api_key": "",
+    "api_secret": "",
+    "check_interval_min": 15,
+    "rules": {},
+    "deposit_addrs": {}
+  },
+  "pplns": {
+    "enabled": false,
+    "window_size": 100000,
+    "pool_fee_pct": 1.0,
+    "min_payout": {},
+    "payout_interval_min": 60
+  },
   "logging": {
     "level": "info",
     "to_file": true,
@@ -258,7 +283,81 @@ Open `http://<pi-ip>:8080` in any browser on your network.
 | **Chain diagnostics** | Stale %, reject %, job age, issue detection per chain — includes QUAI/QUAIS |
 | **Connection info** | Stratum address, port, and algorithm per coin |
 | **Notifications** | Toggle Discord alerts live |
+| **Earnings** | Lifetime per-coin earnings with USD value, recent blocks with confirmation status |
+| **Hashrate history** | 24H / 7D / 30D range buttons — historical hashrate loaded from disk with automatic downsampling |
+| **Luck tracker** | Per-coin session effort %, expected time to next block, historical luck per found block |
+| **Worker uptime** | Online/offline timeline, uptime % for 24h/7d/30d, disconnect pattern alerts |
+| **Auto-swap status** | Per-coin swap toggle, destination selector, active job state indicator (when swap enabled) |
 | **Pool settings** | Edit wallets, vardiff, webhook, auto-kick, fixed diffs, electricity rate, Quai node host/port — saved to disk |
+
+---
+
+## Auto-Swap
+
+PiPool can automatically convert mined coins into a destination coin via exchange APIs. Supported exchanges: **TradeOgre** and **XeggeX**.
+
+```json
+"swap": {
+  "enabled": true,
+  "exchange": "xeggex",
+  "api_key": "YOUR_KEY",
+  "api_secret": "YOUR_SECRET",
+  "check_interval_min": 15,
+  "state_file": "/opt/pipool/swap_state.json",
+  "deposit_addrs": { "DGB": "your-exchange-deposit-address" },
+  "rules": {
+    "DGB": {
+      "enabled": true,
+      "destination": "LTC",
+      "min_balance": 100,
+      "keep_balance": 10
+    }
+  }
+}
+```
+
+**How it works (solo mining):**
+
+1. Block rewards land in your local coin daemon wallet
+2. Swap engine checks wallet balances every N minutes
+3. When balance exceeds `min_balance + keep_balance`, it sends coins to the exchange
+4. Sells source coin for BTC, buys destination coin with BTC
+5. Withdraws destination coin back to your pool wallet (automatic on XeggeX, manual notification on TradeOgre)
+
+State is persisted to disk — survives restarts. The dashboard shows swap status per coin when enabled.
+
+---
+
+## PPLNS Mode (Optional)
+
+For pool operators who want to share rewards with friends. Disabled by default (solo mode).
+
+```json
+"pplns": {
+  "enabled": false,
+  "window_size": 100000,
+  "pool_fee_pct": 1.0,
+  "min_payout": { "LTC": 0.01, "BTC": 0.0001 },
+  "payout_interval_min": 60
+}
+```
+
+When enabled, the PPLNS engine tracks shares per worker in a sliding window ring buffer. On block found, rewards are distributed proportionally based on each worker's share of recent work, minus the pool fee. Payouts are sent automatically via the coin daemon's RPC.
+
+---
+
+## Hashrate History
+
+PiPool persists hashrate samples to disk at `/opt/pipool/hashrate_history.json` with automatic downsampling:
+
+| Age | Resolution |
+|---|---|
+| < 1 hour | Raw samples |
+| 1–24 hours | 1-minute averages |
+| 1–7 days | 5-minute averages |
+| 7–30 days | 15-minute averages |
+
+The dashboard provides 24H / 7D / 30D range buttons to browse historical hashrate. Data survives restarts.
 
 ---
 
@@ -377,6 +476,14 @@ internal/
   dashboard/server.go           — HTTP dashboard + SSE push + config editor + worker detail modal
   metrics/prometheus.go         — Prometheus text-format metrics registry
   ctl/server.go                 — pipoolctl Unix socket server
+  swap/engine.go                — Auto-swap state machine (idle → sell → buy → withdraw)
+  swap/exchange.go              — Exchange interface + TradeOgre adapter
+  swap/xeggex.go                — XeggeX exchange API client
+  swap/tradeogre.go             — TradeOgre exchange API client
+  earnings/tracker.go           — Payout tracking, lifetime per-coin earnings, block history
+  hashstore/store.go            — Hashrate time-series persistence with auto-downsampling
+  uptime/tracker.go             — Worker online/offline history, uptime %, pattern detection
+  pplns/payout.go               — PPLNS proportional payout engine with ring buffer
   quai/rpc.go                   — Quai Network HTTP JSON-RPC node client
   quai/server.go                — Quai Stratum V1 server
 configs/pipool.json             — Your config (generated by -init or install.sh)

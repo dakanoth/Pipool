@@ -21,11 +21,15 @@ import (
 
 	"github.com/dakota/pipool/internal/asic"
 	"github.com/dakota/pipool/internal/config"
+	"github.com/dakota/pipool/internal/earnings"
+	"github.com/dakota/pipool/internal/hashstore"
+	"github.com/dakota/pipool/internal/uptime"
 	"github.com/dakota/pipool/internal/ctl"
 	"github.com/dakota/pipool/internal/dashboard"
 	"github.com/dakota/pipool/internal/discord"
 	"github.com/dakota/pipool/internal/guardian"
 	"github.com/dakota/pipool/internal/merge"
+	"github.com/dakota/pipool/internal/pplns"
 	"github.com/dakota/pipool/internal/swap"
 	"github.com/dakota/pipool/internal/metrics"
 	"github.com/dakota/pipool/internal/mining"
@@ -270,6 +274,32 @@ func main() {
 	coord.Start()
 	defer coord.Stop()
 
+	// ─── Earnings tracker ────────────────────────────────────────────────────
+	earningsTracker := earnings.New(
+		filepath.Join(os.Getenv("HOME"), ".pipool", "*", "blocklog.json"),
+		"/opt/pipool/earnings.json",
+		coinPrice,
+	)
+	{
+		snap := earningsTracker.Snapshot()
+		log.Printf("[earnings] loaded — %d lifetime blocks tracked", snap.AllTime.TotalBlocksFound)
+	}
+
+	// ─── Worker uptime tracker ──────────────────────────────────────────────
+	uptimeTracker := uptime.New("/opt/pipool/uptime.json")
+	log.Printf("[uptime] loaded worker uptime history")
+
+	// ─── PPLNS payout engine ─────────────────────────────────────────────────
+	pplnsEngine := pplns.New(pplns.Config{
+		Enabled:        cfg.PPLNS.Enabled,
+		WindowSize:     cfg.PPLNS.WindowSize,
+		PoolFeeRate:    cfg.PPLNS.PoolFeePct,
+		MinPayout:      cfg.PPLNS.MinPayout,
+		PayoutInterval: cfg.PPLNS.PayoutInterval,
+	})
+	pplnsEngine.Start()
+	log.Printf("[pplns] %s", pplnsEngine)
+
 	// ─── Stratum Servers ──────────────────────────────────────────────────────
 	var servers []*stratum.Server
 
@@ -302,10 +332,12 @@ func main() {
 		srv.OnMinerConnect = func(worker, addr string) {
 			total := srv.Stats().ConnectedMiners
 			notifier.MinerConnected(coin.Symbol, worker, addr, total)
+			uptimeTracker.WorkerOnline(worker, coin.Symbol)
 		}
 		srv.OnMinerDisconnect = func(worker string) {
 			total := srv.Stats().ConnectedMiners
 			notifier.MinerDisconnected(coin.Symbol, worker, total)
+			uptimeTracker.WorkerOffline(worker, coin.Symbol)
 		}
 		srv.OnNodeUnreachable = func(err error) {
 			notifier.NodeUnreachable(coin.Symbol, err)
@@ -318,6 +350,11 @@ func main() {
 		}
 		srv.OnBlockFound = func(sym, hash, worker string, reward, luck float64) {
 			notifier.BlockFound(sym, hash, 0, reward, luck, worker)
+			earningsTracker.RecordBlock(sym, 0, hash, reward, luck)
+			pplnsEngine.BlockFound(sym, reward)
+		}
+		srv.OnShareAccepted = func(coinSym, workerAddr string, difficulty float64) {
+			pplnsEngine.RecordShare(coinSym, workerAddr, difficulty)
 		}
 		srv.OnBlockMature = func(coin, hash string, height int64, reward string) {
 			notifier.BlockMatured(coin, hash, height, reward)
@@ -634,6 +671,30 @@ func main() {
 	}
 	notifier.PoolStarted(activeSymbols)
 
+	// ─── PPLNS periodic payout processing ────────────────────────────────────
+	if cfg.PPLNS.Enabled {
+		go func() {
+			interval := cfg.PPLNS.PayoutInterval
+			if interval <= 0 {
+				interval = 60
+			}
+			ticker := time.NewTicker(time.Duration(interval) * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-shutdownCtx.Done():
+					return
+				case <-ticker.C:
+				}
+				pplnsRPCs := make(map[string]pplns.CoinRPC)
+				for sym, cli := range dashClients {
+					pplnsRPCs[sym] = cli
+				}
+				pplnsEngine.ProcessPayouts(pplnsRPCs)
+			}
+		}()
+	}
+
 	// ─── Live coin price fetcher ──────────────────────────────────────────────
 	go fetchPricesLoop(shutdownCtx)
 
@@ -752,6 +813,10 @@ func main() {
 		}
 	}()
 
+	// ─── Historical hashrate store ──────────────────────────────────────────
+	hrStore := hashstore.New("/opt/pipool/hashrate.json")
+	log.Printf("[hashstore] loaded historical hashrate data")
+
 	// ─── Web dashboard (always on) ───────────────────────────────────────────
 	var dash *dashboard.Server
 	{
@@ -767,7 +832,7 @@ func main() {
 		// instead of allocating a new http.Client every 5 seconds
 		dash = dashboard.New(dashPort, pushInterval,
 			func() dashboard.StatsSnapshot {
-				return buildDashboardSnapshot(cfg, servers, quaiServers, sysmon, dashClients, &asicMu, asicHealth)
+				return buildDashboardSnapshot(cfg, servers, quaiServers, sysmon, dashClients, &asicMu, asicHealth, earningsTracker, uptimeTracker, hrStore)
 			},
 			func() dashboard.NotifSettings {
 				cfgMu.RLock()
@@ -1062,6 +1127,29 @@ func main() {
 			return nil
 		}
 
+		// Wire hashrate history API
+		dash.GetHashHistory = func(coin string, windowHours int) []dashboard.HashrateSample {
+			if hrStore == nil {
+				return nil
+			}
+			if coin != "" {
+				raw := hrStore.Query(coin, windowHours)
+				out := make([]dashboard.HashrateSample, len(raw))
+				for i, s := range raw {
+					out[i] = dashboard.HashrateSample{Coin: coin, KHs: s.KHs, TimeMS: s.TimeMS}
+				}
+				return out
+			}
+			all := hrStore.QueryAll(windowHours)
+			var out []dashboard.HashrateSample
+			for c, samples := range all {
+				for _, s := range samples {
+					out = append(out, dashboard.HashrateSample{Coin: c, KHs: s.KHs, TimeMS: s.TimeMS})
+				}
+			}
+			return out
+		}
+
 		go func() {
 			if err := dash.Start(); err != nil {
 				log.Printf("[dashboard] error: %v", err)
@@ -1159,6 +1247,14 @@ func main() {
 			scfg.DepositAddrs = cfg.Swap.DepositAddrs
 		}
 
+		// Populate withdraw addresses from each coin's wallet config
+		scfg.WithdrawAddrs = make(map[string]string)
+		for sym, coinCfg := range cfg.Coins {
+			if coinCfg.Wallet != "" {
+				scfg.WithdrawAddrs[sym] = coinCfg.Wallet
+			}
+		}
+
 		// Build wallet RPC adapters for each enabled coin
 		swapWallets := make(map[string]swap.WalletRPC)
 		for sym, coinCfg := range cfg.Coins {
@@ -1215,6 +1311,19 @@ func main() {
 	// Cancel background goroutines first so they don't pile up RPC calls during shutdown
 	shutdownCancel()
 
+	if hrStore != nil {
+		hrStore.Save()
+		hrStore.Close()
+	}
+	if pplnsEngine != nil {
+		// Process final payouts before stopping
+		pplnsRPCs := make(map[string]pplns.CoinRPC)
+		for sym, cli := range dashClients {
+			pplnsRPCs[sym] = cli
+		}
+		pplnsEngine.ProcessPayouts(pplnsRPCs)
+		pplnsEngine.Stop()
+	}
 	if swapEngine != nil {
 		swapEngine.Stop()
 	}
@@ -1254,7 +1363,7 @@ func explorerURL(cfg *config.PoolConfig, symbol string) string {
 	return defaultExplorers[symbol]
 }
 
-func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, quaiServers []*quai.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health) dashboard.StatsSnapshot {
+func buildDashboardSnapshot(cfg *config.PoolConfig, servers []*stratum.Server, quaiServers []*quai.Server, sysmon *mining.SystemMonitor, dashClients map[string]*rpc.Client, asicMu *sync.RWMutex, asicHealth map[string]*asic.Health, earningsT *earnings.EarningsTracker, uptimeT *uptime.Tracker, hrStoreRef *hashstore.Store) dashboard.StatsSnapshot {
 	snap := dashboard.StatsSnapshot{
 		Timestamp:   time.Now(),
 		Uptime:      fmtUptime(sysmon.Uptime()),
@@ -1911,6 +2020,71 @@ collect:
 		HashrateIntervalMin: cfg.Discord.Alerts.HashrateIntervalMin,
 		HashrateDropPct:     cfg.Discord.Alerts.HashrateDropPct,
 		NodeUnreachable:     cfg.Discord.Alerts.NodeUnreachable,
+	}
+
+	// ── Earnings ──
+	if earningsT != nil {
+		es := earningsT.Snapshot()
+		ed := &dashboard.EarningsData{
+			TotalBlocks:    es.AllTime.TotalBlocksFound,
+			TotalUSD:       es.AllTime.TotalUSD,
+			FirstBlockAt:   es.AllTime.FirstBlockAt,
+		}
+		var luckSum float64
+		var luckCount int
+		var bestLuck, worstLuck float64
+		for _, cs := range es.PerCoin {
+			ed.CoinEarnings = append(ed.CoinEarnings, dashboard.CoinEarning{
+				Symbol:          cs.Symbol,
+				BlocksFound:     cs.BlocksFound,
+				BlocksConfirmed: cs.BlocksConfirmed,
+				BlocksOrphaned:  cs.BlocksOrphaned,
+				TotalReward:     cs.TotalReward,
+				TotalUSD:        cs.TotalUSD,
+				AvgLuck:         cs.AvgLuck,
+				BestLuck:        cs.BestLuck,
+				WorstLuck:       cs.WorstLuck,
+				LastBlockAt:     cs.LastBlockAt,
+			})
+			ed.TotalConfirmed += cs.BlocksConfirmed
+			ed.TotalOrphaned += cs.BlocksOrphaned
+			if cs.AvgLuck > 0 {
+				luckSum += cs.AvgLuck * float64(cs.BlocksFound)
+				luckCount += cs.BlocksFound
+			}
+			if cs.BestLuck > bestLuck { bestLuck = cs.BestLuck }
+			if cs.WorstLuck > 0 && (worstLuck == 0 || cs.WorstLuck < worstLuck) { worstLuck = cs.WorstLuck }
+		}
+		if luckCount > 0 { ed.AvgLuck = luckSum / float64(luckCount) }
+		ed.BestLuck = bestLuck
+		ed.WorstLuck = worstLuck
+		snap.Earnings = ed
+	}
+
+	// ── Worker uptimes ──
+	if uptimeT != nil {
+		for _, wu := range uptimeT.Snapshot() {
+			snap.WorkerUptimes = append(snap.WorkerUptimes, dashboard.WorkerUptimeData{
+				Name:      wu.Name,
+				Coin:      wu.Coin,
+				Online:    wu.CurrentStatus,
+				Uptime24h: wu.Uptime24h,
+				Uptime7d:  wu.Uptime7d,
+				Uptime30d: wu.Uptime30d,
+				Sessions:  wu.TotalSessions,
+				AvgSession: wu.AvgSessionDur.Round(time.Minute).String(),
+				Pattern:   wu.DisconnectPattern,
+			})
+		}
+	}
+
+	// ── Store hashrate samples ──
+	if hrStoreRef != nil {
+		for _, cs := range snap.Coins {
+			if cs.HashrateKHs > 0 {
+				hrStoreRef.Add(cs.Symbol, cs.HashrateKHs, time.Now().UnixMilli())
+			}
+		}
 	}
 
 	return snap

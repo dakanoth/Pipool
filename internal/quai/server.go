@@ -28,8 +28,13 @@ const (
 )
 
 // diff1Target is the standard Bitcoin SHA-256d difficulty-1 target.
-var diff1Target, _ = new(big.Int).SetString(
-	"00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
+var diff1Target = func() *big.Int {
+	t, ok := new(big.Int).SetString("00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
+	if !ok {
+		panic("invalid diff1Target constant")
+	}
+	return t
+}()
 
 // ─── Observable types ─────────────────────────────────────────────────────────
 
@@ -69,7 +74,11 @@ type Job struct {
 func (j *Job) miningNotify(cleanJobs bool) []interface{} {
 	t := j.Template
 	// prevhash: chunk-reverse each 4-byte word (standard stratum convention)
-	prevBytes, _ := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	prevBytes, err := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	if err != nil {
+		log.Printf("[quai] warning: prevhash hex decode failed: %v", err)
+		prevBytes = make([]byte, 32)
+	}
 	prevhash := hex.EncodeToString(reverseChunks32Bytes(prevBytes))
 	// merkle_branches are already in internal byte order
 	branches := make([]string, len(t.MerkleBranch))
@@ -98,7 +107,9 @@ func workerTargetFromDiff(diff float64) *big.Int {
 
 func newJob(t *BlockTemplate, workerDiff float64) *Job {
 	idb := make([]byte, 4)
-	rand.Read(idb)
+	if _, err := rand.Read(idb); err != nil {
+		binary.LittleEndian.PutUint32(idb, uint32(time.Now().UnixNano()))
+	}
 	return &Job{
 		ID:           hex.EncodeToString(idb),
 		Template:     t,
@@ -205,6 +216,7 @@ type Server struct {
 
 	ln     net.Listener
 	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // ServerConfig holds the config for a Quai stratum server instance.
@@ -271,6 +283,7 @@ func (s *Server) Start() error {
 	s.ln = ln
 	log.Printf("[quai/%s] stratum listening on %s", s.algo, s.listenAddr)
 
+	s.wg.Add(4)
 	go s.acceptLoop(ln)
 	go s.pollLoop()
 	go s.vardiffLoop()
@@ -288,9 +301,11 @@ func (s *Server) Stop() {
 	if s.ln != nil {
 		s.ln.Close()
 	}
+	s.wg.Wait()
 }
 
 func (s *Server) acceptLoop(ln net.Listener) {
+	defer s.wg.Done()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -302,12 +317,22 @@ func (s *Server) acceptLoop(ln net.Listener) {
 				continue
 			}
 		}
-		go s.handleConn(conn)
+		if s.connectedMiners.Load() >= 64 {
+			log.Printf("[quai/%s] max connections reached, rejecting %s", s.algo, conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleConn(conn)
+		}()
 	}
 }
 
 // pollLoop fetches block templates every second and broadcasts new work.
 func (s *Server) pollLoop() {
+	defer s.wg.Done()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var lastQuaiRoot string
@@ -385,9 +410,11 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	log.Printf("[quai/%s] miner connected: %s", s.algo, w.remoteAddr)
 
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4096), 4096)
 	for scanner.Scan() {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -516,20 +543,46 @@ func (s *Server) handleSubmit(w *Worker, id interface{}, rawParams json.RawMessa
 	en1 := w.extraNonce1
 	w.mu.Unlock()
 
+	// Validate extranonce2 length
+	en2Bytes, err := hex.DecodeString(extranonce2)
+	if err != nil || len(en2Bytes) != extranonce2Len {
+		_ = w.respond(id, false, []interface{}{25, "Invalid extranonce2"})
+		return
+	}
+
 	// Assemble coinbase transaction
-	coinbaseTx := assembleCoinbase(job.Template.Coinb1, en1, extranonce2, job.Template.Coinb2)
+	coinbaseTx, err := assembleCoinbase(job.Template.Coinb1, en1, extranonce2, job.Template.Coinb2)
+	if err != nil {
+		log.Printf("[quai/%s] coinbase assembly error worker=%s: %v", s.algo, w.name, err)
+		_ = w.respond(id, false, []interface{}{20, "Internal error"})
+		return
+	}
 
 	// Compute merkle root (internal byte order, not reversed)
-	mRoot := computeMerkleRoot(coinbaseTx, job.Template.MerkleBranch)
+	mRoot, err := computeMerkleRoot(coinbaseTx, job.Template.MerkleBranch)
+	if err != nil {
+		log.Printf("[quai/%s] merkle root error worker=%s: %v", s.algo, w.name, err)
+		_ = w.respond(id, false, []interface{}{20, "Internal error"})
+		return
+	}
 
 	// Build the 80-byte header the miner hashed
-	header80 := buildHeader80(job.Template, mRoot, ntime, nonce)
+	header80, err := buildHeader80(job.Template, mRoot, ntime, nonce)
+	if err != nil {
+		_ = w.respond(id, false, []interface{}{20, fmt.Sprintf("Malformed submit: %v", err)})
+		return
+	}
 
 	// Hash with the appropriate algorithm (result is big-endian for comparison)
 	var hashBytes []byte
 	switch s.algo {
 	case "scrypt":
-		hashBytes = scryptHash(header80)
+		hashBytes, err = scryptHash(header80)
+		if err != nil {
+			log.Printf("[quai/%s] scrypt hash error worker=%s: %v", s.algo, w.name, err)
+			_ = w.respond(id, false, []interface{}{20, "Hash computation failed"})
+			return
+		}
 	default:
 		hashBytes = sha256dHash(header80)
 	}
@@ -617,6 +670,7 @@ func (s *Server) submitToNode(job *Job, coinbaseTx, header80 []byte, w *Worker) 
 // ─── Vardiff ──────────────────────────────────────────────────────────────────
 
 func (s *Server) vardiffLoop() {
+	defer s.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -682,6 +736,7 @@ func (s *Server) adjustDifficulties() {
 // ─── Job cleanup ──────────────────────────────────────────────────────────────
 
 func (s *Server) jobCleanupLoop() {
+	defer s.wg.Done()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -760,58 +815,85 @@ func (s *Server) Workers() []WorkerInfo {
 // ─── Block assembly helpers ───────────────────────────────────────────────────
 
 // assembleCoinbase concatenates coinb1 + extranonce1 + extranonce2 + coinb2.
-func assembleCoinbase(coinb1, en1, en2, coinb2 string) []byte {
-	b1, _ := hex.DecodeString(coinb1)
-	e1, _ := hex.DecodeString(en1)
-	e2, _ := hex.DecodeString(en2)
-	b2, _ := hex.DecodeString(coinb2)
+func assembleCoinbase(coinb1, en1, en2, coinb2 string) ([]byte, error) {
+	b1, err := hex.DecodeString(coinb1)
+	if err != nil {
+		return nil, fmt.Errorf("coinb1 hex: %w", err)
+	}
+	e1, err := hex.DecodeString(en1)
+	if err != nil {
+		return nil, fmt.Errorf("extranonce1 hex: %w", err)
+	}
+	e2, err := hex.DecodeString(en2)
+	if err != nil {
+		return nil, fmt.Errorf("extranonce2 hex: %w", err)
+	}
+	b2, err := hex.DecodeString(coinb2)
+	if err != nil {
+		return nil, fmt.Errorf("coinb2 hex: %w", err)
+	}
 	tx := make([]byte, len(b1)+len(e1)+len(e2)+len(b2))
 	n := copy(tx, b1)
 	n += copy(tx[n:], e1)
 	n += copy(tx[n:], e2)
 	copy(tx[n:], b2)
-	return tx
+	return tx, nil
 }
 
 // computeMerkleRoot builds the merkle root from a coinbase transaction and
 // the merkle branch from the block template. Returns bytes in internal (LE) order.
-func computeMerkleRoot(coinbaseTx []byte, branch []string) []byte {
+func computeMerkleRoot(coinbaseTx []byte, branch []string) ([]byte, error) {
 	hash := sha256dInternal(coinbaseTx)
 	for _, b := range branch {
-		branchBytes, _ := hex.DecodeString(b)
+		branchBytes, err := hex.DecodeString(b)
+		if err != nil {
+			return nil, fmt.Errorf("merkle branch hex: %w", err)
+		}
 		combined := append(hash, branchBytes...)
 		hash = sha256dInternal(combined)
 	}
-	return hash
+	return hash, nil
 }
 
 // buildHeader80 assembles the 80-byte Bitcoin-style block header.
-func buildHeader80(t *BlockTemplate, merkleRoot []byte, ntime, nonce string) []byte {
+func buildHeader80(t *BlockTemplate, merkleRoot []byte, ntime, nonce string) ([]byte, error) {
 	buf := make([]byte, 80)
 
 	// version (4B LE)
 	binary.LittleEndian.PutUint32(buf[0:4], t.Version)
 
 	// prevhash (32B) in internal format (each 4-byte word reversed)
-	prevBytes, _ := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	prevBytes, err := hex.DecodeString(strings.TrimPrefix(t.PrevHash, "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("prevhash hex: %w", err)
+	}
 	copy(buf[4:36], reverseChunks32Bytes(prevBytes))
 
 	// merkle root (32B) already in internal byte order
 	copy(buf[36:68], merkleRoot)
 
 	// ntime (4B LE)
-	ntimeVal, _ := strconv.ParseUint(ntime, 16, 32)
+	ntimeVal, err := strconv.ParseUint(ntime, 16, 32)
+	if err != nil {
+		return nil, fmt.Errorf("ntime %q: %w", ntime, err)
+	}
 	binary.LittleEndian.PutUint32(buf[68:72], uint32(ntimeVal))
 
 	// bits (4B LE)
-	bitsVal, _ := strconv.ParseUint(t.Bits, 16, 32)
+	bitsVal, err := strconv.ParseUint(t.Bits, 16, 32)
+	if err != nil {
+		return nil, fmt.Errorf("bits %q: %w", t.Bits, err)
+	}
 	binary.LittleEndian.PutUint32(buf[72:76], uint32(bitsVal))
 
 	// nonce (4B LE)
-	nonceVal, _ := strconv.ParseUint(nonce, 16, 32)
+	nonceVal, err := strconv.ParseUint(nonce, 16, 32)
+	if err != nil {
+		return nil, fmt.Errorf("nonce %q: %w", nonce, err)
+	}
 	binary.LittleEndian.PutUint32(buf[76:80], uint32(nonceVal))
 
-	return buf
+	return buf, nil
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -837,15 +919,15 @@ func sha256dHash(data []byte) []byte {
 	return out
 }
 
-func scryptHash(data []byte) []byte {
+func scryptHash(data []byte) ([]byte, error) {
 	dk, err := scrypt.Key(data, data, 1024, 1, 1, 32)
 	if err != nil {
-		return make([]byte, 32)
+		return nil, fmt.Errorf("scrypt.Key: %w", err)
 	}
 	for i, j := 0, len(dk)-1; i < j; i, j = i+1, j-1 {
 		dk[i], dk[j] = dk[j], dk[i]
 	}
-	return dk
+	return dk, nil
 }
 
 // reverseChunks32Bytes reverses the byte order within each 4-byte chunk.

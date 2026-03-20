@@ -150,7 +150,9 @@ func (c *NodeClient) GetBlockTemplate(algo, coinbaseAddr string) (*BlockTemplate
 	}
 	targetHex := strings.TrimPrefix(t.Target, "0x")
 	t.TargetInt = new(big.Int)
-	t.TargetInt.SetString(targetHex, 16)
+	if _, ok := t.TargetInt.SetString(targetHex, 16); !ok {
+		return nil, fmt.Errorf("invalid target hex: %q", t.Target)
+	}
 	return &t, nil
 }
 

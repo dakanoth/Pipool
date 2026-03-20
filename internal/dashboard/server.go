@@ -52,6 +52,48 @@ type StatsSnapshot struct {
 	TotalCostPerDayUSD   float64    `json:"total_cost_per_day_usd"`
 	TotalProfitPerDayUSD float64    `json:"total_profit_per_day_usd"`
 	KwhRateUSD           float64    `json:"kwh_rate_usd"`
+	Earnings     *EarningsData      `json:"earnings,omitempty"`
+	WorkerUptimes []WorkerUptimeData `json:"worker_uptimes,omitempty"`
+}
+
+// EarningsData holds lifetime earnings for the dashboard.
+type EarningsData struct {
+	TotalBlocks    int         `json:"total_blocks"`
+	TotalConfirmed int         `json:"total_confirmed"`
+	TotalOrphaned  int         `json:"total_orphaned"`
+	TotalUSD       float64     `json:"total_usd"`
+	AvgLuck        float64     `json:"avg_luck"`
+	BestLuck       float64     `json:"best_luck"`
+	WorstLuck      float64     `json:"worst_luck"`
+	FirstBlockAt   string      `json:"first_block_at,omitempty"`
+	CoinEarnings   []CoinEarning `json:"coin_earnings"`
+}
+
+// CoinEarning holds per-coin earnings data.
+type CoinEarning struct {
+	Symbol         string  `json:"symbol"`
+	BlocksFound    int     `json:"blocks_found"`
+	BlocksConfirmed int    `json:"blocks_confirmed"`
+	BlocksOrphaned int     `json:"blocks_orphaned"`
+	TotalReward    float64 `json:"total_reward"`
+	TotalUSD       float64 `json:"total_usd"`
+	AvgLuck        float64 `json:"avg_luck"`
+	BestLuck       float64 `json:"best_luck"`
+	WorstLuck      float64 `json:"worst_luck"`
+	LastBlockAt    string  `json:"last_block_at,omitempty"`
+}
+
+// WorkerUptimeData holds uptime info for a single worker.
+type WorkerUptimeData struct {
+	Name      string  `json:"name"`
+	Coin      string  `json:"coin"`
+	Online    bool    `json:"online"`
+	Uptime24h float64 `json:"uptime_24h"`
+	Uptime7d  float64 `json:"uptime_7d"`
+	Uptime30d float64 `json:"uptime_30d"`
+	Sessions  int     `json:"sessions"`
+	AvgSession string `json:"avg_session"`
+	Pattern   string  `json:"pattern,omitempty"`
 }
 
 // StratumEndpoint holds connection info for a single stratum port
@@ -270,6 +312,7 @@ type Server struct {
 	TriggerRestart  func()
 	GetSwapStatus   func() json.RawMessage
 	UpdateSwapRule  func(coin string, enabled bool, dest string, minBal, keepBal float64)
+	GetHashHistory  func(coin string, windowHours int) []HashrateSample
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -307,6 +350,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/restart", s.handleRestartReq)
 	mux.HandleFunc("/api/worker/", s.handleWorkerDetail)
 	mux.HandleFunc("/api/swap", s.handleSwap)
+	mux.HandleFunc("/api/hashrate", s.handleHashHistory)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("[dashboard] http://0.0.0.0%s", addr)
@@ -523,6 +567,28 @@ func (s *Server) handleSwap(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func (s *Server) handleHashHistory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if s.GetHashHistory == nil {
+		json.NewEncoder(w).Encode([]HashrateSample{})
+		return
+	}
+	coin := r.URL.Query().Get("coin")
+	hours := 24
+	if h := r.URL.Query().Get("hours"); h != "" {
+		fmt.Sscanf(h, "%d", &hours)
+		if hours <= 0 || hours > 720 {
+			hours = 24
+		}
+	}
+	samples := s.GetHashHistory(coin, hours)
+	if samples == nil {
+		samples = []HashrateSample{}
+	}
+	json.NewEncoder(w).Encode(samples)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -1048,6 +1114,41 @@ body::before {
 .node-enable-toggle input { accent-color:var(--hi2); cursor:pointer; }
 
 /* ── LAYOUT ── */
+/* ── EARNINGS ── */
+.earn-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; margin-bottom:14px; }
+.earn-card { background:var(--surf2); border:1px solid var(--bdr); padding:12px 14px; }
+.earn-val { font-family:var(--vt); font-size:1.4rem; color:var(--hi); letter-spacing:1px; }
+.earn-label { font-family:var(--scan); font-size:.56rem; color:var(--dim2); letter-spacing:1px; margin-top:2px; }
+.earn-sub { font-family:var(--scan); font-size:.58rem; color:var(--dim); margin-top:4px; }
+.earn-coin-row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--off); }
+.earn-coin-row:last-child { border-bottom:none; }
+.earn-coin-sym { font-family:var(--scan); font-size:.72rem; color:var(--hi2); letter-spacing:2px; min-width:50px; }
+.earn-coin-stat { font-family:var(--scan); font-size:.68rem; color:var(--hi2); text-align:right; }
+.earn-coin-dim { font-family:var(--scan); font-size:.58rem; color:var(--dim2); }
+
+/* ── LUCK ── */
+.luck-bar-wrap { display:flex; align-items:center; gap:8px; margin-top:6px; }
+.luck-bar { flex:1; height:6px; background:var(--off); border:1px solid var(--bdr); position:relative; overflow:hidden; }
+.luck-fill { height:100%; transition:width .5s; }
+.luck-good { background:var(--hi); }
+.luck-avg { background:var(--amber); }
+.luck-bad { background:var(--red); }
+.luck-pct { font-family:var(--scan); font-size:.62rem; min-width:45px; text-align:right; }
+
+/* ── UPTIME ── */
+.uptime-bar { display:flex; height:12px; border:1px solid var(--bdr); overflow:hidden; border-radius:2px; }
+.uptime-seg-on { background:var(--hi); opacity:.7; }
+.uptime-seg-off { background:var(--red); opacity:.3; }
+.uptime-pct { font-family:var(--scan); font-size:.6rem; letter-spacing:1px; }
+.uptime-good { color:var(--hi); }
+.uptime-warn { color:var(--amber); }
+.uptime-bad { color:var(--red); }
+
+/* ── HASHRATE TIME RANGE ── */
+.hr-range-btn { background:var(--off); border:1px solid var(--bdr); color:var(--dim); font-family:var(--scan); font-size:.56rem; padding:3px 8px; cursor:pointer; letter-spacing:1px; }
+.hr-range-btn.active { border-color:var(--bdr2); color:var(--hi2); }
+.hr-range-btn:hover { border-color:var(--bdr2); }
+
 .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:16px; }
 /* ─── RESPONSIVE / MOBILE ─────────────────────────────────────────────── */
 @media(max-width:900px){
@@ -1055,12 +1156,24 @@ body::before {
 }
 @media(max-width:700px){
   .res-grid { grid-template-columns:1fr; }
+  .cfg-grid { grid-template-columns:1fr !important; }
+  .notif-grid { grid-template-columns:1fr !important; }
+  .connect-grid { grid-template-columns:1fr !important; }
+  .diag-grid { grid-template-columns:1fr !important; }
+  .group-grid { grid-template-columns:1fr !important; }
+  .disk-wrap { grid-template-columns:1fr !important; }
+  .earn-grid { grid-template-columns:1fr 1fr !important; }
 }
 @media(max-width:640px){
   /* Topbar */
   .topbar { padding:8px 12px; flex-wrap:wrap; gap:6px; }
   .logo-text { font-size:1.6rem; letter-spacing:3px; }
+  .logo-sub { font-size:.5rem; letter-spacing:2px; }
   .topbar-right { flex-wrap:wrap; gap:4px; }
+  /* Hide CRT effects on mobile — saves GPU/battery */
+  body::after { display:none; }
+  body::before { display:none; }
+  .wrap { animation:none; }
 
   /* Stat cards — 2 per row on phones */
   .cards { grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
@@ -1080,7 +1193,16 @@ body::before {
 
   /* Section padding */
   .section { margin-bottom:10px; }
-  .section-head { padding:8px 12px; }
+  .section-head { padding:8px 12px; flex-wrap:wrap; gap:4px; }
+  .section-title { font-size:.9rem !important; letter-spacing:2px !important; }
+
+  /* Earnings mobile */
+  .earn-grid { grid-template-columns:1fr 1fr !important; gap:6px !important; }
+  .earn-val { font-size:1.1rem !important; }
+
+  /* Telemetry stats row mobile */
+  #diffChart + div,
+  .section-body > div:first-child[style*="grid-template-columns"] { grid-template-columns:1fr 1fr !important; gap:6px !important; }
 
   /* Chart — shorter on mobile */
   canvas#diffChart { height:160px !important; max-height:160px; }
@@ -1098,6 +1220,10 @@ body::before {
 @media(max-width:400px){
   .cards { grid-template-columns:1fr; }
   .card-val { font-size:1.2rem; }
+  .earn-grid { grid-template-columns:1fr !important; }
+  .coin-stats-grid { grid-template-columns:1fr !important; }
+  .block-entry { grid-template-columns:1fr !important; }
+  .block-meta { text-align:left !important; }
 }
 
 footer {
@@ -1231,6 +1357,11 @@ footer {
         <button onclick="setChartMode('hashrate')" id="btnHashrate" style="background:var(--off);border:1px solid var(--bdr);color:var(--dim);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">HASHRATE</button>
         <button onclick="setChartMode('diff')" id="btnDiff" style="background:var(--off);border:1px solid var(--bdr2);color:var(--hi2);font-family:var(--scan);font-size:.58rem;padding:3px 8px;cursor:pointer;letter-spacing:1px">SHARE DIFF</button>
       </div>
+      <div id="hrRangeBtns" style="display:none;gap:4px">
+        <button class="hr-range-btn active" onclick="setHrRange(24)" data-hrs="24">24H</button>
+        <button class="hr-range-btn" onclick="setHrRange(168)" data-hrs="168">7D</button>
+        <button class="hr-range-btn" onclick="setHrRange(720)" data-hrs="720">30D</button>
+      </div>
     </div>
   </div>
   <div class="section-body" style="padding-bottom:8px">
@@ -1307,10 +1438,48 @@ footer {
 <div class="section" style="margin-bottom:16px">
   <div class="section-head">
     <span class="section-title">BLOCK LOG</span>
-    <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">This session</span>
+    <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">All found blocks</span>
   </div>
   <div class="section-body" id="blockLog">
     <div class="no-blocks">No blocks found this session.<br>Keep hashing.</div>
+  </div>
+</div>
+
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">EARNINGS</span>
+    <span id="earningsTotal" style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">LIFETIME STATS</span>
+  </div>
+  <div class="section-body">
+    <div class="earn-grid" id="earningsGrid">
+      <div class="earn-card">
+        <div class="earn-val" id="earnTotalBlocks">0</div>
+        <div class="earn-label">BLOCKS FOUND</div>
+      </div>
+      <div class="earn-card">
+        <div class="earn-val" id="earnTotalUSD">$0.00</div>
+        <div class="earn-label">TOTAL EARNED (USD)</div>
+      </div>
+      <div class="earn-card">
+        <div class="earn-val" id="earnAvgLuck">--</div>
+        <div class="earn-label">AVG LUCK</div>
+      </div>
+      <div class="earn-card">
+        <div class="earn-val" id="earnOrphaned">0</div>
+        <div class="earn-label">ORPHANED</div>
+      </div>
+    </div>
+    <div id="earningsByCoin" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="section" style="margin-bottom:16px">
+  <div class="section-head">
+    <span class="section-title">SOLO LUCK CALCULATOR</span>
+    <span style="font-family:var(--scan);font-size:.58rem;color:var(--dim2)">REAL-TIME ODDS</span>
+  </div>
+  <div class="section-body">
+    <div id="luckCalcGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px"></div>
   </div>
 </div>
 
@@ -1932,7 +2101,90 @@ function apply(s) {
     sec.style.display = 'none';
   }
 
+  // ── Earnings panel ──
+  renderEarnings(s.earnings);
+
+  // ── Luck calculator ──
+  renderLuckCalc(s.coins);
+
   document.getElementById('footerTime').textContent = new Date().toLocaleString();
+}
+
+function renderEarnings(e) {
+  if (!e) return;
+  var tb = document.getElementById('earnTotalBlocks');
+  var tu = document.getElementById('earnTotalUSD');
+  var al = document.getElementById('earnAvgLuck');
+  var or = document.getElementById('earnOrphaned');
+  if (tb) tb.textContent = e.total_blocks || 0;
+  if (tu) tu.textContent = '$' + (e.total_usd || 0).toFixed(2);
+  if (al) al.textContent = e.avg_luck > 0 ? e.avg_luck.toFixed(1) + '%' : '--';
+  if (or) or.textContent = e.total_orphaned || 0;
+  var total = document.getElementById('earningsTotal');
+  if (total && e.first_block_at) total.textContent = 'SINCE ' + e.first_block_at;
+
+  var byCoin = document.getElementById('earningsByCoin');
+  if (!byCoin || !e.coin_earnings || !e.coin_earnings.length) return;
+  var html = '';
+  e.coin_earnings.forEach(function(c) {
+    var luckColor = c.avg_luck >= 100 ? 'var(--hi)' : (c.avg_luck >= 50 ? 'var(--amber)' : 'var(--red)');
+    var luckW = Math.min(100, c.avg_luck > 0 ? Math.min(200, c.avg_luck) / 2 : 0);
+    var luckClass = c.avg_luck >= 100 ? 'luck-good' : (c.avg_luck >= 50 ? 'luck-avg' : 'luck-bad');
+    html += '<div class="earn-coin-row">' +
+      '<span class="earn-coin-sym">' + c.symbol + '</span>' +
+      '<span class="earn-coin-stat">' + c.blocks_found + ' blocks</span>' +
+      '<span class="earn-coin-stat">' + c.total_reward.toFixed(4) + ' ' + c.symbol + '</span>' +
+      '<span class="earn-coin-stat">' + (c.total_usd > 0 ? '$'+c.total_usd.toFixed(2) : '--') + '</span>' +
+      '<span class="earn-coin-stat" style="color:'+luckColor+'">' + (c.avg_luck > 0 ? c.avg_luck.toFixed(1)+'%' : '--') + ' luck</span>' +
+      (c.blocks_orphaned > 0 ? '<span class="earn-coin-dim" style="color:var(--red)">' + c.blocks_orphaned + ' orphaned</span>' : '') +
+    '</div>';
+  });
+  byCoin.innerHTML = html;
+}
+
+function renderLuckCalc(coins) {
+  var grid = document.getElementById('luckCalcGrid');
+  if (!grid || !coins) return;
+  var POWERBALL = 292201338;
+  var html = [];
+  coins.forEach(function(c) {
+    if (!c.hashrate_khs || c.hashrate_khs <= 0 || !c.difficulty || c.difficulty <= 0) return;
+    var algo = c.symbol;
+    var diff1 = 65536;
+    if (['BTC','BCH','DGB'].indexOf(c.symbol) >= 0) diff1 = 4294967296;
+    var hashPerSec = c.hashrate_khs * 1000;
+    var expectedSec = (c.difficulty * diff1) / hashPerSec;
+    var pctPerHour = (1 - Math.exp(-3600 / expectedSec)) * 100;
+    var oddsPerHour = pctPerHour > 0 ? 100 / pctPerHour : Infinity;
+    var vsPowerball = oddsPerHour > 0 ? POWERBALL / oddsPerHour : 0;
+    var expectedStr = fmtDuration(expectedSec);
+    var oddsStr = oddsPerHour < 1e12 ? '1 in ' + fmtBigNum(Math.round(oddsPerHour)) : 'Astronomically unlikely';
+    var pbStr = vsPowerball >= 1 ? vsPowerball.toFixed(1) + 'x better than Powerball' : (vsPowerball > 0 ? (1/vsPowerball).toFixed(0) + 'x worse than Powerball' : '--');
+    var pbColor = vsPowerball >= 1 ? 'var(--hi)' : 'var(--red)';
+    html.push('<div style="background:var(--surf2);border:1px solid var(--bdr);padding:12px 14px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">' +
+        '<span style="font-family:var(--scan);font-size:.78rem;color:var(--hi2);letter-spacing:2px">' + c.symbol + '</span>' +
+        '<span style="font-family:var(--scan);font-size:.52rem;color:var(--dim2)">' + fmtHash(c.hashrate_khs) + '</span>' +
+      '</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">' +
+        '<div><div style="font-family:var(--scan);font-size:.5rem;color:var(--dim2);letter-spacing:1px">EXPECTED TIME</div>' +
+          '<div style="font-family:var(--vt);font-size:.9rem;color:var(--hi)">' + expectedStr + '</div></div>' +
+        '<div><div style="font-family:var(--scan);font-size:.5rem;color:var(--dim2);letter-spacing:1px">ODDS / HOUR</div>' +
+          '<div style="font-family:var(--vt);font-size:.9rem;color:var(--hi2)">' + oddsStr + '</div></div>' +
+        '<div style="grid-column:1/-1"><div style="font-family:var(--scan);font-size:.5rem;color:var(--dim2);letter-spacing:1px">VS POWERBALL</div>' +
+          '<div style="font-family:var(--scan);font-size:.68rem;color:' + pbColor + '">' + pbStr + '</div></div>' +
+      '</div>' +
+    '</div>');
+  });
+  grid.innerHTML = html.length > 0 ? html.join('') : '<div style="font-family:var(--scan);font-size:.7rem;color:var(--dim2);text-align:center;padding:20px">No active mining — connect miners to see odds</div>';
+}
+
+function fmtBigNum(n) {
+  if (n >= 1e12) return (n/1e12).toFixed(1) + 'T';
+  if (n >= 1e9)  return (n/1e9).toFixed(1) + 'B';
+  if (n >= 1e6)  return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3)  return (n/1e3).toFixed(1) + 'K';
+  return n.toString();
 }
 
 function renderDiag(diags) {
@@ -2246,7 +2498,20 @@ function renderWorkersTab(s) {
     var sessCount = (w.reconnect_count||0) + 1;
     var sessLabel = sessCount+'×';
     var sessDur = (w.online && w.session_duration) ? ' '+w.session_duration : '';
-    var sessHtml = '<span class="shares-val" title="'+sessCount+' session'+(sessCount>1?'s':'')+'" style="font-size:.65rem">'+sessLabel+sessDur+'</span>';
+    // Uptime percentage from uptime tracker
+    var uptimeInfo = '';
+    if (s.worker_uptimes) {
+      for (var ui=0; ui<s.worker_uptimes.length; ui++) {
+        var wu = s.worker_uptimes[ui];
+        if (wu.name === w.name) {
+          var uPct = wu.uptime_24h;
+          var uColor = uPct >= 95 ? 'var(--hi)' : (uPct >= 80 ? 'var(--amber)' : 'var(--red)');
+          uptimeInfo = '<br><span style="font-size:.54rem;color:'+uColor+'" title="24h: '+uPct.toFixed(1)+'% | 7d: '+wu.uptime_7d.toFixed(1)+'% | 30d: '+wu.uptime_30d.toFixed(1)+'%'+(wu.pattern?' | '+wu.pattern:'')+'">' + uPct.toFixed(0) + '% uptime</span>';
+          break;
+        }
+      }
+    }
+    var sessHtml = '<span class="shares-val" title="'+sessCount+' session'+(sessCount>1?'s':'')+'" style="font-size:.65rem">'+sessLabel+sessDur+'</span>' + uptimeInfo;
     var wattsStr = (w.watts_estimate && w.watts_estimate > 0) ? w.watts_estimate.toFixed(0)+'W' : '--';
     var kwhRate = s.kwh_rate_usd || 0;
     var costStr = '--';
@@ -2274,13 +2539,33 @@ function renderWorkersTab(s) {
   });
 }
 
+var hrRangeHours = 24;
+var hrHistoricalData = null;
+
 function setChartMode(m) {
   chartMode = m;
   var bH = document.getElementById('btnHashrate');
   var bD = document.getElementById('btnDiff');
   if (bH) { bH.style.color = m==='hashrate' ? 'var(--hi2)' : 'var(--dim)'; bH.style.borderColor = m==='hashrate' ? 'var(--bdr2)' : 'var(--bdr)'; }
   if (bD) { bD.style.color = m==='diff' ? 'var(--hi2)' : 'var(--dim)'; bD.style.borderColor = m==='diff' ? 'var(--bdr2)' : 'var(--bdr)'; }
+  var rb = document.getElementById('hrRangeBtns');
+  if (rb) rb.style.display = m==='hashrate' ? 'flex' : 'none';
   renderChart();
+}
+
+function setHrRange(hrs) {
+  hrRangeHours = hrs;
+  var btns = document.querySelectorAll('.hr-range-btn');
+  btns.forEach(function(b){ b.classList.toggle('active', parseInt(b.getAttribute('data-hrs'))===hrs); });
+  if (hrs > 24) {
+    fetch('/api/hashrate?hours='+hrs).then(function(r){return r.json();}).then(function(data){
+      hrHistoricalData = data;
+      renderChart();
+    }).catch(function(){ hrHistoricalData = null; renderChart(); });
+  } else {
+    hrHistoricalData = null;
+    renderChart();
+  }
 }
 
 function populateCoinFilter(coins) {
@@ -2442,8 +2727,9 @@ function renderChartNow() {
 
   if (chartMode === 'hashrate') {
     // Group hashrate history by coin, filtered to selected coins
+    var hrSource = (hrHistoricalData && hrRangeHours > 24) ? hrHistoricalData : hashrateHistoryGlobal;
     var coinGroups = {};
-    hashrateHistoryGlobal.forEach(function(s) {
+    hrSource.forEach(function(s) {
       if (activeCoins.length > 0 && activeCoins.indexOf(s.coin) < 0) return;
       if (!coinGroups[s.coin]) coinGroups[s.coin] = [];
       coinGroups[s.coin].push(s);

@@ -17,6 +17,16 @@ type PoolConfig struct {
 	Quai     QuaiConfig              `json:"quai"`
 	Guardian GuardianConfig          `json:"guardian"`
 	Swap     SwapConfig              `json:"swap"`
+	PPLNS    PPLNSConfig             `json:"pplns"`
+}
+
+// PPLNSConfig controls the Pay-Per-Last-N-Shares payout system.
+type PPLNSConfig struct {
+	Enabled        bool               `json:"enabled"`
+	WindowSize     int                `json:"window_size"`
+	PoolFeePct     float64            `json:"pool_fee_pct"`
+	MinPayout      map[string]float64 `json:"min_payout"`
+	PayoutInterval int                `json:"payout_interval_min"`
 }
 
 // SwapConfig controls the auto-swap system that converts mined coins to a destination coin.
