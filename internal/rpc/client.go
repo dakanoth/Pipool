@@ -130,6 +130,9 @@ type BlockTemplate struct {
 	// SegWit witness commitment (BTC/BCH). When present, the coinbase must
 	// include an OP_RETURN output with this commitment as the second output.
 	DefaultWitnessCommitment string `json:"default_witness_commitment,omitempty"`
+	// DGB MultiAlgo: the algorithm the node expects for this block.
+	// Values: "sha256d", "scrypt", "skein", "qubit", "odo". Empty for non-DGB coins.
+	PowAlgo string `json:"pow_algo,omitempty"`
 }
 
 type TxData struct {

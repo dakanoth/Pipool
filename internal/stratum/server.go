@@ -209,6 +209,9 @@ type Job struct {
 	// RawTxHexes holds the serialized transactions from getblocktemplate (excluding coinbase).
 	// Required for correct full-block assembly when submitting a found block.
 	RawTxHexes     []string
+	// PowAlgo is the proof-of-work algorithm the node expects for this block (DGB multi-algo).
+	// Empty for non-DGB coins. Values: "sha256d", "scrypt", "skein", "qubit", "odo".
+	PowAlgo        string
 }
 
 // NewServer creates a Stratum server for the given coin
@@ -803,6 +806,7 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		AuxSortedSyms:  auxSortedSyms,
 		AuxWorks:       auxWorkSnap,
 		RawTxHexes:     txHexes,
+		PowAlgo:        bt.PowAlgo,
 		CreatedAt:      time.Now(),
 	}
 
@@ -1260,6 +1264,17 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 	}
 
 	valid, isBlock, effectiveNonce := s.validateShare(job, w.extranonce1, extranonce2, ntime, nonce, effectiveVersion, validationDiff)
+
+	// DGB multi-algo: only submit blocks when the template's PoW algo matches
+	// our configured algorithm. The node rotates through 5 algos and we can only
+	// solve blocks for the algo our miners actually compute.
+	if isBlock && job.PowAlgo != "" {
+		algoMatch := (s.coin.Algorithm == "sha256d" && job.PowAlgo == "sha256d") ||
+			(s.coin.Algorithm == "scrypt" && job.PowAlgo == "scrypt")
+		if !algoMatch {
+			isBlock = false
+		}
+	}
 
 	if !valid {
 		w.sharesRejected++
@@ -1955,7 +1970,7 @@ func (s *Server) writeJSON(w *Worker, v any) error {
 		return err
 	}
 	data = append(data, '\n')
-        if len(data) > 800 {
+        if len(data) > 4096 {
 		log.Printf("[%s] WARN large message to %s: %d bytes", s.coin.Symbol, w.workerName, len(data))
 	}
 	_, err = w.writer.Write(data)
