@@ -326,6 +326,14 @@ func (s *Server) Stop() {
 		s.ln.Close() // unblocks ln.Accept() in the accept goroutine
 	}
 
+	// Close all worker connections so their handleWorker goroutines unblock
+	// from reads and drain via the deferred cleanup path.
+	s.mu.RLock()
+	for _, w := range s.workers {
+		w.conn.Close()
+	}
+	s.mu.RUnlock()
+
 	// Drain in-flight worker goroutines with a timeout
 	done := make(chan struct{})
 	go func() {
@@ -338,7 +346,8 @@ func (s *Server) Stop() {
 	case <-time.After(10 * time.Second):
 		log.Printf("[%s] shutdown timeout — %d workers still active, forcing close", s.coin.Symbol, s.connectedMiners.Load())
 	}
-	s.saveBlockLog() // persist block log on clean shutdown
+	s.saveWorkerState() // persist difficulty state for next startup
+	s.saveBlockLog()    // persist block log on clean shutdown
 }
 
 // activateProxy starts the upstream stratum proxy fallback.
@@ -868,7 +877,9 @@ func (s *Server) handleWorker(conn net.Conn) {
 			s.connectedMiners.Add(-1)
 			go s.saveWorkerState() // persist LastDifficulty and BestShare for next startup
 		}
-		log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
+		if w.authorized {
+			log.Printf("[%s] miner disconnected: %s (%s)", s.coin.Symbol, w.workerName, conn.RemoteAddr())
+		}
 		// Smarter offline alert: wait 3 minutes before firing Discord notification.
 		// If the worker reconnects within that window, skip the alert to avoid noise.
 		if s.OnMinerDisconnect != nil && w.authorized {
@@ -1766,7 +1777,13 @@ func (s *Server) adjustVardiff(w *Worker) {
 
 	w.sharesSinceRetarget++
 
-	if time.Since(w.lastRetargetAt) < retarget {
+	// Emergency fast retarget: if we've already received 50+ shares in under
+	// half the retarget window, the difficulty is clearly way too low (e.g.
+	// after a restart that lost state). Retarget immediately instead of
+	// waiting for the full retarget interval.
+	sinceRetarget := time.Since(w.lastRetargetAt)
+	emergency := w.sharesSinceRetarget >= 50 && sinceRetarget >= 5*time.Second && sinceRetarget < retarget
+	if !emergency && sinceRetarget < retarget {
 		return
 	}
 

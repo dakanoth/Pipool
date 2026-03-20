@@ -1330,12 +1330,23 @@ func main() {
 	if guard != nil {
 		guard.Stop()
 	}
+	// Stop all stratum servers concurrently to avoid sequential 10s timeouts
+	var stopWg sync.WaitGroup
 	for _, srv := range servers {
-		srv.Stop()
+		stopWg.Add(1)
+		go func(s *stratum.Server) {
+			defer stopWg.Done()
+			s.Stop()
+		}(srv)
 	}
 	for _, qs := range quaiServers {
-		qs.Stop()
+		stopWg.Add(1)
+		go func(q *quai.Server) {
+			defer stopWg.Done()
+			q.Stop()
+		}(qs)
 	}
+	stopWg.Wait()
 	sysmon.Stop()
 
 	log.Printf("PiPool stopped cleanly. Goodbye!")
