@@ -28,6 +28,18 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
+const (
+	// extranonce1Size is the size of extranonce1 in bytes (4 bytes = 8 hex chars).
+	extranonce1Size = 4
+	// defaultEN2Size is the default extranonce2 size for standard miners (4 bytes).
+	defaultEN2Size = 4
+	// maxEN2Size is the maximum extranonce2 size we support (Braiins firmware requests 7).
+	maxEN2Size = 7
+	// coinbaseENSlot is the total extranonce space reserved in the coinbase script.
+	// Must be extranonce1Size + maxEN2Size = 11 bytes. Miners with smaller en2 are zero-padded.
+	coinbaseENSlot = extranonce1Size + maxEN2Size
+)
+
 // AuxBlockInfo bundles the data needed to submit a found parent block to aux chains.
 type AuxBlockInfo struct {
 	// CoinbaseTx is the full serialized coinbase transaction (for the AuxPoW proof).
@@ -145,6 +157,7 @@ type Worker struct {
 
 	// Extranonce assigned to this worker
 	extranonce1    string
+	en2Size        int  // extranonce2 size in bytes (default 4, Braiins requests 7)
 	supportsEnSub  bool // true if miner sent mining.extranonce.subscribe
 }
 
@@ -422,8 +435,9 @@ func (s *Server) updateExtraNonce(en1 string) {
 		if sub {
 			w.mu.Lock()
 			w.extranonce1 = en1
+			en2 := w.en2Size
 			w.mu.Unlock()
-			s.sendSetExtranonce(w, en1, 4)
+			s.sendSetExtranonce(w, en1, en2)
 		} else {
 			w.conn.Close()
 		}
@@ -782,7 +796,7 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		s.coin.Wallet,
 		bt.CoinbaseValue,
 		bt.Height,
-		8, // extranonce1 (4 bytes) + extranonce2 (4 bytes) = 8 bytes total in coinbase script
+		coinbaseENSlot, // extranonce1 (4) + max extranonce2 (7) = 11 bytes; shorter en2 is zero-padded
 		s.coinbaseTag,
 		bt.DefaultWitnessCommitment,
 		auxCommitment, // ← new parameter
@@ -842,6 +856,7 @@ func (s *Server) handleWorker(conn net.Conn) {
 		lastRetargetAt: time.Now(),
 		connectedAt:    time.Now(),
 		extranonce1:    fmt.Sprintf("%08x", rand.Uint32()),
+		en2Size:        defaultEN2Size,
 	}
 
 	conn.SetReadDeadline(time.Now().Add(s.poolCfg.Pool.WorkerTimeoutDuration()))
@@ -1025,12 +1040,34 @@ func (s *Server) handleMessage(w *Worker, msg *stratumMsg) error {
 func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 	// Extract user-agent from subscribe params if present
 	// mining.subscribe params: ["user-agent/version", "session-id"]
-	var params []string
+	// Braiins firmware may also send a requested extranonce2 size.
+	var params []json.RawMessage
 	json.Unmarshal(msg.Params, &params)
 	if len(params) > 0 {
-		w.userAgent = params[0]
+		var ua string
+		if json.Unmarshal(params[0], &ua) == nil {
+			w.userAgent = ua
+		}
 	}
 	log.Printf("[%s] subscribe from %s: user-agent=%q params=%s", s.coin.Symbol, w.remoteAddr, w.userAgent, msg.Params)
+
+	// Detect Braiins firmware extranonce2 size request.
+	// Braiins sends mining.subscribe with params like:
+	//   ["braiins-os/version", null, "host", port]
+	// and expects the pool to honor larger extranonce2 sizes.
+	// We also check the user-agent string for "braiins" or "bos" as a signal.
+	requestedEN2 := defaultEN2Size
+	ua := strings.ToLower(w.userAgent)
+	if strings.Contains(ua, "braiins") || strings.Contains(ua, "bosminer") || strings.Contains(ua, "/bos") {
+		requestedEN2 = maxEN2Size
+	}
+	if requestedEN2 > maxEN2Size {
+		requestedEN2 = maxEN2Size
+	}
+	if requestedEN2 < defaultEN2Size {
+		requestedEN2 = defaultEN2Size
+	}
+	w.en2Size = requestedEN2
 
 	// When upstream proxy is active, use the upstream extranonce1 so miner
 	// shares are valid against the upstream pool's template.
@@ -1052,10 +1089,13 @@ func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 			[]string{"mining.notify", w.id},
 		},
 		en1,
-		4, // extranonce2 size in bytes
+		w.en2Size,
 	}
 	if err := s.reply(w, msg.ID, result, nil); err != nil {
 		return err
+	}
+	if w.en2Size != defaultEN2Size {
+		log.Printf("[%s] %s granted extranonce2_size=%d (firmware: %s)", s.coin.Symbol, w.remoteAddr, w.en2Size, w.userAgent)
 	}
 	// Send initial difficulty
 	return s.sendDifficulty(w, w.difficulty)
@@ -1239,8 +1279,9 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 
 	// Validate the share: assemble header and check hash meets worker difficulty
 	extranonce2 := params[2]
-	// Extranonce2 must be exactly 4 bytes (8 hex chars) as declared in mining.subscribe
-	if len(extranonce2) != 8 {
+	// Extranonce2 must match the size declared in mining.subscribe (en2Size bytes = en2Size*2 hex chars)
+	expectedEN2Hex := w.en2Size * 2
+	if len(extranonce2) != expectedEN2Hex {
 		w.sharesRejected++
 		s.recordShareSample(w.difficulty, false, w.workerName)
 		return s.reply(w, msg.ID, false, []any{20, "Invalid extranonce2 length", nil})
@@ -1450,7 +1491,13 @@ func (s *Server) updateSeenWorkerShares(w *Worker) {
 // both orientations and accept whichever validates.
 func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce, effectiveVersion string, workerDiff float64) (bool, bool, string) {
 	// Build coinbase transaction hash (same regardless of nonce orientation)
-	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
+	// Zero-pad the extranonce to fill the full coinbase slot (11 bytes = 22 hex chars).
+	// This ensures miners with different en2 sizes (4 vs 7) produce valid coinbases.
+	enHex := extranonce1 + extranonce2
+	if pad := coinbaseENSlot*2 - len(enHex); pad > 0 {
+		enHex += strings.Repeat("0", pad)
+	}
+	coinbaseHex := job.CoinbasePart1 + enHex + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
 		return false, false, nonce
@@ -1559,7 +1606,12 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce,
 // All header fields are converted to Bitcoin wire format (little-endian) as
 // required by the node's submitblock RPC.
 func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion string) (blockHex, blockHash string, headerBytes, coinbaseTxBytes []byte) {
-	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
+	// Zero-pad extranonce to fill the full coinbase slot (11 bytes).
+	enHex := extranonce1 + extranonce2
+	if pad := coinbaseENSlot*2 - len(enHex); pad > 0 {
+		enHex += strings.Repeat("0", pad)
+	}
+	coinbaseHex := job.CoinbasePart1 + enHex + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
 		log.Printf("[%s] assembleBlockHex: invalid coinbase hex: %v", s.coin.Symbol, err)
