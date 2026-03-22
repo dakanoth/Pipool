@@ -348,9 +348,9 @@ func main() {
 		srv.OnNodeWatchdogRestart = func(service string) {
 			notifier.DaemonRestarted(coin.Symbol, service)
 		}
-		srv.OnBlockFound = func(sym, hash, worker string, reward, luck float64) {
-			notifier.BlockFound(sym, hash, 0, reward, luck, worker)
-			earningsTracker.RecordBlock(sym, 0, hash, reward, luck)
+		srv.OnBlockFound = func(sym, hash, worker string, height int64, reward, luck float64) {
+			notifier.BlockFound(sym, hash, height, reward, luck, worker)
+			earningsTracker.RecordBlock(sym, height, hash, reward, luck)
 			pplnsEngine.BlockFound(sym, reward)
 		}
 		srv.OnShareAccepted = func(coinSym, workerAddr string, difficulty float64) {
@@ -358,6 +358,11 @@ func main() {
 		}
 		srv.OnBlockMature = func(coin, hash string, height int64, reward string) {
 			notifier.BlockMatured(coin, hash, height, reward)
+			threshold := stratum.CoinMaturityThreshold(coin)
+			earningsTracker.UpdateConfirmations(coin, hash, threshold, false)
+		}
+		srv.OnBlockOrphaned = func(coin, hash string, height int64) {
+			earningsTracker.UpdateConfirmations(coin, hash, -1, true)
 		}
 		srv.OnStaleKick = func(workerName string, kickCount int) {
 			notifier.StaleKick(coin.Symbol, workerName, kickCount)

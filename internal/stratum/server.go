@@ -96,7 +96,7 @@ type Server struct {
 	upstreamDiff float64 // difficulty from upstream pool (under mu)
 
 	// Callbacks for Discord notifications
-	OnBlockFound      func(coin, hash, worker string, reward, luck float64)
+	OnBlockFound      func(coin, hash, worker string, height int64, reward, luck float64)
 	OnMinerConnect    func(worker string, addr string)
 	OnMinerDisconnect func(worker string)
 	OnNodeUnreachable func(err error)
@@ -1488,7 +1488,7 @@ func (s *Server) handleSubmit(w *Worker, msg *stratumMsg) error {
 				s.blocksFound.Add(1)
 				s.recordBlock(blockHash, height, reward, workerName, luck)
 				if onBlockFound != nil {
-					onBlockFound(coinSym, blockHash, workerName, reward, luck)
+					onBlockFound(coinSym, blockHash, workerName, height, reward, luck)
 				}
 				if onAuxBlockFound != nil && auxInfo != nil {
 					onAuxBlockFound(*auxInfo)
