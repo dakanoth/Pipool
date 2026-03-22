@@ -152,17 +152,20 @@ func (c *Client) GetBlockTemplate(capabilities []string) (*BlockTemplate, error)
 		rules = []string{} // Bitcoin Cash does not support the segwit rule
 	}
 	params := map[string]any{"capabilities": capabilities, "rules": rules}
-	// DGB MultiAlgo: specify sha256d algorithm so digibyted produces SHA-256d work.
-	// Without this, digibyted defaults to the network's current algo rotation.
+	// DGB MultiAlgo: the algo is a separate second RPC parameter (not inside the
+	// template_request object). Without it, digibyted defaults to "scrypt".
+	var rpcParams []any
 	if strings.EqualFold(c.Symbol, "DGB") || strings.EqualFold(c.Symbol, "DGBS") {
 		algo := "sha256d"
 		if strings.EqualFold(c.Symbol, "DGBS") {
 			algo = "scrypt"
 		}
-		params["algo"] = algo
+		rpcParams = []any{params, algo}
+	} else {
+		rpcParams = []any{params}
 	}
 	var bt BlockTemplate
-	if err := c.Call("getblocktemplate", []any{params}, &bt); err != nil {
+	if err := c.Call("getblocktemplate", rpcParams, &bt); err != nil {
 		return nil, err
 	}
 	return &bt, nil

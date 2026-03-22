@@ -31,13 +31,10 @@ import (
 const (
 	// extranonce1Size is the size of extranonce1 in bytes (4 bytes = 8 hex chars).
 	extranonce1Size = 4
-	// defaultEN2Size is the default extranonce2 size for standard miners (4 bytes).
-	defaultEN2Size = 4
-	// maxEN2Size is the maximum extranonce2 size we support (Braiins firmware requests 7).
-	maxEN2Size = 7
-	// coinbaseENSlot is the total extranonce space reserved in the coinbase script.
-	// Must be extranonce1Size + maxEN2Size = 11 bytes. Miners with smaller en2 are zero-padded.
-	coinbaseENSlot = extranonce1Size + maxEN2Size
+	// defaultEN2Size is the extranonce2 size in bytes. Set to 8 so the pool is
+	// compatible with Braiins Hashpower (requires en2 >= 7) and standard miners
+	// alike. Smaller miners simply zero-pad the upper bytes.
+	defaultEN2Size = 8
 )
 
 // AuxBlockInfo bundles the data needed to submit a found parent block to aux chains.
@@ -119,6 +116,9 @@ type Server struct {
 
 	// workerKickTimes tracks rolling 1-hour stale kick timestamps per worker (under mu).
 	workerKickTimes map[string][]time.Time
+
+	// Per-IP connection count for rate limiting (under mu).
+	ipConns map[string]int
 }
 
 // Worker represents a connected miner
@@ -177,6 +177,7 @@ type SeenWorker struct {
 	SharesStaleBase    uint64
 	BestShare        float64
 	LastDifficulty   float64    // difficulty at last disconnect — restored on next reconnect
+	AvgDifficulty    float64    // exponential moving average of difficulty across all sessions
 	DiffHistory      []DiffEvent // last 100 difficulty changes, persisted across reconnects
 	ReconnectCount   int        // number of times this worker has reconnected (0 = first session)
 	SessionStartedAt time.Time  // time of the most recent authorization
@@ -263,6 +264,7 @@ func NewServer(coin config.CoinConfig, poolCfg *config.PoolConfig, coord *merge.
 		jobBroadcast:    make(chan *Job, 256),
 		stopCh:          make(chan struct{}),
 		workerKickTimes: make(map[string][]time.Time),
+		ipConns:         make(map[string]int),
 	}
 }
 
@@ -450,15 +452,28 @@ func (s *Server) updateExtraNonce(en1 string) {
 // firmware which ignores clean_jobs=true is kicked at the next block boundary
 // rather than waiting for N more stale submissions.
 func (s *Server) kickStaleStreakWorkers() {
+	// Collect workers to kick under read lock, then release before calling
+	// recordStaleKick (which acquires a write lock — holding RLock would deadlock).
+	type toKick struct {
+		name          string
+		staleStreak   int
+		lastStaleJob  string
+		conn          net.Conn
+	}
+	var victims []toKick
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	for _, w := range s.workers {
 		if w.staleJobStreak > 0 {
-			log.Printf("[%s] new block: kicking %s (stale streak %d, job %s ignores clean_jobs)",
-				s.coin.Symbol, w.workerName, w.staleJobStreak, w.lastStaleJobID)
-			s.recordStaleKick(w.workerName)
-			w.conn.Close()
+			victims = append(victims, toKick{w.workerName, w.staleJobStreak, w.lastStaleJobID, w.conn})
 		}
+	}
+	s.mu.RUnlock()
+
+	for _, v := range victims {
+		log.Printf("[%s] new block: kicking %s (stale streak %d, job %s ignores clean_jobs)",
+			s.coin.Symbol, v.name, v.staleStreak, v.lastStaleJob)
+		s.recordStaleKick(v.name)
+		v.conn.Close()
 	}
 }
 
@@ -530,9 +545,32 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			conn.Close()
 			continue
 		}
+		// Per-IP connection limit
+		ip := remoteIP(conn.RemoteAddr().String())
+		maxPerIP := s.poolCfg.Pool.MaxConnsPerIP
+		if maxPerIP > 0 {
+			s.mu.Lock()
+			if s.ipConns[ip] >= maxPerIP {
+				s.mu.Unlock()
+				log.Printf("[%s] per-IP limit (%d) reached for %s, rejecting", s.coin.Symbol, maxPerIP, ip)
+				conn.Close()
+				continue
+			}
+			s.ipConns[ip]++
+			s.mu.Unlock()
+		}
 		s.wg.Add(1)
 		go s.handleWorker(conn)
 	}
+}
+
+// remoteIP extracts just the IP address from a "host:port" or "[host]:port" string.
+func remoteIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
 
 // activeRPC returns the backup RPC client if we're currently using it, else primary.
@@ -796,7 +834,7 @@ func (s *Server) buildJob(cleanJobs bool) (*Job, error) {
 		s.coin.Wallet,
 		bt.CoinbaseValue,
 		bt.Height,
-		coinbaseENSlot, // extranonce1 (4) + max extranonce2 (7) = 11 bytes; shorter en2 is zero-padded
+		extranonce1Size + defaultEN2Size, // 4 + 8 = 12 bytes nonce space
 		s.coinbaseTag,
 		bt.DefaultWitnessCommitment,
 		auxCommitment, // ← new parameter
@@ -872,6 +910,13 @@ func (s *Server) handleWorker(conn net.Conn) {
 		s.mu.Lock()
 		delete(s.workers, workerID)
 		delete(s.workerKickTimes, w.workerName)
+		// Decrement per-IP connection count
+		ip := remoteIP(conn.RemoteAddr().String())
+		if s.ipConns[ip] > 1 {
+			s.ipConns[ip]--
+		} else {
+			delete(s.ipConns, ip)
+		}
 		// Update seenWorkers on disconnect
 		if w.authorized && w.workerName != "" {
 			if seen, ok := s.seenWorkers[w.workerName]; ok {
@@ -884,6 +929,14 @@ func (s *Server) handleWorker(conn net.Conn) {
 					seen.BestShare = w.bestShare
 				}
 				seen.LastDifficulty = w.difficulty
+				// Update exponential moving average of difficulty (alpha=0.3).
+				// This gives new connections a good starting diff that reflects
+				// the worker's actual hashrate across all recent sessions.
+				if seen.AvgDifficulty <= 0 {
+					seen.AvgDifficulty = w.difficulty
+				} else {
+					seen.AvgDifficulty = 0.3*w.difficulty + 0.7*seen.AvgDifficulty
+				}
 				seen.DiffHistory = w.diffHistory
 			}
 		}
@@ -1051,23 +1104,7 @@ func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 	}
 	log.Printf("[%s] subscribe from %s: user-agent=%q params=%s", s.coin.Symbol, w.remoteAddr, w.userAgent, msg.Params)
 
-	// Detect Braiins firmware extranonce2 size request.
-	// Braiins sends mining.subscribe with params like:
-	//   ["braiins-os/version", null, "host", port]
-	// and expects the pool to honor larger extranonce2 sizes.
-	// We also check the user-agent string for "braiins" or "bos" as a signal.
-	requestedEN2 := defaultEN2Size
-	ua := strings.ToLower(w.userAgent)
-	if strings.Contains(ua, "braiins") || strings.Contains(ua, "bosminer") || strings.Contains(ua, "/bos") {
-		requestedEN2 = maxEN2Size
-	}
-	if requestedEN2 > maxEN2Size {
-		requestedEN2 = maxEN2Size
-	}
-	if requestedEN2 < defaultEN2Size {
-		requestedEN2 = defaultEN2Size
-	}
-	w.en2Size = requestedEN2
+	w.en2Size = defaultEN2Size
 
 	// When upstream proxy is active, use the upstream extranonce1 so miner
 	// shares are valid against the upstream pool's template.
@@ -1082,20 +1119,20 @@ func (s *Server) handleSubscribe(w *Worker, msg *stratumMsg) error {
 		}
 	}
 
-	// Reply: [session_id, extranonce1, extranonce2_size]
+	// Reply: [subscriptions, extranonce1, extranonce2_size]
+	// Include mining.set_extranonce so proxy pools like Braiins Hashpower know
+	// they can dynamically reassign extranonces without reconnecting.
 	result := []any{
 		[]any{
 			[]string{"mining.set_difficulty", w.id},
 			[]string{"mining.notify", w.id},
+			[]string{"mining.set_extranonce", w.id},
 		},
 		en1,
 		w.en2Size,
 	}
 	if err := s.reply(w, msg.ID, result, nil); err != nil {
 		return err
-	}
-	if w.en2Size != defaultEN2Size {
-		log.Printf("[%s] %s granted extranonce2_size=%d (firmware: %s)", s.coin.Symbol, w.remoteAddr, w.en2Size, w.userAgent)
 	}
 	// Send initial difficulty
 	return s.sendDifficulty(w, w.difficulty)
@@ -1139,10 +1176,21 @@ func (s *Server) handleAuthorize(w *Worker, msg *stratumMsg) error {
 		existing.UserAgent = w.userAgent
 		existing.ReconnectCount++
 		existing.SessionStartedAt = now
-		// Restore last-known difficulty so the miner doesn't flood the pool with
-		// thousands of low-diff shares before vardiff catches up.
-		if existing.LastDifficulty >= vd.MinDiff && existing.LastDifficulty <= vd.MaxDiff {
-			startDiff = existing.LastDifficulty
+
+		// Adaptive start difficulty: use the worker's running average difficulty
+		// so reconnecting miners (and proxy pool connections that cycle frequently)
+		// start near the right difficulty immediately instead of flooding with
+		// low-diff shares while vardiff ramps up.
+		// Cap at 500K so proxy pool probe connections (which disconnect in <1s)
+		// can submit at least one share before bailing. Vardiff ramps persistent
+		// connections to the proper level quickly via emergency retarget.
+		if existing.AvgDifficulty > 0 && existing.AvgDifficulty >= vd.MinDiff {
+			adaptiveDiff := existing.AvgDifficulty
+			const maxStartDiff = 500000.0
+			if adaptiveDiff > maxStartDiff {
+				adaptiveDiff = maxStartDiff
+			}
+			startDiff = adaptiveDiff
 		}
 		w.diffHistory = existing.DiffHistory
 	} else {
@@ -1491,13 +1539,7 @@ func (s *Server) updateSeenWorkerShares(w *Worker) {
 // both orientations and accept whichever validates.
 func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce, effectiveVersion string, workerDiff float64) (bool, bool, string) {
 	// Build coinbase transaction hash (same regardless of nonce orientation)
-	// Zero-pad the extranonce to fill the full coinbase slot (11 bytes = 22 hex chars).
-	// This ensures miners with different en2 sizes (4 vs 7) produce valid coinbases.
-	enHex := extranonce1 + extranonce2
-	if pad := coinbaseENSlot*2 - len(enHex); pad > 0 {
-		enHex += strings.Repeat("0", pad)
-	}
-	coinbaseHex := job.CoinbasePart1 + enHex + job.CoinbasePart2
+	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
 		return false, false, nonce
@@ -1606,12 +1648,7 @@ func (s *Server) validateShare(job *Job, extranonce1, extranonce2, ntime, nonce,
 // All header fields are converted to Bitcoin wire format (little-endian) as
 // required by the node's submitblock RPC.
 func (s *Server) assembleBlockHex(job *Job, extranonce1, extranonce2, ntime, effectiveNonce, effectiveVersion string) (blockHex, blockHash string, headerBytes, coinbaseTxBytes []byte) {
-	// Zero-pad extranonce to fill the full coinbase slot (11 bytes).
-	enHex := extranonce1 + extranonce2
-	if pad := coinbaseENSlot*2 - len(enHex); pad > 0 {
-		enHex += strings.Repeat("0", pad)
-	}
-	coinbaseHex := job.CoinbasePart1 + enHex + job.CoinbasePart2
+	coinbaseHex := job.CoinbasePart1 + extranonce1 + extranonce2 + job.CoinbasePart2
 	coinbaseBytes, err := hex.DecodeString(coinbaseHex)
 	if err != nil {
 		log.Printf("[%s] assembleBlockHex: invalid coinbase hex: %v", s.coin.Symbol, err)
@@ -2625,7 +2662,7 @@ func (s *Server) trackConfirmations() {
 // hashes are collapsed one level up before the next iteration.
 func buildMerkleBranch(txHashes []string) []string {
 	if len(txHashes) == 0 {
-		return nil
+		return []string{}
 	}
 	branch := []string{}
 	hashes := make([]string, len(txHashes))
@@ -2725,6 +2762,7 @@ type workerStateEntry struct {
 	Name           string  `json:"name"`
 	Coin           string  `json:"coin"`
 	LastDifficulty float64 `json:"last_difficulty"`
+	AvgDifficulty  float64 `json:"avg_difficulty"`
 	BestShare      float64 `json:"best_share"`
 }
 
@@ -2768,6 +2806,7 @@ func (s *Server) saveWorkerState() {
 			Name:           sw.Name,
 			Coin:           sw.Coin,
 			LastDifficulty: sw.LastDifficulty,
+			AvgDifficulty:  sw.AvgDifficulty,
 			BestShare:      sw.BestShare,
 		}
 	}
@@ -2815,6 +2854,7 @@ func (s *Server) loadWorkerState() {
 			Name:           entry.Name,
 			Coin:           entry.Coin,
 			LastDifficulty: entry.LastDifficulty,
+			AvgDifficulty:  entry.AvgDifficulty,
 			BestShare:      entry.BestShare,
 		}
 		loaded++

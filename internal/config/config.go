@@ -89,6 +89,9 @@ type PoolSettings struct {
 	AutoKickRejectPct  int `json:"auto_kick_reject_pct"`
 	// AutoKickMinShares is the minimum share count before auto-kick is evaluated.
 	AutoKickMinShares  int `json:"auto_kick_min_shares"`
+	// MaxConnsPerIP limits the number of simultaneous stratum connections from a single IP.
+	// Prevents a single host from consuming all connection slots. 0 = unlimited.
+	MaxConnsPerIP      int `json:"max_conns_per_ip"`
 	// LastShareAlertMin fires a Discord alert if a connected worker goes this many minutes
 	// without submitting a share. 0 = disabled.
 	LastShareAlertMin  int `json:"last_share_alert_min"`
@@ -233,9 +236,10 @@ func DefaultConfig() *PoolConfig {
 			TempLimitC:        75,
 			IPAllowlist:       []string{},
 			StateFile:         "/opt/pipool/worker_state",
-			AutoKickRejectPct: 0, // disabled by default
+			AutoKickRejectPct: 0,  // disabled by default
 			AutoKickMinShares: 50,
-			LastShareAlertMin: 0, // disabled by default
+			MaxConnsPerIP:     10, // default: 10 connections per IP
+			LastShareAlertMin: 0,  // disabled by default
 			KwhRateUSD:        0, // disabled by default
 		},
 		Coins: map[string]CoinConfig{
